@@ -1,26 +1,44 @@
 {
-  "name": "aaliyah-core",
+  "name": "@aaliyah/core",
   "version": "1.0.0",
   "description": "Core API service for Aaliyah.",
   "main": "dist/src/index.js",
   "types": "dist/src/index.d.ts",
+  "exports": {
+    ".": "./dist/src/index.js",
+    "./application/decision-engine/runAaliyahTask": "./dist/src/application/decision-engine/runAaliyahTask.js",
+    "./services/buildEvidence": "./dist/src/services/buildEvidence.js",
+    "./services/followup/detectFollowup": "./dist/src/services/followup/detectFollowup.js",
+    "./services/followup/draftFollowup": "./dist/src/services/followup/draftFollowup.js",
+    "./services/followup/selectFollowupOwner": "./dist/src/services/followup/selectFollowupOwner.js",
+    "./services/followup/trackFollowupOutcome": "./dist/src/services/followup/trackFollowupOutcome.js",
+    "./services/followup/recordShadowDivergence": "./dist/src/services/followup/recordShadowDivergence.js",
+    "./services/followup/recordApprovalReview": "./dist/src/services/followup/recordApprovalReview.js",
+    "./services/followup/recordReplyOutcome": "./dist/src/services/followup/recordReplyOutcome.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "dev": "ts-node src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --require ts-node/register --test tests/**/*.test.ts"
+    "test": "node --require ts-node/register --test tests/**/*.test.ts",
+    "start": "node dist/src/server.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "packageManager": "pnpm@10.30.2",
   "dependencies": {
+    "@aaliyah/contracts": "file:../aaliyah-contracts",
     "express": "^5.2.1",
+    "googleapis": "^157.0.0",
+    "openai": "^5.12.2",
+    "pino": "^9.9.4",
+    "pg": "^8.16.3",
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@types/express": "^5.0.6",
+    "@types/express": "^5.0.3",
     "@types/node": "^25.6.0",
+    "@types/pg": "^8.15.5",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.2"
   }

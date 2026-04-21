@@ -1,13 +1,12 @@
-import express from "express";
-
-const app = express();
-
-app.use(express.json());
-
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok" });
-});
-
-app.listen(3000, () => {
-  console.log("Aaliyah core running on 3000");
-});
+export * from "./application/decision-engine/runAaliyahTask";
+export * from "./http/createCoreApp";
+export * from "./http/internalEvalRoutes";
+export * from "./services/buildEvidence";
+export * from "./services/followup/detectFollowup";
+export * from "./services/followup/scoreFollowupUrgency";
+export * from "./services/followup/selectFollowupOwner";
+export * from "./services/followup/draftFollowup";
+export * from "./services/followup/trackFollowupOutcome";
+export * from "./services/followup/recordShadowDivergence";
+export * from "./services/followup/recordApprovalReview";
+export * from "./services/followup/recordReplyOutcome";
