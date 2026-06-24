@@ -19,6 +19,8 @@ import {
   deterministicDraftGenerator,
   type DraftGenerator,
 } from "./generateInboundDraft";
+import { buildConfidence } from "../trust/confidenceEngine";
+import { recordDecisionTrace } from "../trust/decisionTrace";
 
 /**
  * Injectable seams so the flow is testable without Gmail/credentials and so the
@@ -133,6 +135,14 @@ export async function runInboundDraft(raw: unknown): Promise<InboundDraftResult>
 
     const draftId = await inboundDraftInternals.createDraft(rawMessage, accessToken);
 
+    // Trust metadata (Block 6): confidence on every generated draft. Low
+    // confidence forces manual review — inbound already requires approval
+    // unconditionally, so the draft stays awaiting_approval regardless.
+    const confidence = buildConfidence(
+      draft.confidence,
+      `${analysis.reason}; generator=${draft.generatorMode}`,
+    );
+
     const result = InboundDraftResultSchema.parse({
       threadId: request.email.threadId,
       status: "awaiting_approval",
@@ -141,6 +151,19 @@ export async function runInboundDraft(raw: unknown): Promise<InboundDraftResult>
       draftId,
       replyType: draft.replyType,
       generatorMode: draft.generatorMode,
+      confidence,
+    });
+
+    // Every inbound draft has a decision trace.
+    recordDecisionTrace({
+      tenantId: tenant.tenantId,
+      workspaceId: tenant.workspaceId,
+      userId: tenant.userId,
+      inputSummary: `inbound ${request.email.messageId} from ${request.email.fromEmail}`,
+      decision: "draft_reply_awaiting_approval",
+      evidenceUsed: [request.email.threadId],
+      reason: confidence.reason,
+      provider: draft.generatorMode,
     });
 
     await persistTrace({
