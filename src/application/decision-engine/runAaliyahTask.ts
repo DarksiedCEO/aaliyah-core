@@ -9,6 +9,7 @@ import { PlannerPolicySchema, TaskEnvelopeSchema } from "@aaliyah/contracts/v1";
 import { logger } from "../../observability/logger";
 import { emitMetric } from "../../observability/metrics";
 import { persistTrace } from "../../observability/persistTrace";
+import { requireTenantContext } from "../../governance/requireTenantContext";
 import { executeIdempotent } from "../../services/executeIdempotent";
 import { escalateForReview } from "../../services/escalateForReview";
 import { recoverOrEscalate } from "../../services/recoverOrEscalate";
@@ -72,10 +73,21 @@ async function buildEvidenceWithPolicy(
 
 export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
   const task = TaskEnvelopeSchema.parse(raw);
+  // Resolve the isolation key once (backfills the default workspace for
+  // phase-1 envelopes). Additive plumbing only — decision logic is unchanged.
+  const tenant = requireTenantContext({
+    tenantId: task.tenantId,
+    userId: task.userId,
+    workspaceId: task.workspaceId,
+  });
+  const idempotencyScope = {
+    tenantId: tenant.tenantId,
+    workspaceId: tenant.workspaceId,
+  };
   const executionId = crypto.randomUUID();
   const idempotency = await ensureIdempotentExecution<ExecutionResult & {
     plannerTelemetry?: unknown;
-  }>(task.taskId, task, task.taskType);
+  }>(task.taskId, task, task.taskType, idempotencyScope);
 
   if (idempotency.replay && idempotency.result) {
     logger.info({ taskId: task.taskId }, "aaliyah.task.replayed");
@@ -159,7 +171,7 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
         outcome: responseWithTelemetry,
       });
 
-      await recordIdempotentResult(task.taskId, responseWithTelemetry);
+      await recordIdempotentResult(task.taskId, responseWithTelemetry, idempotencyScope);
       return responseWithTelemetry;
     }
 
@@ -193,7 +205,7 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
         outcome: responseWithTelemetry,
       });
 
-      await recordIdempotentResult(task.taskId, responseWithTelemetry);
+      await recordIdempotentResult(task.taskId, responseWithTelemetry, idempotencyScope);
       return responseWithTelemetry;
     }
 
@@ -241,7 +253,7 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
         outcome: shadowResult,
       });
 
-      await recordIdempotentResult(task.taskId, shadowResult);
+      await recordIdempotentResult(task.taskId, shadowResult, idempotencyScope);
       return shadowResult;
     }
 
@@ -267,6 +279,7 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
       executionId,
       idempotencyKey: task.taskId,
       tenantId: task.tenantId,
+      workspaceId: tenant.workspaceId,
       userId: task.userId,
       rankedEvidence,
       plannerRequest,
@@ -290,17 +303,18 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
         plannerTelemetry: telemetry,
       };
 
-      await recordIdempotentResult(task.taskId, recoveredWithTelemetry);
+      await recordIdempotentResult(task.taskId, recoveredWithTelemetry, idempotencyScope);
       return recoveredWithTelemetry;
     }
 
-    await recordIdempotentResult(task.taskId, finalResultWithTelemetry);
+    await recordIdempotentResult(task.taskId, finalResultWithTelemetry, idempotencyScope);
     logger.info({ taskId: task.taskId }, "aaliyah.task.completed");
     return finalResultWithTelemetry;
   } catch (error) {
     await recordIdempotentFailure(
       task.taskId,
       error instanceof Error ? error.message : "unknown error",
+      idempotencyScope,
     );
     throw error;
   }

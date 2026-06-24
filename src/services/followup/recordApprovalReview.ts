@@ -4,6 +4,10 @@ import {
 } from "@aaliyah/contracts/v1";
 
 import {
+  scopeBucketKey,
+  type TenantScope,
+} from "../../persistence/tenantScopedStore";
+import {
   clearPersistedApprovalReviews,
   listPersistedApprovalReviews,
   persistApprovalReview,
@@ -17,7 +21,18 @@ export type ApprovalReviewRecord = ApprovalReview & {
   liveOperatorPilot?: boolean;
 };
 
-const approvalReviewStore: ApprovalReviewRecord[] = [];
+// In-memory store partitioned by tenant/workspace bucket (see recordReplyOutcome).
+const approvalReviewStores = new Map<string, ApprovalReviewRecord[]>();
+
+function bucket(scope?: TenantScope): ApprovalReviewRecord[] {
+  const key = scopeBucketKey(scope);
+  let store = approvalReviewStores.get(key);
+  if (!store) {
+    store = [];
+    approvalReviewStores.set(key, store);
+  }
+  return store;
+}
 
 function normalizeRejectionReason(reason: string | undefined): string | undefined {
   if (!reason || reason.trim().length === 0) {
@@ -98,6 +113,7 @@ function normalizeRejectionReason(reason: string | undefined): string | undefine
 
 export async function recordApprovalReview(
   review: ApprovalReviewRecord,
+  scope?: TenantScope,
 ): Promise<ApprovalReviewRecord> {
   const base = ApprovalReviewSchema.parse(review);
   let parsed: ApprovalReviewRecord = {
@@ -124,13 +140,15 @@ export async function recordApprovalReview(
     parsed = { ...parsed, liveOperatorPilot: review.liveOperatorPilot };
   }
 
-  approvalReviewStore.push(parsed);
-  await persistApprovalReview(parsed);
+  bucket(scope).push(parsed);
+  await persistApprovalReview(parsed, scope);
   return parsed;
 }
 
-export async function listApprovalReviews(): Promise<ApprovalReviewRecord[]> {
-  return [...approvalReviewStore, ...(await listPersistedApprovalReviews())]
+export async function listApprovalReviews(
+  scope?: TenantScope,
+): Promise<ApprovalReviewRecord[]> {
+  return [...bucket(scope), ...(await listPersistedApprovalReviews(scope))]
     .filter(
       (record, index, records) =>
         records.findIndex(
@@ -142,7 +160,7 @@ export async function listApprovalReviews(): Promise<ApprovalReviewRecord[]> {
     );
 }
 
-export async function clearApprovalReviews(): Promise<void> {
-  approvalReviewStore.length = 0;
-  await clearPersistedApprovalReviews();
+export async function clearApprovalReviews(scope?: TenantScope): Promise<void> {
+  bucket(scope).length = 0;
+  await clearPersistedApprovalReviews(scope);
 }
