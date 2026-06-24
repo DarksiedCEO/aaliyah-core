@@ -7,6 +7,7 @@
   "exports": {
     ".": "./dist/src/index.js",
     "./application/decision-engine/runAaliyahTask": "./dist/src/application/decision-engine/runAaliyahTask.js",
+    "./application/inbound/runInboundDraft": "./dist/src/application/inbound/runInboundDraft.js",
     "./services/buildEvidence": "./dist/src/services/buildEvidence.js",
     "./services/followup/detectFollowup": "./dist/src/services/followup/detectFollowup.js",
     "./services/followup/draftFollowup": "./dist/src/services/followup/draftFollowup.js",
