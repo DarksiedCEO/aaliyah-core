@@ -92,8 +92,8 @@ export async function runInboundDraft(raw: unknown): Promise<InboundDraftResult>
     if (!analysis.shouldDraft) {
       const skipped = InboundDraftResultSchema.parse({
         threadId: request.email.threadId,
-        status: "skipped",
-        approvalState: "pending",
+        status: "no_action",
+        mode: "inbound_draft",
         autoSend: false,
         reason: analysis.reason,
       });
@@ -103,7 +103,7 @@ export async function runInboundDraft(raw: unknown): Promise<InboundDraftResult>
         userId: tenant.userId,
         flow: "inbound_draft",
         messageId: request.email.messageId,
-        decisionPath: "inbound -> skipped",
+        decisionPath: "inbound -> no_action",
         analysis,
         outcome: skipped,
       });
@@ -135,8 +135,8 @@ export async function runInboundDraft(raw: unknown): Promise<InboundDraftResult>
 
     const result = InboundDraftResultSchema.parse({
       threadId: request.email.threadId,
-      status: "draft_saved",
-      approvalState: "pending",
+      status: "awaiting_approval",
+      mode: "inbound_draft",
       autoSend: false,
       draftId,
       replyType: draft.replyType,
@@ -148,7 +148,7 @@ export async function runInboundDraft(raw: unknown): Promise<InboundDraftResult>
       userId: tenant.userId,
       flow: "inbound_draft",
       messageId: request.email.messageId,
-      decisionPath: "inbound -> draft_saved",
+      decisionPath: "inbound -> awaiting_approval",
       analysis,
       generatorMode: draft.generatorMode,
       outcome: result,

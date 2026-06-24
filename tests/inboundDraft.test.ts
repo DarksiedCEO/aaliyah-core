@@ -54,8 +54,9 @@ function request(overrides: Record<string, unknown> = {}) {
 test("inbound draft is saved as a Gmail draft, pending approval, never sent", async () => {
   const result = await runInboundDraft(request());
 
-  assert.equal(result.status, "draft_saved");
-  assert.equal(result.approvalState, "pending");
+  // Acceptance criterion: status=awaiting_approval, mode=inbound_draft, draftId.
+  assert.equal(result.status, "awaiting_approval");
+  assert.equal(result.mode, "inbound_draft");
   assert.equal(result.autoSend, false);
   assert.equal(result.draftId, "draft_1");
   assert.equal(result.replyType, "first_touch");
@@ -81,8 +82,8 @@ test("non-replyable senders are skipped without creating a draft", async () => {
     }),
   );
 
-  assert.equal(result.status, "skipped");
-  assert.equal(result.approvalState, "pending");
+  assert.equal(result.status, "no_action");
+  assert.equal(result.mode, "inbound_draft");
   assert.equal(result.autoSend, false);
   assert.equal(createdDrafts.length, 0);
 });
