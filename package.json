@@ -29,17 +29,17 @@
   "dependencies": {
     "@aaliyah/contracts": "file:../aaliyah-contracts",
     "express": "^5.2.1",
-    "googleapis": "^157.0.0",
-    "openai": "^5.12.2",
-    "pino": "^9.9.4",
-    "pg": "^8.16.3",
-    "zod": "^4.3.6"
+    "googleapis": "^173.0.0",
+    "openai": "^6.44.0",
+    "pino": "^10.3.1",
+    "pg": "^8.22.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/express": "^5.0.3",
-    "@types/node": "^25.6.0",
+    "@types/node": "^26.0.0",
     "@types/pg": "^8.15.5",
     "ts-node": "^10.9.2",
-    "typescript": "^6.0.2"
+    "typescript": "^6.0.3"
   }
 }
