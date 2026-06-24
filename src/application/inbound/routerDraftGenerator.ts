@@ -1,4 +1,10 @@
+import type { StyleProfile } from "@aaliyah/contracts/v1";
+
 import type { AaliyahModelRouter } from "../../model-router/AaliyahModelRouter";
+import {
+  styleDirectives,
+  enforceForbiddenPhrases,
+} from "../style/styleDirectives";
 import type { DraftGenerator } from "./generateInboundDraft";
 
 function replySubject(subject: string): string {
@@ -21,7 +27,15 @@ const SYSTEM_PROMPT = [
  * `inboundDraftInternals.generator = routerDraftGenerator(router)`), so the
  * inbound flow itself is unchanged — exactly what the seam was built for.
  */
-export function routerDraftGenerator(router: AaliyahModelRouter): DraftGenerator {
+export function routerDraftGenerator(
+  router: AaliyahModelRouter,
+  options?: { style?: StyleProfile },
+): DraftGenerator {
+  const style = options?.style;
+  const system = style
+    ? `${SYSTEM_PROMPT} ${styleDirectives(style)}`
+    : SYSTEM_PROMPT;
+
   return async ({ email, replyType }) => {
     const prompt = [
       `From: ${email.fromEmail}`,
@@ -32,15 +46,15 @@ export function routerDraftGenerator(router: AaliyahModelRouter): DraftGenerator
       "Draft a reply to the message above.",
     ].join("\n");
 
-    const result = await router.generate({
-      system: SYSTEM_PROMPT,
-      prompt,
-      maxOutputTokens: 512,
-    });
+    const result = await router.generate({ system, prompt, maxOutputTokens: 512 });
+
+    const raw =
+      result.text.trim().length > 0 ? result.text.trim() : "Thank you for your message.";
+    const body = style ? enforceForbiddenPhrases(raw, style) : raw;
 
     return {
       subject: replySubject(email.subject),
-      body: result.text.trim().length > 0 ? result.text.trim() : "Thank you for your message.",
+      body,
       replyType,
       confidence: 60,
       generatorMode: `router:${result.provider}`,
