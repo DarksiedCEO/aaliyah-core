@@ -1,10 +1,11 @@
-import type { StyleProfile } from "@aaliyah/contracts/v1";
+import type { RelationshipContext, StyleProfile } from "@aaliyah/contracts/v1";
 
 import type { AaliyahModelRouter } from "../../model-router/AaliyahModelRouter";
 import {
   styleDirectives,
   enforceForbiddenPhrases,
 } from "../style/styleDirectives";
+import { relationshipDirectives } from "../relationship/relationshipMemory";
 import type { DraftGenerator } from "./generateInboundDraft";
 
 function replySubject(subject: string): string {
@@ -29,12 +30,17 @@ const SYSTEM_PROMPT = [
  */
 export function routerDraftGenerator(
   router: AaliyahModelRouter,
-  options?: { style?: StyleProfile },
+  options?: { style?: StyleProfile; relationship?: RelationshipContext },
 ): DraftGenerator {
   const style = options?.style;
-  const system = style
-    ? `${SYSTEM_PROMPT} ${styleDirectives(style)}`
-    : SYSTEM_PROMPT;
+  const relationship = options?.relationship;
+  const system = [
+    SYSTEM_PROMPT,
+    style ? styleDirectives(style) : "",
+    relationship ? relationshipDirectives(relationship) : "",
+  ]
+    .filter((part) => part.length > 0)
+    .join(" ");
 
   return async ({ email, replyType }) => {
     const prompt = [
