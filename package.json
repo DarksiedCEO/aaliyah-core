@@ -27,6 +27,9 @@
   "author": "",
   "license": "ISC",
   "packageManager": "pnpm@10.30.2",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@aaliyah/contracts": "file:../aaliyah-contracts",
     "@anthropic-ai/sdk": "^0.105.0",

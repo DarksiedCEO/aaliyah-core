@@ -41,11 +41,13 @@ export class GeminiAdapter implements ProviderAdapter {
     }
 
     const start = this.now();
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${apiKey}`;
+    // Pass the key via header, not the URL query string, so it never lands in
+    // proxy/access logs or error traces that capture the request line.
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent`;
 
     const res = await this.fetchImpl(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: request.prompt }] }],
         ...(request.system
