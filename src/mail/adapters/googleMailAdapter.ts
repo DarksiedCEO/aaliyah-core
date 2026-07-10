@@ -17,7 +17,13 @@ import {
 } from "@aaliyah/contracts/v1";
 
 import type { MailProviderAdapter } from "../types";
-import { denyAllSends, type ApprovalConsumer } from "../sendGuard";
+import {
+  denyAllSends,
+  noopSettler,
+  classifySendError,
+  type ApprovalConsumer,
+  type SendSettler,
+} from "../sendGuard";
 import {
   base64url,
   buildRawRfc822,
@@ -84,10 +90,11 @@ export class GoogleMailAdapter implements MailProviderAdapter {
   private readonly fetchImpl: typeof fetch;
   private readonly resolveToken: (connectionId: string) => string;
   private readonly now: () => string;
-  private readonly consumeApproval: ApprovalConsumer;
+  private readonly beginSend: ApprovalConsumer;
+  private readonly settleSend: SendSettler;
 
   constructor(
-    deps: AdapterDeps & { consumeApproval?: ApprovalConsumer } = {},
+    deps: AdapterDeps & { beginSend?: ApprovalConsumer; settleSend?: SendSettler } = {},
   ) {
     this.fetchImpl = deps.fetchImpl ?? fetch;
     this.resolveToken =
@@ -96,7 +103,8 @@ export class GoogleMailAdapter implements MailProviderAdapter {
         throw new Error("google: no access-token resolver configured");
       });
     this.now = deps.now ?? (() => new Date().toISOString());
-    this.consumeApproval = deps.consumeApproval ?? denyAllSends;
+    this.beginSend = deps.beginSend ?? denyAllSends;
+    this.settleSend = deps.settleSend ?? noopSettler;
   }
 
   private async call(connectionId: string, path: string, init?: RequestInit): Promise<unknown> {
@@ -180,9 +188,10 @@ export class GoogleMailAdapter implements MailProviderAdapter {
   }
 
   async sendMessage(input: SendMessageInput): Promise<SentMessage> {
-    // Validate + atomically consume the approval BEFORE any network call. The
-    // exact approved content is what we transmit, so nothing can be swapped.
-    this.consumeApproval(input);
+    // Claim the approval (issued -> sending) BEFORE any network call. The exact
+    // approved content is what we transmit. On an ambiguous failure the record
+    // stays `sending` for reconciliation — never silently retried.
+    const claim = this.beginSend(input);
     const raw = base64url(
       buildRawRfc822({
         to: input.to.map((a) => a.email).join(", "),
@@ -190,15 +199,22 @@ export class GoogleMailAdapter implements MailProviderAdapter {
         body: input.body,
       }),
     );
-    const data = (await this.call(input.connectionId, "/messages/send", {
-      method: "POST",
-      body: JSON.stringify({ raw }),
-    })) as { id?: string; threadId?: string };
-    return SentMessageSchema.parse({
-      messageId: data.id ?? "unknown",
-      ...(data.threadId ? { threadId: data.threadId } : {}),
-      sentAt: this.now(),
-    });
+    try {
+      const data = (await this.call(input.connectionId, "/messages/send", {
+        method: "POST",
+        body: JSON.stringify({ raw }),
+      })) as { id?: string; threadId?: string };
+      this.settleSend(claim.approvalId, { sent: true, providerMessageId: data.id ?? "unknown" });
+      return SentMessageSchema.parse({
+        messageId: data.id ?? "unknown",
+        ...(data.threadId ? { threadId: data.threadId } : {}),
+        sentAt: this.now(),
+      });
+    } catch (error) {
+      const outcome = classifySendError(error);
+      if (outcome) this.settleSend(claim.approvalId, outcome);
+      throw error;
+    }
   }
 
   async applyLabel(input: ApplyLabelInput): Promise<void> {

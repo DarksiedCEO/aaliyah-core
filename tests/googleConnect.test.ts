@@ -23,7 +23,7 @@ import {
 import { getConnection, clearConnections } from "../src/mail/connectionStore";
 import {
   issueSendApproval,
-  consumeSendApproval,
+  getApproval,
   clearSendApprovals,
 } from "../src/mail/security/sendApproval";
 import { readMailAudit } from "../src/mail/security/mailAudit";
@@ -43,13 +43,13 @@ function fakeHttp(over: Partial<GoogleOAuthHttp> = {}): GoogleOAuthHttp & { revo
   const revoked: string[] = [];
   return {
     revoked,
-    exchangeCode: over.exchangeCode ?? (async () => ({
+    exchangeAuthorizationCode: over.exchangeAuthorizationCode ?? (async () => ({
       accessToken: "at", refreshToken: "rt-SECRET", expiresIn: 3600,
       scope: "https://www.googleapis.com/auth/gmail.modify email",
     })),
-    fetchIdentity: over.fetchIdentity ?? (async () => ({ email: EMAIL })),
-    refresh: over.refresh ?? (async () => ({ accessToken: "at2", expiresIn: 3600 })),
-    revoke: over.revoke ?? (async (t: string) => { revoked.push(t); }),
+    fetchMailboxProfile: over.fetchMailboxProfile ?? (async () => ({ email: EMAIL })),
+    refreshAccessToken: over.refreshAccessToken ?? (async () => ({ accessToken: "at2", expiresIn: 3600, scope: "" })),
+    revokeToken: over.revokeToken ?? (async (t: string) => { revoked.push(t); }),
   };
 }
 
@@ -137,7 +137,7 @@ test("OAuth state cannot be replayed and a foreign tenant is rejected", async ()
 });
 
 test("a failed code exchange leaves no orphan credential or connection", async () => {
-  const http = fakeHttp({ exchangeCode: async () => { throw new Error("google 400"); } });
+  const http = fakeHttp({ exchangeAuthorizationCode: async () => { throw new Error("google 400"); } });
   const { state } = buildGoogleAuthorizationUrl(authInput(), deps(http));
   await assert.rejects(() => handleGoogleCallback({ code: "c", state, redirectUri: REDIRECT }, deps(http)));
   assert.equal(getMailCredential(CONN_ID, SCOPE), undefined);
@@ -181,11 +181,8 @@ test("access token refresh works, and disconnect revokes + destroys + invalidate
   // Credential destroyed → refresh now impossible.
   await assert.rejects(() => refreshGoogleAccessToken(CONN_ID, SCOPE, deps(http)), /revoked|not found/);
 
-  // Pending approval invalidated → cannot send.
-  assert.throws(
-    () => consumeSendApproval({ connectionId: CONN_ID, approvalId: approval.approvalId, to: [{ email: "c@e.com" }], subject: "s", body: "b" }),
-    /already consumed/,
-  );
+  // Pending approval invalidated → terminally failed, cannot be claimed.
+  assert.equal(getApproval(approval.approvalId)!.status, "failed_terminal");
 
   // Disconnect audited.
   assert.ok(readMailAudit(SCOPE).some((e) => e.action === "google.disconnected"));

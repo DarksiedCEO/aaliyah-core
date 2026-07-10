@@ -10,10 +10,13 @@ import {
 import { bodyHash, recipientHash } from "./hashing";
 
 // Process-local approval store. In production this MUST be a durable,
-// tenant-scoped, transactional table so consume() is atomic across instances.
+// tenant-scoped, transactional table so the issued→sending transition is atomic
+// across instances (a conditional UPDATE ... WHERE status='issued').
 const store = new Map<string, MailSendApproval>();
 
 const DEFAULT_TTL_MS = 15 * 60 * 1000;
+/** How long a `sending` record may sit before it is considered ambiguous. */
+export const RECONCILE_AFTER_MS = 60 * 1000;
 
 export type IssueApprovalInput = {
   tenantId: string;
@@ -28,11 +31,11 @@ export type IssueApprovalInput = {
   now?: () => number;
 };
 
-/**
- * Record a human approval to send ONE specific message. Called only after a
- * real person approved the exact content; it binds tenant/workspace/connection/
- * recipients/body so nothing else can be substituted later.
- */
+function iso(ms: number): string {
+  return new Date(ms).toISOString();
+}
+
+/** Record a human approval to send ONE specific message (status `issued`). */
 export function issueSendApproval(input: IssueApprovalInput): MailSendApproval {
   if (!input.approvedByUserId) {
     throw new Error("cannot issue send approval without an approver");
@@ -48,21 +51,25 @@ export function issueSendApproval(input: IssueApprovalInput): MailSendApproval {
     recipientHash: recipientHash(input.to),
     bodyHash: bodyHash(input.subject, input.body),
     approvedByUserId: input.approvedByUserId,
-    approvedAt: new Date(at).toISOString(),
-    expiresAt: new Date(at + (input.ttlMs ?? DEFAULT_TTL_MS)).toISOString(),
-    consumedAt: null,
+    approvedAt: iso(at),
+    expiresAt: iso(at + (input.ttlMs ?? DEFAULT_TTL_MS)),
+    status: "issued",
+    operationId: null,
+    providerMessageId: null,
+    updatedAt: iso(at),
   });
   store.set(approval.approvalId, approval);
   return approval;
 }
 
 /**
- * Validate the approval against the message actually being sent and consume it
- * atomically. Throws — fail closed — on any mismatch, expiry, or reuse. Because
- * consumption happens before the network send, a spent approval can never be
- * replayed even if the send itself later fails.
+ * Claim an approval for sending: validate it against the message actually being
+ * sent and atomically transition `issued` (or a reconciled `failed_retryable`)
+ * → `sending`, assigning a stable operationId. Throws — fail closed — on any
+ * mismatch, expiry, an in-flight `sending` (must reconcile first), or a spent
+ * `sent`/`failed_terminal`. This is the ONLY way to begin a send.
  */
-export function consumeSendApproval(
+export function beginSend(
   input: SendMessageInput,
   ctx?: { now?: () => number },
 ): MailSendApproval {
@@ -70,10 +77,27 @@ export function consumeSendApproval(
   const approval = store.get(input.approvalId);
 
   if (!approval) throw new Error("send refused: no such approval");
-  if (approval.consumedAt) throw new Error("send refused: approval already consumed");
-  if (now() > new Date(approval.expiresAt).getTime()) {
+
+  if (now() > new Date(approval.expiresAt).getTime() && approval.status === "issued") {
+    const expired = { ...approval, status: "expired" as const, updatedAt: iso(now()) };
+    store.set(approval.approvalId, expired);
     throw new Error("send refused: approval expired");
   }
+
+  switch (approval.status) {
+    case "sending":
+      throw new Error("send refused: a send is already in flight — reconcile first");
+    case "sent":
+      throw new Error("send refused: already sent");
+    case "failed_terminal":
+      throw new Error("send refused: approval terminally failed");
+    case "expired":
+      throw new Error("send refused: approval expired");
+    case "issued":
+    case "failed_retryable":
+      break; // claimable
+  }
+
   if (approval.connectionId !== input.connectionId) {
     throw new Error("send refused: connection mismatch");
   }
@@ -90,19 +114,81 @@ export function consumeSendApproval(
     throw new Error("send refused: no authorized approver");
   }
 
-  // Atomic consume (single-threaded event loop): mark spent before returning.
-  const consumed = { ...approval, consumedAt: new Date(now()).toISOString() };
-  store.set(approval.approvalId, consumed);
-  return consumed;
+  const claimed: MailSendApproval = {
+    ...approval,
+    status: "sending",
+    operationId: crypto.randomUUID(),
+    updatedAt: iso(now()),
+  };
+  store.set(approval.approvalId, claimed);
+  return claimed;
 }
 
-/** Invalidate every pending approval for a connection (used on disconnect). */
+export function markSent(
+  approvalId: string,
+  providerMessageId: string,
+  now: () => number = () => Date.now(),
+): void {
+  const a = store.get(approvalId);
+  if (!a || a.status !== "sending") return;
+  store.set(approvalId, { ...a, status: "sent", providerMessageId, updatedAt: iso(now()) });
+}
+
+export function markFailed(
+  approvalId: string,
+  retryable: boolean,
+  now: () => number = () => Date.now(),
+): void {
+  const a = store.get(approvalId);
+  if (!a || a.status !== "sending") return;
+  store.set(approvalId, {
+    ...a,
+    status: retryable ? "failed_retryable" : "failed_terminal",
+    updatedAt: iso(now()),
+  });
+}
+
+/**
+ * Reconcile an ambiguous `sending` record after checking the provider for the
+ * message: delivered → `sent`; confirmed-not-delivered → `failed_retryable`.
+ * Only reconciliation can move a record out of `sending`.
+ */
+export function reconcileSend(
+  approvalId: string,
+  wasDelivered: boolean,
+  providerMessageId?: string,
+  now: () => number = () => Date.now(),
+): void {
+  const a = store.get(approvalId);
+  if (!a || a.status !== "sending") return;
+  store.set(
+    approvalId,
+    wasDelivered
+      ? { ...a, status: "sent", providerMessageId: providerMessageId ?? a.providerMessageId, updatedAt: iso(now()) }
+      : { ...a, status: "failed_retryable", updatedAt: iso(now()) },
+  );
+}
+
+/** Approvals stuck `sending` past the reconcile window — need provider lookup. */
+export function approvalsNeedingReconciliation(
+  now: () => number = () => Date.now(),
+): MailSendApproval[] {
+  return [...store.values()].filter(
+    (a) => a.status === "sending" && now() - new Date(a.updatedAt).getTime() > RECONCILE_AFTER_MS,
+  );
+}
+
+export function getApproval(approvalId: string): MailSendApproval | undefined {
+  return store.get(approvalId);
+}
+
+/** Terminally fail every non-sent approval for a connection (used on disconnect). */
 export function invalidateApprovalsForConnection(connectionId: string): number {
   let count = 0;
   const at = new Date().toISOString();
   for (const [id, a] of store) {
-    if (a.connectionId === connectionId && !a.consumedAt) {
-      store.set(id, { ...a, consumedAt: at });
+    if (a.connectionId === connectionId && a.status !== "sent" && a.status !== "failed_terminal") {
+      store.set(id, { ...a, status: "failed_terminal", updatedAt: at });
       count += 1;
     }
   }

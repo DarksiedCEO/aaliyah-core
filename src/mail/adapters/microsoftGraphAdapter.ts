@@ -17,7 +17,13 @@ import {
 } from "@aaliyah/contracts/v1";
 
 import type { MailProviderAdapter } from "../types";
-import { denyAllSends, type ApprovalConsumer } from "../sendGuard";
+import {
+  denyAllSends,
+  noopSettler,
+  classifySendError,
+  type ApprovalConsumer,
+  type SendSettler,
+} from "../sendGuard";
 import { makeConnection, type AdapterDeps } from "./helpers";
 
 const GRAPH = "https://graph.microsoft.com/v1.0/me";
@@ -69,9 +75,12 @@ export class MicrosoftGraphAdapter implements MailProviderAdapter {
   private readonly fetchImpl: typeof fetch;
   private readonly resolveToken: (connectionId: string) => string;
   private readonly now: () => string;
-  private readonly consumeApproval: ApprovalConsumer;
+  private readonly beginSend: ApprovalConsumer;
+  private readonly settleSend: SendSettler;
 
-  constructor(deps: AdapterDeps & { consumeApproval?: ApprovalConsumer } = {}) {
+  constructor(
+    deps: AdapterDeps & { beginSend?: ApprovalConsumer; settleSend?: SendSettler } = {},
+  ) {
     this.fetchImpl = deps.fetchImpl ?? fetch;
     this.resolveToken =
       deps.resolveAccessToken ??
@@ -79,7 +88,8 @@ export class MicrosoftGraphAdapter implements MailProviderAdapter {
         throw new Error("microsoft: no access-token resolver configured");
       });
     this.now = deps.now ?? (() => new Date().toISOString());
-    this.consumeApproval = deps.consumeApproval ?? denyAllSends;
+    this.beginSend = deps.beginSend ?? denyAllSends;
+    this.settleSend = deps.settleSend ?? noopSettler;
   }
 
   private async call(connectionId: string, path: string, init?: RequestInit): Promise<unknown> {
@@ -160,20 +170,26 @@ export class MicrosoftGraphAdapter implements MailProviderAdapter {
   }
 
   async sendMessage(input: SendMessageInput): Promise<SentMessage> {
-    // Validate + atomically consume the approval; transmit the exact approved
-    // content (never a draft that could have been altered after approval).
-    this.consumeApproval(input);
-    await this.call(input.connectionId, "/sendMail", {
-      method: "POST",
-      body: JSON.stringify({
-        message: {
-          subject: input.subject,
-          body: { contentType: "Text", content: input.body },
-          toRecipients: input.to.map((a) => ({ emailAddress: { address: a.email } })),
-        },
-      }),
-    });
-    return SentMessageSchema.parse({ messageId: `sent:${this.now()}`, sentAt: this.now() });
+    const claim = this.beginSend(input);
+    try {
+      await this.call(input.connectionId, "/sendMail", {
+        method: "POST",
+        body: JSON.stringify({
+          message: {
+            subject: input.subject,
+            body: { contentType: "Text", content: input.body },
+            toRecipients: input.to.map((a) => ({ emailAddress: { address: a.email } })),
+          },
+        }),
+      });
+      const messageId = `sent:${this.now()}`;
+      this.settleSend(claim.approvalId, { sent: true, providerMessageId: messageId });
+      return SentMessageSchema.parse({ messageId, sentAt: this.now() });
+    } catch (error) {
+      const outcome = classifySendError(error);
+      if (outcome) this.settleSend(claim.approvalId, outcome);
+      throw error;
+    }
   }
 
   async applyLabel(input: ApplyLabelInput): Promise<void> {

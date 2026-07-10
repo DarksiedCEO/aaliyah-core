@@ -33,16 +33,24 @@ const DEFAULT_SCOPES = [
   "email",
 ];
 
+export type GoogleTokenResponse = {
+  accessToken: string;
+  refreshToken?: string;
+  expiresIn: number;
+  scope: string;
+};
+export type GoogleMailboxProfile = { email: string };
+
 /** Injectable Google network surface — real HTTP behind it in production. */
 export interface GoogleOAuthHttp {
-  exchangeCode(input: {
+  exchangeAuthorizationCode(input: {
     code: string;
     codeVerifier: string;
     redirectUri: string;
-  }): Promise<{ accessToken: string; refreshToken: string; expiresIn: number; scope: string }>;
-  fetchIdentity(accessToken: string): Promise<{ email: string }>;
-  refresh(refreshToken: string): Promise<{ accessToken: string; expiresIn: number }>;
-  revoke(refreshToken: string): Promise<void>;
+  }): Promise<GoogleTokenResponse>;
+  refreshAccessToken(refreshToken: string): Promise<GoogleTokenResponse>;
+  fetchMailboxProfile(accessToken: string): Promise<GoogleMailboxProfile>;
+  revokeToken(token: string): Promise<void>;
 }
 
 export type GoogleConnectDeps = {
@@ -109,41 +117,46 @@ export async function handleGoogleCallback(
     throw new Error("oauth callback rejected: tenant mismatch");
   }
 
-  // 3-4. Exchange + verified mailbox identity (no persistence yet).
-  const tokens = await deps.http.exchangeCode({
+  // 3. Exchange the code (not retried — single-use). A refresh token is required.
+  const tokens = await deps.http.exchangeAuthorizationCode({
     code: input.code,
     codeVerifier: state.codeVerifier,
     redirectUri: input.redirectUri,
   });
   if (!tokens.refreshToken) {
+    // Nothing persisted yet; revoke the access token we just received.
+    await safeRevoke(deps, tokens.accessToken);
+    recordFailureAudit(state, "no_refresh_token", now);
     throw new Error("oauth callback rejected: no refresh token granted");
   }
-  const identity = await deps.http.fetchIdentity(tokens.accessToken);
 
-  const connectionId = connectionIdFor({
-    tenantId: state.tenantId,
-    workspaceId: state.workspaceId,
-    userId: state.userId,
-    provider: "google",
-    emailAddress: identity.email,
-  });
-  const at = now();
-
-  // 5-6. Persist credential + connection with rollback — no orphans.
-  saveMailCredential(
-    {
-      connectionId,
+  // Everything after a successful exchange is wrapped so ANY failure fully rolls
+  // back: revoke the fresh token, destroy any persisted credential/connection.
+  let connectionId: string | undefined;
+  try {
+    const identity = await deps.http.fetchMailboxProfile(tokens.accessToken);
+    connectionId = connectionIdFor({
       tenantId: state.tenantId,
       workspaceId: state.workspaceId,
       userId: state.userId,
-      refreshToken: tokens.refreshToken,
-      grantedScopes: tokens.scope ? tokens.scope.split(" ") : [],
-      connectedEmail: identity.email,
-      accessTokenExpiresAt: new Date(Date.now() + tokens.expiresIn * 1000).toISOString(),
-    },
-    deps.keyProvider,
-  );
-  try {
+      provider: "google",
+      emailAddress: identity.email,
+    });
+    const at = now();
+
+    saveMailCredential(
+      {
+        connectionId,
+        tenantId: state.tenantId,
+        workspaceId: state.workspaceId,
+        userId: state.userId,
+        refreshToken: tokens.refreshToken,
+        grantedScopes: tokens.scope ? tokens.scope.split(" ") : [],
+        connectedEmail: identity.email,
+        accessTokenExpiresAt: new Date(Date.now() + tokens.expiresIn * 1000).toISOString(),
+      },
+      deps.keyProvider,
+    );
     saveConnection(
       MailboxConnectionSchema.parse({
         connectionId,
@@ -157,27 +170,54 @@ export async function handleGoogleCallback(
         connectedAt: at,
       }),
     );
+
+    recordMailAudit({
+      tenantId: state.tenantId,
+      workspaceId: state.workspaceId,
+      connectionId,
+      actorUserId: state.userId,
+      action: "google.connected",
+      detail: identity.email,
+    });
+
+    return SanitizedConnectionSchema.parse({
+      connectionId,
+      provider: "google",
+      connectedEmail: identity.email,
+      status: "connected",
+    });
   } catch (error) {
-    deleteMailCredential(connectionId); // rollback the secret we just wrote
+    if (connectionId) {
+      deleteMailCredential(connectionId);
+      deleteConnection(connectionId);
+    }
+    await safeRevoke(deps, tokens.refreshToken);
+    deps.onDisconnect?.(connectionId ?? "");
+    recordFailureAudit(state, "connect_failed", now);
     throw error;
   }
+}
 
-  // 7. Audit (no secrets).
+async function safeRevoke(deps: GoogleConnectDeps, token: string): Promise<void> {
+  try {
+    await deps.http.revokeToken(token);
+  } catch {
+    // best effort — must not mask the original failure
+  }
+}
+
+function recordFailureAudit(
+  state: { tenantId: string; workspaceId: string; userId: string },
+  reason: string,
+  now: () => string,
+): void {
   recordMailAudit({
     tenantId: state.tenantId,
     workspaceId: state.workspaceId,
-    connectionId,
     actorUserId: state.userId,
-    action: "google.connected",
-    detail: identity.email,
-  });
-
-  // 8. Sanitized status — never returns tokens.
-  return SanitizedConnectionSchema.parse({
-    connectionId,
-    provider: "google",
-    connectedEmail: identity.email,
-    status: "connected",
+    action: "google.connect_failed",
+    detail: reason,
+    now,
   });
 }
 
@@ -188,7 +228,7 @@ export async function refreshGoogleAccessToken(
   deps: GoogleConnectDeps,
 ): Promise<string> {
   const refresh = openRefreshToken(connectionId, scope, deps.keyProvider);
-  const { accessToken } = await deps.http.refresh(refresh);
+  const { accessToken } = await deps.http.refreshAccessToken(refresh);
   return accessToken;
 }
 
@@ -209,7 +249,7 @@ export async function disconnectGoogle(
   if (credential && !credential.revokedAt) {
     try {
       const refresh = openRefreshToken(connectionId, scope, deps.keyProvider);
-      await deps.http.revoke(refresh);
+      await deps.http.revokeToken(refresh);
     } catch {
       // Revocation failure must not block local teardown.
     }

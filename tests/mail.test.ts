@@ -14,9 +14,15 @@ import {
 import { MailTransportNotConfiguredError } from "../src/mail/types";
 import {
   issueSendApproval,
-  consumeSendApproval,
+  beginSend,
+  markSent,
+  markFailed,
   clearSendApprovals,
 } from "../src/mail/security/sendApproval";
+import type { SendOutcome } from "../src/mail/sendGuard";
+
+const settle = (id: string, outcome: SendOutcome) =>
+  outcome.sent ? markSent(id, outcome.providerMessageId) : markFailed(id, outcome.retryable);
 
 const NOW = () => "2026-06-23T12:00:00.000Z";
 
@@ -135,7 +141,7 @@ test("send is refused when content is tampered after approval", async () => {
   clearSendApprovals();
   const fetchImpl = fakeFetch([{ match: /\/messages\/send/, body: { id: "sent_1" } }]);
   const adapter = new GoogleMailAdapter({
-    fetchImpl, resolveAccessToken: () => "tok", now: NOW, consumeApproval: consumeSendApproval,
+    fetchImpl, resolveAccessToken: () => "tok", now: NOW, beginSend, settleSend: settle,
   });
   const approval = issueSendApproval({
     tenantId: "t", workspaceId: "w", connectionId: "c1",
@@ -156,7 +162,7 @@ test("send succeeds with a matching approval and cannot be replayed", async () =
   clearSendApprovals();
   const fetchImpl = fakeFetch([{ match: /\/messages\/send/, body: { id: "sent_1", threadId: "th_1" } }]);
   const adapter = new GoogleMailAdapter({
-    fetchImpl, resolveAccessToken: () => "tok", now: NOW, consumeApproval: consumeSendApproval,
+    fetchImpl, resolveAccessToken: () => "tok", now: NOW, beginSend, settleSend: settle,
   });
   const approval = issueSendApproval({
     tenantId: "t", workspaceId: "w", connectionId: "c1",
@@ -170,8 +176,8 @@ test("send succeeds with a matching approval and cannot be replayed", async () =
 
   const sent = await send();
   assert.equal(sent.messageId, "sent_1");
-  // Replay of the same approval is refused (consumed).
-  await assert.rejects(send, /already consumed/);
+  // Replay of the same approval is refused (already sent).
+  await assert.rejects(send, /already sent/);
 });
 
 test("IMAP/SMTP + Yahoo connect but fail loud without a verified transport (no faking)", async () => {

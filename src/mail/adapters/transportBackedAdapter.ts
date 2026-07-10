@@ -15,7 +15,13 @@ import type {
 } from "@aaliyah/contracts/v1";
 
 import { MailProviderAdapter, MailTransportNotConfiguredError } from "../types";
-import { denyAllSends, type ApprovalConsumer } from "../sendGuard";
+import {
+  denyAllSends,
+  noopSettler,
+  classifySendError,
+  type ApprovalConsumer,
+  type SendSettler,
+} from "../sendGuard";
 import { makeConnection, type AdapterDeps } from "./helpers";
 
 /**
@@ -45,20 +51,22 @@ export class TransportBackedAdapter implements MailProviderAdapter {
 
   private readonly transport: MailTransport | undefined;
   private readonly now: () => string;
-  private readonly consumeApproval: ApprovalConsumer;
+  private readonly beginSend: ApprovalConsumer;
+  private readonly settleSend: SendSettler;
   private readonly connections = new Map<string, MailboxConnection>();
 
   constructor(config: {
     provider: MailProvider;
     capabilities: MailCapabilities;
     transport?: MailTransport;
-    deps?: AdapterDeps & { consumeApproval?: ApprovalConsumer };
+    deps?: AdapterDeps & { beginSend?: ApprovalConsumer; settleSend?: SendSettler };
   }) {
     this.provider = config.provider;
     this.capabilities = config.capabilities;
     this.transport = config.transport;
     this.now = config.deps?.now ?? (() => new Date().toISOString());
-    this.consumeApproval = config.deps?.consumeApproval ?? denyAllSends;
+    this.beginSend = config.deps?.beginSend ?? denyAllSends;
+    this.settleSend = config.deps?.settleSend ?? noopSettler;
   }
 
   private requireTransport(operation: string): MailTransport {
@@ -125,11 +133,19 @@ export class TransportBackedAdapter implements MailProviderAdapter {
   }
 
   async sendMessage(input: SendMessageInput): Promise<SentMessage> {
-    this.consumeApproval(input);
-    return this.requireTransport("sendMessage").sendMessage(
-      this.connection(input.connectionId),
-      input,
-    );
+    const claim = this.beginSend(input);
+    try {
+      const sent = await this.requireTransport("sendMessage").sendMessage(
+        this.connection(input.connectionId),
+        input,
+      );
+      this.settleSend(claim.approvalId, { sent: true, providerMessageId: sent.messageId });
+      return sent;
+    } catch (error) {
+      const outcome = classifySendError(error);
+      if (outcome) this.settleSend(claim.approvalId, outcome);
+      throw error;
+    }
   }
 
   async applyLabel(input: ApplyLabelInput): Promise<void> {
