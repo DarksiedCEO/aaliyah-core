@@ -32,9 +32,13 @@ DELETE /api/mail/connections/:connectionId        -> revoke + destroy + stop job
 The browser NEVER receives authorization codes (post-callback), access tokens,
 refresh tokens, client secrets, or raw provider errors.
 
-> ⚠️ Identity is currently taken from `x-aaliyah-tenant/workspace/user` headers
-> as a temporary seam. Production MUST replace this with an authenticated
-> session before exposure — this is the open auth gap from the audit.
+> Identity comes ONLY from a `Authorization: Bearer` credential resolved
+> server-side (session store for humans, service registry for workloads);
+> tenant, workspaces, and roles are resolved from the membership directory —
+> `x-aaliyah-*` headers are never read (Phase B3). Remaining gap: the session
+> store and membership directory are in-memory seams pending Phase B4 durable
+> backing, and there is no real IdP/login flow yet — sessions are issued
+> programmatically.
 
 ## Client experience
 

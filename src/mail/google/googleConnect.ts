@@ -72,11 +72,15 @@ export function buildGoogleAuthorizationUrl(
     tenantId: string;
     workspaceId: string;
     userId: string;
+    sessionId: string;
     redirectUri: string;
   },
   deps: GoogleConnectDeps,
 ): { url: string; state: string } {
-  const { state, codeChallenge } = createOAuthState(input);
+  const { stateValue, codeChallenge } = createOAuthState({
+    ...input,
+    keyProvider: deps.keyProvider,
+  });
   const params = new URLSearchParams({
     client_id: deps.clientId,
     redirect_uri: input.redirectUri,
@@ -87,9 +91,9 @@ export function buildGoogleAuthorizationUrl(
     scope: (deps.scopes ?? DEFAULT_SCOPES).join(" "),
     code_challenge: codeChallenge,
     code_challenge_method: "S256",
-    state: state.state,
+    state: stateValue,
   });
-  return { url: `${AUTHORIZE_URL}?${params.toString()}`, state: state.state };
+  return { url: `${AUTHORIZE_URL}?${params.toString()}`, state: stateValue };
 }
 
 /**
@@ -103,14 +107,21 @@ export async function handleGoogleCallback(
     code: string;
     state: string;
     redirectUri: string;
+    /** sessionId of the authenticated principal presenting the callback. */
+    expectedSessionId: string;
     expectedTenantId?: string;
   },
   deps: GoogleConnectDeps,
 ): Promise<SanitizedConnection> {
   const now = deps.now ?? (() => new Date().toISOString());
 
-  // 1. One-time state — consumed up front so a replayed callback is dead.
-  const state = consumeOAuthState(input.state, input.redirectUri);
+  // 1. One-time, session-bound state — consumed up front so a replayed or
+  // hijacked callback is dead. Tenant/workspace/user come ONLY from the state.
+  const state = consumeOAuthState(input.state, {
+    redirectUri: input.redirectUri,
+    sessionId: input.expectedSessionId,
+    keyProvider: deps.keyProvider,
+  });
 
   // 2. Tenant-confusion defense.
   if (input.expectedTenantId && state.tenantId !== input.expectedTenantId) {

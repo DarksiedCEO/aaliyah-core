@@ -14,7 +14,10 @@ export type MailAuditEvent = {
   tenantId: string;
   workspaceId: string;
   connectionId?: string;
+  /** Who acted: a human session or a workload identity. */
+  actorType?: "user" | "service";
   actorUserId?: string;
+  actorServiceId?: string;
   action: string;
   detail?: string;
   at: string;
@@ -28,7 +31,9 @@ export function recordMailAudit(input: {
   tenantId: string;
   workspaceId: string;
   connectionId?: string;
+  actorType?: "user" | "service";
   actorUserId?: string;
+  actorServiceId?: string;
   action: string;
   detail?: string;
   now?: () => string;
@@ -39,7 +44,9 @@ export function recordMailAudit(input: {
     tenantId: input.tenantId,
     workspaceId: input.workspaceId,
     ...(input.connectionId ? { connectionId: input.connectionId } : {}),
+    ...(input.actorType ? { actorType: input.actorType } : {}),
     ...(input.actorUserId ? { actorUserId: input.actorUserId } : {}),
+    ...(input.actorServiceId ? { actorServiceId: input.actorServiceId } : {}),
     action: input.action,
     ...(input.detail ? { detail: input.detail } : {}),
     at: now(),

@@ -57,8 +57,13 @@ function deps(http: GoogleOAuthHttp): GoogleConnectDeps {
   return { http, keyProvider: KP, clientId: "client-123", now: NOW };
 }
 
+const SESSION = "sess_u1";
+
 function authInput() {
-  return { tenantId: "tenant_a", workspaceId: "tenant_a:default", userId: "u1", redirectUri: REDIRECT };
+  return {
+    tenantId: "tenant_a", workspaceId: "tenant_a:default", userId: "u1",
+    sessionId: SESSION, redirectUri: REDIRECT,
+  };
 }
 
 before(() => {
@@ -93,7 +98,7 @@ test("callback connects: sanitized status, encrypted-at-rest token, audit trail"
   const http = fakeHttp();
   const { state } = buildGoogleAuthorizationUrl(authInput(), deps(http));
   const result = await handleGoogleCallback(
-    { code: "auth-code", state, redirectUri: REDIRECT }, deps(http),
+    { code: "auth-code", state, redirectUri: REDIRECT, expectedSessionId: SESSION }, deps(http),
   );
 
   assert.equal(result.status, "connected");
@@ -114,24 +119,24 @@ test("OAuth state cannot be replayed and a foreign tenant is rejected", async ()
   const http = fakeHttp();
   const { state } = buildGoogleAuthorizationUrl(authInput(), deps(http));
 
-  await handleGoogleCallback({ code: "c", state, redirectUri: REDIRECT }, deps(http));
+  await handleGoogleCallback({ code: "c", state, redirectUri: REDIRECT, expectedSessionId: SESSION }, deps(http));
   // Replay of the same state is dead.
   await assert.rejects(
-    () => handleGoogleCallback({ code: "c", state, redirectUri: REDIRECT }, deps(http)),
+    () => handleGoogleCallback({ code: "c", state, redirectUri: REDIRECT, expectedSessionId: SESSION }, deps(http)),
     /state already used/,
   );
 
   // Wrong redirect URI is rejected.
   const { state: s2 } = buildGoogleAuthorizationUrl(authInput(), deps(http));
   await assert.rejects(
-    () => handleGoogleCallback({ code: "c", state: s2, redirectUri: "https://evil.example/cb" }, deps(http)),
+    () => handleGoogleCallback({ code: "c", state: s2, redirectUri: "https://evil.example/cb", expectedSessionId: SESSION }, deps(http)),
     /redirect URI mismatch/,
   );
 
   // Tenant confusion is rejected.
   const { state: s3 } = buildGoogleAuthorizationUrl(authInput(), deps(http));
   await assert.rejects(
-    () => handleGoogleCallback({ code: "c", state: s3, redirectUri: REDIRECT, expectedTenantId: "tenant_b" }, deps(http)),
+    () => handleGoogleCallback({ code: "c", state: s3, redirectUri: REDIRECT, expectedSessionId: SESSION, expectedTenantId: "tenant_b" }, deps(http)),
     /tenant mismatch/,
   );
 });
@@ -139,7 +144,7 @@ test("OAuth state cannot be replayed and a foreign tenant is rejected", async ()
 test("a failed code exchange leaves no orphan credential or connection", async () => {
   const http = fakeHttp({ exchangeAuthorizationCode: async () => { throw new Error("google 400"); } });
   const { state } = buildGoogleAuthorizationUrl(authInput(), deps(http));
-  await assert.rejects(() => handleGoogleCallback({ code: "c", state, redirectUri: REDIRECT }, deps(http)));
+  await assert.rejects(() => handleGoogleCallback({ code: "c", state, redirectUri: REDIRECT, expectedSessionId: SESSION }, deps(http)));
   assert.equal(getMailCredential(CONN_ID, SCOPE), undefined);
   assert.equal(getConnection(CONN_ID, SCOPE), undefined);
 });
@@ -147,7 +152,7 @@ test("a failed code exchange leaves no orphan credential or connection", async (
 test("tenant isolation: another tenant cannot read the connection or credential", async () => {
   const http = fakeHttp();
   const { state } = buildGoogleAuthorizationUrl(authInput(), deps(http));
-  await handleGoogleCallback({ code: "c", state, redirectUri: REDIRECT }, deps(http));
+  await handleGoogleCallback({ code: "c", state, redirectUri: REDIRECT, expectedSessionId: SESSION }, deps(http));
 
   const foreign = { tenantId: "tenant_b", workspaceId: "tenant_b:default" };
   assert.equal(getMailCredential(CONN_ID, foreign), undefined);
@@ -157,7 +162,7 @@ test("tenant isolation: another tenant cannot read the connection or credential"
 test("access token refresh works, and disconnect revokes + destroys + invalidates", async () => {
   const http = fakeHttp();
   const { state } = buildGoogleAuthorizationUrl(authInput(), deps(http));
-  await handleGoogleCallback({ code: "c", state, redirectUri: REDIRECT }, deps(http));
+  await handleGoogleCallback({ code: "c", state, redirectUri: REDIRECT, expectedSessionId: SESSION }, deps(http));
 
   // Refresh works from the encrypted token.
   assert.equal(await refreshGoogleAccessToken(CONN_ID, SCOPE, deps(http)), "at2");
