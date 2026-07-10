@@ -1,109 +1,99 @@
 import assert from "node:assert/strict";
 import test, { beforeEach } from "node:test";
 
-import type { KeyProvider } from "../src/crypto/authenticatedEncryption";
+import { localMasterKms } from "../src/crypto/envelopeEncryption";
 import {
-  clearOAuthStates,
   createOAuthState,
   consumeOAuthState,
-  debugOAuthStates,
+  type OAuthStateDeps,
 } from "../src/mail/security/oauthStateStore";
 import {
   handleGoogleCallback,
   type GoogleConnectDeps,
   type GoogleOAuthHttp,
 } from "../src/mail/google/googleConnect";
-import { clearMailCredentials } from "../src/mail/security/credentialVault";
-import { clearConnections, getConnection } from "../src/mail/connectionStore";
+import { createInMemoryMailState } from "../src/mail/mailState";
 
-const KP: KeyProvider = { currentVersion: () => "v1", key: () => Buffer.alloc(32, 7) };
+const KMS = localMasterKms({ keyId: "v1", masterKey: Buffer.alloc(32, 7) });
 const REDIRECT = "https://app.example/oauth/google/callback";
-const BIND = {
+const BINDING = {
   tenantId: "tenant_a",
   workspaceId: "tenant_a:default",
   userId: "u1",
   sessionId: "sess_original",
   redirectUri: REDIRECT,
-  keyProvider: KP,
 };
 
+let state: ReturnType<typeof createInMemoryMailState>;
+let deps: OAuthStateDeps;
+
 beforeEach(() => {
-  clearOAuthStates();
-  clearMailCredentials();
-  clearConnections();
+  state = createInMemoryMailState();
+  deps = { store: state.oauthStates, kms: KMS };
 });
 
-test("oauth state is persisted hashed with an encrypted verifier only", () => {
-  const { stateValue, codeChallenge } = createOAuthState(BIND);
+test("oauth state is persisted hashed with an encrypted verifier only", async () => {
+  const { stateValue, codeChallenge } = await createOAuthState(BINDING, deps);
   assert.ok(stateValue.length > 20);
   assert.ok(codeChallenge.length > 20);
 
-  const stored = JSON.stringify(debugOAuthStates());
+  const stored = JSON.stringify(state.dump().oauthStates);
   // Neither the raw state value nor any plaintext verifier may be persisted.
   assert.ok(!stored.includes(stateValue), "raw state value must not be stored");
   assert.ok(!stored.includes('"codeVerifier"'), "plaintext verifier field must not exist");
   assert.ok(stored.includes("codeVerifierEncrypted"));
-  assert.ok(stored.includes(BIND.sessionId), "state must be bound to the session");
+  assert.ok(stored.includes(BINDING.sessionId), "state must be bound to the session");
 });
 
-test("consume succeeds only for the original session and returns the verifier once", () => {
-  const { stateValue } = createOAuthState(BIND);
+test("consume succeeds only for the original session and returns the verifier once", async () => {
+  const { stateValue } = await createOAuthState(BINDING, deps);
 
   // A different authenticated session cannot consume the state.
-  assert.throws(
+  await assert.rejects(
     () =>
-      consumeOAuthState(stateValue, {
-        redirectUri: REDIRECT,
-        sessionId: "sess_hijacker",
-        keyProvider: KP,
-      }),
+      consumeOAuthState(stateValue, { redirectUri: REDIRECT, sessionId: "sess_hijacker" }, deps),
     /session/,
   );
 
-  const consumed = consumeOAuthState(stateValue, {
-    redirectUri: REDIRECT,
-    sessionId: "sess_original",
-    keyProvider: KP,
-  });
-  assert.equal(consumed.tenantId, BIND.tenantId);
-  assert.equal(consumed.workspaceId, BIND.workspaceId);
-  assert.equal(consumed.userId, BIND.userId);
+  const consumed = await consumeOAuthState(
+    stateValue,
+    { redirectUri: REDIRECT, sessionId: "sess_original" },
+    deps,
+  );
+  assert.equal(consumed.tenantId, BINDING.tenantId);
+  assert.equal(consumed.workspaceId, BINDING.workspaceId);
+  assert.equal(consumed.userId, BINDING.userId);
   assert.ok(consumed.codeVerifier.length > 20);
 
   // One-time: replay is dead even for the right session.
-  assert.throws(
+  await assert.rejects(
     () =>
-      consumeOAuthState(stateValue, {
-        redirectUri: REDIRECT,
-        sessionId: "sess_original",
-        keyProvider: KP,
-      }),
+      consumeOAuthState(stateValue, { redirectUri: REDIRECT, sessionId: "sess_original" }, deps),
     /already used/,
   );
 });
 
-test("expiry and redirect mismatch still fail closed under the new shape", () => {
+test("expiry and redirect mismatch still fail closed under the new shape", async () => {
   const t0 = Date.now();
-  const { stateValue } = createOAuthState({ ...BIND, ttlMs: 1000, now: () => t0 });
-  assert.throws(
+  const { stateValue } = await createOAuthState({ ...BINDING, ttlMs: 1000, now: () => t0 }, deps);
+  await assert.rejects(
     () =>
-      consumeOAuthState(stateValue, {
-        redirectUri: REDIRECT,
-        sessionId: "sess_original",
-        keyProvider: KP,
-        now: () => t0 + 5000,
-      }),
+      consumeOAuthState(
+        stateValue,
+        { redirectUri: REDIRECT, sessionId: "sess_original", now: () => t0 + 5000 },
+        deps,
+      ),
     /expired/,
   );
 
-  const fresh = createOAuthState(BIND);
-  assert.throws(
+  const fresh = await createOAuthState(BINDING, deps);
+  await assert.rejects(
     () =>
-      consumeOAuthState(fresh.stateValue, {
-        redirectUri: "https://evil.example/callback",
-        sessionId: "sess_original",
-        keyProvider: KP,
-      }),
+      consumeOAuthState(
+        fresh.stateValue,
+        { redirectUri: "https://evil.example/callback", sessionId: "sess_original" },
+        deps,
+      ),
     /redirect/,
   );
 });
@@ -129,11 +119,11 @@ function fakeHttp(email: string): GoogleOAuthHttp & { revoked: string[] } {
 }
 
 function connectDeps(http: GoogleOAuthHttp): GoogleConnectDeps {
-  return { http, keyProvider: KP, clientId: "client-1" };
+  return { http, kms: KMS, state, clientId: "client-1" };
 }
 
 test("callback consumed under a different session is rejected and creates nothing", async () => {
-  const { stateValue } = createOAuthState(BIND);
+  const { stateValue } = await createOAuthState(BINDING, deps);
   const http = fakeHttp("sales@pussycatalley.com");
 
   await assert.rejects(
@@ -150,11 +140,13 @@ test("callback consumed under a different session is rejected and creates nothin
     /session/,
   );
   // Nothing persisted for either tenant/workspace.
-  assert.equal(debugOAuthStates().every((s) => s.consumedAt === null), true);
+  const stored = state.dump();
+  assert.equal(stored.connections!.length, 0);
+  assert.equal(stored.credentials!.length, 0);
 });
 
 test("callback derives tenant and workspace from the bound state, never from caller input", async () => {
-  const { stateValue } = createOAuthState(BIND);
+  const { stateValue } = await createOAuthState(BINDING, deps);
   const http = fakeHttp("sales@pussycatalley.com");
 
   const sanitized = await handleGoogleCallback(
@@ -164,17 +156,17 @@ test("callback derives tenant and workspace from the bound state, never from cal
   assert.equal(sanitized.status, "connected");
 
   // The connection exists exactly in the state-bound scope…
-  const inBoundScope = getConnection(sanitized.connectionId, {
-    tenantId: BIND.tenantId,
-    workspaceId: BIND.workspaceId,
+  const inBoundScope = await state.connections.get(sanitized.connectionId, {
+    tenantId: BINDING.tenantId,
+    workspaceId: BINDING.workspaceId,
   });
   assert.ok(inBoundScope);
-  assert.equal(inBoundScope!.userId, BIND.userId);
+  assert.equal(inBoundScope!.userId, BINDING.userId);
 
   // …and is invisible to any other tenant, no matter what a caller claims.
-  const crossTenant = getConnection(sanitized.connectionId, {
+  const crossTenant = await state.connections.get(sanitized.connectionId, {
     tenantId: "tenant_b",
     workspaceId: "tenant_b:default",
   });
-  assert.equal(crossTenant, undefined);
+  assert.equal(crossTenant, null);
 });

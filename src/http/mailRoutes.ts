@@ -8,7 +8,7 @@ import type { MembershipDirectory } from "../auth/membershipDirectory";
 import { authorizeMail, AuthorizationError } from "../auth/permissions";
 import type { SessionStore } from "../auth/sessionStore";
 import { GoogleMailAdapter } from "../mail/adapters/googleMailAdapter";
-import { getConnection } from "../mail/connectionStore";
+import type { MailStateBackend } from "../mail/mailState";
 import {
   buildGoogleAuthorizationUrl,
   disconnectGoogle,
@@ -30,6 +30,8 @@ export type MailRoutesDeps = {
   frontendInboxesUrl: string; // e.g. https://app.example/settings/inboxes
   connectDeps?: GoogleConnectDeps; // present only when configured
   auth: MailAuthDeps;
+  /** Durable mail state (Postgres in production, in-memory for dev/tests). */
+  state: MailStateBackend;
 };
 
 // ---- Server-verified principal resolution ----
@@ -81,13 +83,14 @@ function auditDecision(
 
 // ---- Handler functions (framework-independent, unit-testable) ----
 
-export function startGoogleConnect(
+export async function startGoogleConnect(
   principal: Principal,
   workspaceId: string,
   deps: MailRoutesDeps,
-):
+): Promise<
   | { available: false; reasonCode: "provider_not_configured" }
-  | { available: true; authorizationUrl: string } {
+  | { available: true; authorizationUrl: string }
+> {
   authorizeMail(principal, "mail.connection.create", {
     tenantId: principal.tenantId,
     workspaceId,
@@ -100,7 +103,7 @@ export function startGoogleConnect(
   if (!deps.capability.available || !deps.connectDeps) {
     return { available: false, reasonCode: "provider_not_configured" };
   }
-  const { url } = buildGoogleAuthorizationUrl(
+  const { url } = await buildGoogleAuthorizationUrl(
     {
       tenantId: principal.tenantId,
       workspaceId,
@@ -166,17 +169,18 @@ function clientStatus(stored: string): SanitizedConnection["status"] {
   return "needs_attention";
 }
 
-export function getConnectionStatus(
+export async function getConnectionStatus(
   connectionId: string,
   workspaceId: string,
   principal: Principal,
-): SanitizedConnection | null {
+  deps: MailRoutesDeps,
+): Promise<SanitizedConnection | null> {
   authorizeMail(principal, "mail.connection.read", {
     tenantId: principal.tenantId,
     workspaceId,
   });
   const scope: TenantScope = { tenantId: principal.tenantId, workspaceId };
-  const conn = getConnection(connectionId, scope);
+  const conn = await deps.state.connections.get(connectionId, scope);
   if (!conn) return null;
   auditDecision(principal, workspaceId, "mail.connection.read", "allowed", connectionId);
   return {
@@ -204,7 +208,7 @@ export async function testConnection(
   });
   if (!deps.connectDeps) throw new Error("google not configured");
   const scope: TenantScope = { tenantId: principal.tenantId, workspaceId };
-  const conn = getConnection(connectionId, scope);
+  const conn = await deps.state.connections.get(connectionId, scope);
   if (!conn) throw new Error("connection not found");
 
   const accessToken = await refreshGoogleAccessToken(connectionId, scope, deps.connectDeps);
@@ -238,7 +242,7 @@ export async function disconnectConnection(
   });
   if (!deps.connectDeps) return { ok: false };
   const scope: TenantScope = { tenantId: principal.tenantId, workspaceId };
-  const conn = getConnection(connectionId, scope);
+  const conn = await deps.state.connections.get(connectionId, scope);
   if (!conn) return { ok: false };
   await disconnectGoogle(connectionId, scope, deps.connectDeps);
   auditDecision(principal, workspaceId, "mail.connection.disconnect_requested", "allowed", connectionId);
@@ -294,13 +298,13 @@ export function createMailRouter(deps: MailRoutesDeps): Router {
 
   router.post(
     "/api/mail/connections/google/start",
-    authed((req, res, principal) => {
+    authed(async (req, res, principal) => {
       const workspaceId = workspaceParam(req);
       if (!workspaceId) {
         res.status(400).json({ error: "workspace_required" });
         return;
       }
-      const result = startGoogleConnect(principal, workspaceId, deps);
+      const result = await startGoogleConnect(principal, workspaceId, deps);
       res.status(result.available ? 200 : 503).json(result);
     }),
   );
@@ -320,13 +324,18 @@ export function createMailRouter(deps: MailRoutesDeps): Router {
 
   router.get(
     "/api/mail/connections/:connectionId",
-    authed((req, res, principal) => {
+    authed(async (req, res, principal) => {
       const workspaceId = workspaceParam(req);
       if (!workspaceId) {
         res.status(400).json({ error: "workspace_required" });
         return;
       }
-      const status = getConnectionStatus(String(req.params.connectionId), workspaceId, principal);
+      const status = await getConnectionStatus(
+        String(req.params.connectionId),
+        workspaceId,
+        principal,
+        deps,
+      );
       if (status) res.json(status);
       else res.status(404).json({ error: "not_found" });
     }),

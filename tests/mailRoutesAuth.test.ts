@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 
 import express from "express";
 
-import type { KeyProvider } from "../src/crypto/authenticatedEncryption";
+import { localMasterKms } from "../src/crypto/envelopeEncryption";
 import { createMailRouter, type MailRoutesDeps } from "../src/http/mailRoutes";
 import { createSessionStore, type SessionStore } from "../src/auth/sessionStore";
 import {
@@ -15,14 +15,12 @@ import {
   type MembershipDirectory,
 } from "../src/auth/membershipDirectory";
 import type { GoogleConnectDeps, GoogleOAuthHttp } from "../src/mail/google/googleConnect";
-import { clearOAuthStates } from "../src/mail/security/oauthStateStore";
-import { clearMailCredentials } from "../src/mail/security/credentialVault";
-import { clearConnections, getConnection } from "../src/mail/connectionStore";
+import { createInMemoryMailState } from "../src/mail/mailState";
 import { clearSendApprovals } from "../src/mail/security/sendApproval";
 import { readMailAudit } from "../src/mail/security/mailAudit";
 import { connectionIdFor } from "../src/mail/adapters/helpers";
 
-const KP: KeyProvider = { currentVersion: () => "v1", key: () => Buffer.alloc(32, 5) };
+const KMS = localMasterKms({ keyId: "v1", masterKey: Buffer.alloc(32, 5) });
 const EMAIL = "sales@pussycatalley.com";
 const REDIRECT = "https://app.example/oauth/google/callback";
 const TENANT_A = "tenant_a";
@@ -32,6 +30,7 @@ const WS_B = "tenant_b:default";
 
 let sessions: SessionStore;
 let directory: MembershipDirectory;
+let mailState: ReturnType<typeof createInMemoryMailState>;
 let server: ReturnType<express.Express["listen"]>;
 let baseUrl: string;
 let revokedTokens: string[];
@@ -53,7 +52,7 @@ function fakeHttp(): GoogleOAuthHttp {
 }
 
 function connectDeps(): GoogleConnectDeps {
-  return { http: fakeHttp(), keyProvider: KP, clientId: "client-1" };
+  return { http: fakeHttp(), kms: KMS, state: mailState, clientId: "client-1" };
 }
 
 function routesDeps(): MailRoutesDeps {
@@ -63,6 +62,7 @@ function routesDeps(): MailRoutesDeps {
     frontendInboxesUrl: "https://app.example/settings/inboxes",
     connectDeps: connectDeps(),
     auth: { sessions, directory },
+    state: mailState,
   };
 }
 
@@ -126,13 +126,11 @@ before(() => {
 });
 
 beforeEach(async () => {
-  clearOAuthStates();
-  clearMailCredentials();
-  clearConnections();
   clearSendApprovals();
   revokedTokens = [];
   sessions = createSessionStore();
   directory = createMembershipDirectory();
+  mailState = createInMemoryMailState();
   if (server) server.close();
   const app = express();
   app.use(express.json());
@@ -180,8 +178,8 @@ test("spoofed identity headers cannot redirect an authenticated operation to ano
   const body = (await res.json()) as { connectionId: string };
   assert.equal(body.connectionId, connectionId);
   // And the connection genuinely lives in tenant_a, not tenant_b.
-  assert.ok(getConnection(connectionId, { tenantId: TENANT_A, workspaceId: WS_A }));
-  assert.equal(getConnection(connectionId, { tenantId: TENANT_B, workspaceId: WS_B }), undefined);
+  assert.ok(await mailState.connections.get(connectionId, { tenantId: TENANT_A, workspaceId: WS_A }));
+  assert.equal(await mailState.connections.get(connectionId, { tenantId: TENANT_B, workspaceId: WS_B }), null);
 });
 
 // ---- Gate: authorized-but-unpermissioned → 403; role policy on routes ----
@@ -213,7 +211,7 @@ test("workspace member can view health but cannot test, connect, or disconnect",
   });
   assert.equal(delRes.status, 403);
   // Still connected.
-  assert.ok(getConnection(connectionId, { tenantId: TENANT_A, workspaceId: WS_A }));
+  assert.ok(await mailState.connections.get(connectionId, { tenantId: TENANT_A, workspaceId: WS_A }));
 });
 
 test("workspace admin can connect and disconnect a shared mailbox", async () => {
@@ -224,7 +222,7 @@ test("workspace admin can connect and disconnect a shared mailbox", async () => 
     token: admin.token,
   });
   assert.equal(delRes.status, 200);
-  assert.equal(getConnection(connectionId, { tenantId: TENANT_A, workspaceId: WS_A }), undefined);
+  assert.equal(await mailState.connections.get(connectionId, { tenantId: TENANT_A, workspaceId: WS_A }), null);
   // Provider token revoked on disconnect.
   assert.ok(revokedTokens.length >= 1);
 });
@@ -256,7 +254,7 @@ test("a tenant_b admin can neither read nor disconnect a tenant_a connection", a
     token: adminB.token,
   });
   assert.equal(del.status, 404);
-  assert.ok(getConnection(connectionId, { tenantId: TENANT_A, workspaceId: WS_A }));
+  assert.ok(await mailState.connections.get(connectionId, { tenantId: TENANT_A, workspaceId: WS_A }));
 });
 
 // ---- Gate: OAuth state bound to user+session+tenant+workspace at the route level ----
@@ -287,7 +285,7 @@ test("a callback presented by a different user/session fails and connects nothin
     provider: "google",
     emailAddress: EMAIL,
   });
-  assert.equal(getConnection(expectedId, { tenantId: TENANT_A, workspaceId: WS_A }), undefined);
+  assert.equal(await mailState.connections.get(expectedId, { tenantId: TENANT_A, workspaceId: WS_A }), null);
 });
 
 test("callback query params cannot choose tenant or workspace", async () => {
@@ -315,8 +313,8 @@ test("callback query params cannot choose tenant or workspace", async () => {
     provider: "google",
     emailAddress: EMAIL,
   });
-  assert.ok(getConnection(connectionId, { tenantId: TENANT_A, workspaceId: WS_A }));
-  assert.equal(getConnection(connectionId, { tenantId: TENANT_B, workspaceId: WS_B }), undefined);
+  assert.ok(await mailState.connections.get(connectionId, { tenantId: TENANT_A, workspaceId: WS_A }));
+  assert.equal(await mailState.connections.get(connectionId, { tenantId: TENANT_B, workspaceId: WS_B }), null);
 });
 
 // ---- Gate: revoked sessions cannot start OAuth ----
@@ -360,7 +358,7 @@ test("service identity can read health but cannot start or disconnect", async ()
     token: serviceToken,
   });
   assert.equal(del.status, 403);
-  assert.ok(getConnection(connectionId, { tenantId: TENANT_A, workspaceId: WS_A }));
+  assert.ok(await mailState.connections.get(connectionId, { tenantId: TENANT_A, workspaceId: WS_A }));
 });
 
 // ---- Gate: audit distinguishes users from services; no secrets in mail logs ----

@@ -35,10 +35,25 @@ refresh tokens, client secrets, or raw provider errors.
 > Identity comes ONLY from a `Authorization: Bearer` credential resolved
 > server-side (session store for humans, service registry for workloads);
 > tenant, workspaces, and roles are resolved from the membership directory —
-> `x-aaliyah-*` headers are never read (Phase B3). Remaining gap: the session
-> store and membership directory are in-memory seams pending Phase B4 durable
-> backing, and there is no real IdP/login flow yet — sessions are issued
-> programmatically.
+> `x-aaliyah-*` headers are never read (Phase B3).
+>
+> Mail state (Phase B4): OAuth states, connections, credentials, health,
+> send approvals, reconciliation, job markers, and audit all have durable
+> Postgres stores (`AALIYAH_DATABASE_URL`; server runs migrations at boot).
+> Refresh tokens and PKCE verifiers rest as KMS envelopes (fresh data key
+> per secret; local env master today, cloud KMS swaps the wrapper only).
+> The connect vertical (oauth/connections/credentials/job markers) runs on
+> this backend; without a database URL it runs on the conformance-tested
+> in-memory twin — dev only, announced at boot.
+>
+> Remaining gaps, stated plainly: (1) send approvals still run on the
+> in-memory module store — wiring the durable store requires async changes
+> to frozen sendGuard types (unlock pending, risk report on file); the
+> durable store exists, is proven, and disconnect invalidates BOTH views.
+> (2) Session store and membership directory are in-memory; no real
+> IdP/login flow yet — sessions are issued programmatically. (3) Audit
+> events currently write to scoped JSONL; the durable audit table exists
+> and is proven, wiring lands with the approval unlock.
 
 ## Client experience
 

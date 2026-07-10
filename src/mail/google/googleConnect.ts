@@ -4,14 +4,10 @@ import {
   type SanitizedConnection,
 } from "@aaliyah/contracts/v1";
 
-import type { KeyProvider } from "../../crypto/authenticatedEncryption";
+import type { KmsKeyWrapper } from "../../crypto/envelopeEncryption";
 import type { TenantScope } from "../../persistence/tenantScopedStore";
 import { connectionIdFor } from "../adapters/helpers";
-import {
-  deleteConnection,
-  getConnection,
-  saveConnection,
-} from "../connectionStore";
+import type { MailStateBackend } from "../mailState";
 import {
   deleteMailCredential,
   getMailCredential,
@@ -55,7 +51,9 @@ export interface GoogleOAuthHttp {
 
 export type GoogleConnectDeps = {
   http: GoogleOAuthHttp;
-  keyProvider: KeyProvider;
+  kms: KmsKeyWrapper;
+  /** Durable mail state (Postgres in production, in-memory for dev/tests). */
+  state: MailStateBackend;
   clientId: string;
   scopes?: string[];
   now?: () => string;
@@ -64,10 +62,10 @@ export type GoogleConnectDeps = {
 
 /**
  * Build the "Continue with Google" authorization URL. Creates a one-time,
- * tenant-bound PKCE state; the user never types their address — Google returns
- * the verified mailbox identity in the callback.
+ * session-bound PKCE state; the user never types their address — Google
+ * returns the verified mailbox identity in the callback.
  */
-export function buildGoogleAuthorizationUrl(
+export async function buildGoogleAuthorizationUrl(
   input: {
     tenantId: string;
     workspaceId: string;
@@ -76,10 +74,10 @@ export function buildGoogleAuthorizationUrl(
     redirectUri: string;
   },
   deps: GoogleConnectDeps,
-): { url: string; state: string } {
-  const { stateValue, codeChallenge } = createOAuthState({
-    ...input,
-    keyProvider: deps.keyProvider,
+): Promise<{ url: string; state: string }> {
+  const { stateValue, codeChallenge } = await createOAuthState(input, {
+    store: deps.state.oauthStates,
+    kms: deps.kms,
   });
   const params = new URLSearchParams({
     client_id: deps.clientId,
@@ -114,14 +112,15 @@ export async function handleGoogleCallback(
   deps: GoogleConnectDeps,
 ): Promise<SanitizedConnection> {
   const now = deps.now ?? (() => new Date().toISOString());
+  const vault = { store: deps.state.credentials, kms: deps.kms };
 
   // 1. One-time, session-bound state — consumed up front so a replayed or
   // hijacked callback is dead. Tenant/workspace/user come ONLY from the state.
-  const state = consumeOAuthState(input.state, {
-    redirectUri: input.redirectUri,
-    sessionId: input.expectedSessionId,
-    keyProvider: deps.keyProvider,
-  });
+  const state = await consumeOAuthState(
+    input.state,
+    { redirectUri: input.redirectUri, sessionId: input.expectedSessionId },
+    { store: deps.state.oauthStates, kms: deps.kms },
+  );
 
   // 2. Tenant-confusion defense.
   if (input.expectedTenantId && state.tenantId !== input.expectedTenantId) {
@@ -155,7 +154,7 @@ export async function handleGoogleCallback(
     });
     const at = now();
 
-    saveMailCredential(
+    await saveMailCredential(
       {
         connectionId,
         tenantId: state.tenantId,
@@ -166,9 +165,9 @@ export async function handleGoogleCallback(
         connectedEmail: identity.email,
         accessTokenExpiresAt: new Date(Date.now() + tokens.expiresIn * 1000).toISOString(),
       },
-      deps.keyProvider,
+      vault,
     );
-    saveConnection(
+    await deps.state.connections.save(
       MailboxConnectionSchema.parse({
         connectionId,
         tenantId: state.tenantId,
@@ -186,6 +185,7 @@ export async function handleGoogleCallback(
       tenantId: state.tenantId,
       workspaceId: state.workspaceId,
       connectionId,
+      actorType: "user",
       actorUserId: state.userId,
       action: "google.connected",
       detail: identity.email,
@@ -199,8 +199,8 @@ export async function handleGoogleCallback(
     });
   } catch (error) {
     if (connectionId) {
-      deleteMailCredential(connectionId);
-      deleteConnection(connectionId);
+      await deleteMailCredential(connectionId, vault);
+      await deps.state.connections.delete(connectionId);
     }
     await safeRevoke(deps, tokens.refreshToken);
     deps.onDisconnect?.(connectionId ?? "");
@@ -225,6 +225,7 @@ function recordFailureAudit(
   recordMailAudit({
     tenantId: state.tenantId,
     workspaceId: state.workspaceId,
+    actorType: "user",
     actorUserId: state.userId,
     action: "google.connect_failed",
     detail: reason,
@@ -238,28 +239,34 @@ export async function refreshGoogleAccessToken(
   scope: TenantScope,
   deps: GoogleConnectDeps,
 ): Promise<string> {
-  const refresh = openRefreshToken(connectionId, scope, deps.keyProvider);
+  const refresh = await openRefreshToken(connectionId, scope, {
+    store: deps.state.credentials,
+    kms: deps.kms,
+  });
   const { accessToken } = await deps.http.refreshAccessToken(refresh);
   return accessToken;
 }
 
 /**
  * Disconnect: revoke the provider token, cryptographically destroy the stored
- * credential, invalidate pending send approvals, stop queued work, delete the
- * connection — preserving only non-secret audit records.
+ * credential, invalidate pending send approvals, mark background jobs stopped
+ * (durable) and notify listeners, delete the connection — preserving only
+ * non-secret audit records.
  */
 export async function disconnectGoogle(
   connectionId: string,
   scope: TenantScope,
   deps: GoogleConnectDeps,
 ): Promise<void> {
-  const conn = getConnection(connectionId, scope);
-  const credential = getMailCredential(connectionId, scope);
+  const now = deps.now ?? (() => new Date().toISOString());
+  const vault = { store: deps.state.credentials, kms: deps.kms };
+  const conn = await deps.state.connections.get(connectionId, scope);
+  const credential = await getMailCredential(connectionId, scope, vault);
 
   // 1-2. Revoke at the provider (best effort — already-revoked is fine).
   if (credential && !credential.revokedAt) {
     try {
-      const refresh = openRefreshToken(connectionId, scope, deps.keyProvider);
+      const refresh = await openRefreshToken(connectionId, scope, vault);
       await deps.http.revokeToken(refresh);
     } catch {
       // Revocation failure must not block local teardown.
@@ -267,13 +274,23 @@ export async function disconnectGoogle(
   }
 
   // 3. Destroy the stored secret.
-  revokeMailCredential(connectionId, scope, deps.now);
-  // 4. Stop polling / queued jobs.
+  await revokeMailCredential(connectionId, scope, vault, now);
+  // 4. Stop polling / queued jobs — durable marker + in-process signal.
+  await deps.state.jobMarkers.setStopped({
+    connectionId,
+    tenantId: scope.tenantId,
+    workspaceId: scope.workspaceId,
+    stoppedAt: now(),
+  });
   deps.onDisconnect?.(connectionId);
-  // 5. Invalidate pending send approvals.
+  // 5. Invalidate pending send approvals. NOTE: send approvals remain in the
+  // in-memory module store pending the frozen sendGuard async unlock — the
+  // durable sendApprovals store exists but is deliberately unwired (risk
+  // report). Invalidate both so neither view can leak a claimable approval.
   invalidateApprovalsForConnection(connectionId);
+  await deps.state.sendApprovals.invalidateForConnection(connectionId, now);
   // 6. Remove the connection record (keep audit).
-  deleteConnection(connectionId);
+  await deps.state.connections.delete(connectionId);
 
   if (conn) {
     recordMailAudit({
