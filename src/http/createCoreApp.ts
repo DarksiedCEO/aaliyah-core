@@ -39,12 +39,18 @@ function mailRoutesDeps(auth: MailAuthDeps, state: MailStateBackend): MailRoutes
 /**
  * Select the mail-state backend: Postgres when AALIYAH_DATABASE_URL is set
  * (the caller — server.ts — must run migrations before serving traffic),
- * otherwise in-memory for dev/tests. The choice is explicit and logged by
- * the caller; there is no silent production fallback to memory.
+ * otherwise in-memory for dev/tests. In production the durable backend is
+ * REQUIRED — startup fails closed rather than running approvals, credentials,
+ * or audit on process memory.
  */
 export function mailStateFromEnv(env: NodeJS.ProcessEnv = process.env): MailStateBackend {
   if (env.AALIYAH_DATABASE_URL) {
     return createPostgresMailState(createMailDbPool(env));
+  }
+  if (env.NODE_ENV === "production") {
+    throw new Error(
+      "durable mail state is required in production: set AALIYAH_DATABASE_URL (no in-memory fallback)",
+    );
   }
   return createInMemoryMailState();
 }

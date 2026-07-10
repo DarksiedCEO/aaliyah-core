@@ -64,21 +64,29 @@ function actorFields(principal: Principal): {
     : { actorType: "service", actorServiceId: principal.serviceId };
 }
 
-/** Audit an authorization decision — allowed or denied — with the actor. */
-function auditDecision(
+/**
+ * Audit an authorization decision — allowed or denied — with the actor, into
+ * the durable audit store. Throws on persistence failure; each call site
+ * applies the policy (mutations fail closed, health reads continue).
+ */
+async function auditDecision(
+  store: MailStateBackend["audit"],
   principal: Principal,
   workspaceId: string,
   action: string,
   decision: "allowed" | "denied",
   detail?: string,
-): void {
-  recordMailAudit({
-    tenantId: principal.tenantId,
-    workspaceId,
-    ...actorFields(principal),
-    action,
-    detail: detail ?? decision,
-  });
+): Promise<void> {
+  await recordMailAudit(
+    {
+      tenantId: principal.tenantId,
+      workspaceId,
+      ...actorFields(principal),
+      action,
+      detail: detail ?? decision,
+    },
+    store,
+  );
 }
 
 // ---- Handler functions (framework-independent, unit-testable) ----
@@ -113,7 +121,8 @@ export async function startGoogleConnect(
     },
     deps.connectDeps,
   );
-  auditDecision(principal, workspaceId, "mail.connection.start_requested", "allowed");
+  // OAuth initiation is a mutation: unaudited => fail closed.
+  await auditDecision(deps.state.audit, principal, workspaceId, "mail.connection.start_requested", "allowed");
   return { available: true, authorizationUrl: url };
 }
 
@@ -182,7 +191,15 @@ export async function getConnectionStatus(
   const scope: TenantScope = { tenantId: principal.tenantId, workspaceId };
   const conn = await deps.state.connections.get(connectionId, scope);
   if (!conn) return null;
-  auditDecision(principal, workspaceId, "mail.connection.read", "allowed", connectionId);
+  try {
+    await auditDecision(deps.state.audit, principal, workspaceId, "mail.connection.read", "allowed", connectionId);
+  } catch (error) {
+    // Health read policy: continue, but surface the operational failure.
+    logger.error(
+      { reason: error instanceof Error ? error.message : "unknown" },
+      "mail.audit.append_failed",
+    );
+  }
   return {
     connectionId: conn.connectionId,
     provider: "google",
@@ -226,7 +243,8 @@ export async function testConnection(
     subject: marker,
     body: "Aaliyah connection self-test — safe to delete.",
   });
-  auditDecision(principal, workspaceId, "mail.connection.test_requested", "allowed", connectionId);
+  // Test writes a draft into the mailbox: a mutation — unaudited => fail closed.
+  await auditDecision(deps.state.audit, principal, workspaceId, "mail.connection.test_requested", "allowed", connectionId);
   return { profileOk: health.healthy, threadsListed: threads.length, draftId: draft.draftId, marker };
 }
 
@@ -245,7 +263,7 @@ export async function disconnectConnection(
   const conn = await deps.state.connections.get(connectionId, scope);
   if (!conn) return { ok: false };
   await disconnectGoogle(connectionId, scope, deps.connectDeps);
-  auditDecision(principal, workspaceId, "mail.connection.disconnect_requested", "allowed", connectionId);
+  await auditDecision(deps.state.audit, principal, workspaceId, "mail.connection.disconnect_requested", "allowed", connectionId);
   return { ok: true };
 }
 
@@ -272,13 +290,22 @@ export function createMailRouter(deps: MailRoutesDeps): Router {
         await handler(req, res, principal);
       } catch (error) {
         if (error instanceof AuthorizationError) {
-          auditDecision(
-            principal,
-            workspaceParam(req) ?? "unspecified",
-            "mail.authz.denied",
-            "denied",
-            error.code,
-          );
+          try {
+            await auditDecision(
+              deps.state.audit,
+              principal,
+              workspaceParam(req) ?? "unspecified",
+              "mail.authz.denied",
+              "denied",
+              error.code,
+            );
+          } catch (auditError) {
+            // The request is denied either way; surface the sink failure.
+            logger.error(
+              { reason: auditError instanceof Error ? auditError.message : "unknown" },
+              "mail.audit.append_failed",
+            );
+          }
           res.status(403).json({ error: error.code });
           return;
         }

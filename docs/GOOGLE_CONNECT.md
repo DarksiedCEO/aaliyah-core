@@ -46,14 +46,23 @@ refresh tokens, client secrets, or raw provider errors.
 > this backend; without a database URL it runs on the conformance-tested
 > in-memory twin — dev only, announced at boot.
 >
-> Remaining gaps, stated plainly: (1) send approvals still run on the
-> in-memory module store — wiring the durable store requires async changes
-> to frozen sendGuard types (unlock pending, risk report on file); the
-> durable store exists, is proven, and disconnect invalidates BOTH views.
-> (2) Session store and membership directory are in-memory; no real
-> IdP/login flow yet — sessions are issued programmatically. (3) Audit
-> events currently write to scoped JSONL; the durable audit table exists
-> and is proven, wiring lands with the approval unlock.
+> Send approvals (sendGuard unlock, 2026-07-10): the durable store IS the
+> only approval source of truth — atomic conditional claim (fresh operation
+> id persisted before any provider call), operation-id-matched settlement,
+> ambiguous outcomes stay `sending` for explicit reconciliation, disconnect
+> invalidates durably. The module-level store is gone. Durable audit is the
+> sole production audit sink (JSONL removed): mutations fail closed when
+> the audit record cannot persist; health reads continue with an
+> operational error. Production startup fails closed without
+> AALIYAH_DATABASE_URL. sendGuard.ts is REFROZEN — see the recorded hash in
+> the B4.5 commit message.
+>
+> Remaining gaps, stated plainly: (1) Session store and membership
+> directory are in-memory; no real IdP/login flow yet — sessions are issued
+> programmatically (Phase B5). (2) Sending remains disabled: no role or
+> service grant maps to mail.send.execute, and live sending awaits explicit
+> authorization. (3) Adapters not live-proven until the real Google app
+> registration and the 13-step live run.
 
 ## Client experience
 

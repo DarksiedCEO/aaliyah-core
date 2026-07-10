@@ -170,7 +170,8 @@ export class MicrosoftGraphAdapter implements MailProviderAdapter {
   }
 
   async sendMessage(input: SendMessageInput): Promise<SentMessage> {
-    const claim = this.beginSend(input);
+    const claim = await this.beginSend(input);
+    const operationId = claim.operationId!; // assigned at claim, persisted pre-send
     try {
       await this.call(input.connectionId, "/sendMail", {
         method: "POST",
@@ -183,11 +184,11 @@ export class MicrosoftGraphAdapter implements MailProviderAdapter {
         }),
       });
       const messageId = `sent:${this.now()}`;
-      this.settleSend(claim.approvalId, { sent: true, providerMessageId: messageId });
+      await this.settleSend({ approvalId: claim.approvalId, operationId, outcome: { sent: true, providerMessageId: messageId } });
       return SentMessageSchema.parse({ messageId, sentAt: this.now() });
     } catch (error) {
       const outcome = classifySendError(error);
-      if (outcome) this.settleSend(claim.approvalId, outcome);
+      if (outcome) await this.settleSend({ approvalId: claim.approvalId, operationId, outcome });
       throw error;
     }
   }

@@ -133,17 +133,18 @@ export class TransportBackedAdapter implements MailProviderAdapter {
   }
 
   async sendMessage(input: SendMessageInput): Promise<SentMessage> {
-    const claim = this.beginSend(input);
+    const claim = await this.beginSend(input);
+    const operationId = claim.operationId!; // assigned at claim, persisted pre-send
     try {
       const sent = await this.requireTransport("sendMessage").sendMessage(
         this.connection(input.connectionId),
         input,
       );
-      this.settleSend(claim.approvalId, { sent: true, providerMessageId: sent.messageId });
+      await this.settleSend({ approvalId: claim.approvalId, operationId, outcome: { sent: true, providerMessageId: sent.messageId } });
       return sent;
     } catch (error) {
       const outcome = classifySendError(error);
-      if (outcome) this.settleSend(claim.approvalId, outcome);
+      if (outcome) await this.settleSend({ approvalId: claim.approvalId, operationId, outcome });
       throw error;
     }
   }

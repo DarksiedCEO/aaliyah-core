@@ -20,7 +20,6 @@ import {
   type MailRoutesDeps,
 } from "../src/http/mailRoutes";
 import { createInMemoryMailState } from "../src/mail/mailState";
-import { clearSendApprovals } from "../src/mail/security/sendApproval";
 import { connectionIdFor } from "../src/mail/adapters/helpers";
 import { createSessionStore } from "../src/auth/sessionStore";
 import { createMembershipDirectory } from "../src/auth/membershipDirectory";
@@ -55,7 +54,6 @@ before(() => {
 });
 beforeEach(() => {
   state = createInMemoryMailState();
-  clearSendApprovals();
 });
 
 function jsonRes(status: number, body: unknown): Response {

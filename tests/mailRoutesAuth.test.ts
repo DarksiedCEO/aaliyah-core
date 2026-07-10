@@ -16,7 +16,6 @@ import {
 } from "../src/auth/membershipDirectory";
 import type { GoogleConnectDeps, GoogleOAuthHttp } from "../src/mail/google/googleConnect";
 import { createInMemoryMailState } from "../src/mail/mailState";
-import { clearSendApprovals } from "../src/mail/security/sendApproval";
 import { readMailAudit } from "../src/mail/security/mailAudit";
 import { connectionIdFor } from "../src/mail/adapters/helpers";
 
@@ -126,7 +125,6 @@ before(() => {
 });
 
 beforeEach(async () => {
-  clearSendApprovals();
   revokedTokens = [];
   sessions = createSessionStore();
   directory = createMembershipDirectory();
@@ -381,7 +379,7 @@ test("audit trail distinguishes user and service actors and never contains token
     token: admin.token,
   });
 
-  const audit = readMailAudit({ tenantId: TENANT_A, workspaceId: WS_A });
+  const audit = await readMailAudit({ tenantId: TENANT_A, workspaceId: WS_A }, mailState.audit);
   const userEvents = audit.filter((e) => e.actorType === "user");
   const serviceEvents = audit.filter((e) => e.actorType === "service");
   assert.ok(userEvents.length >= 1, "expected user-actor audit events");

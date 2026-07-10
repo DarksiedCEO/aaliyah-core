@@ -244,17 +244,104 @@ test("send approvals: claim is atomic — concurrent claims yield one sending", 
   assert.ok(row?.operationId);
 });
 
-test("send approvals: settle sent / retryable; ambiguous stays sending for reconciliation", async () => {
+test("send approvals: settlement requires the matching operation id and happens once", async () => {
   await state.sendApprovals.insert(approval("ap_1"));
   await state.sendApprovals.claim("ap_1", { operationId: "op_1", now: () => NOW });
-  await state.sendApprovals.settle("ap_1", { sent: true, providerMessageId: "pm_1" }, () => LATER);
+
+  // Wrong operation id is rejected and changes nothing.
+  await assert.rejects(
+    () =>
+      state.sendApprovals.settle("ap_1", {
+        operationId: "op_WRONG",
+        outcome: { sent: true, providerMessageId: "pm_x" },
+        now: () => LATER,
+      }),
+    /operation/,
+  );
+  assert.equal((await state.sendApprovals.get("ap_1"))?.status, "sending");
+
+  await state.sendApprovals.settle("ap_1", {
+    operationId: "op_1",
+    outcome: { sent: true, providerMessageId: "pm_1" },
+    now: () => LATER,
+  });
   assert.equal((await state.sendApprovals.get("ap_1"))?.status, "sent");
+
+  // Duplicate settlement is safely rejected.
+  await assert.rejects(
+    () =>
+      state.sendApprovals.settle("ap_1", {
+        operationId: "op_1",
+        outcome: { sent: true, providerMessageId: "pm_1" },
+        now: () => LATER,
+      }),
+    /not sending/,
+  );
 
   await state.sendApprovals.insert(approval("ap_2"));
   await state.sendApprovals.claim("ap_2", { operationId: "op_2", now: () => NOW });
   // Never settled → surfaces for reconciliation once stale.
   const needing = await state.sendApprovals.needingReconciliation(new Date(LATER).getTime());
   assert.deepEqual(needing.map((a) => a.approvalId), ["ap_2"]);
+});
+
+test("send approvals: failed_retryable is re-claimable; sent/terminal/expired are not", async () => {
+  await state.sendApprovals.insert(approval("ap_1"));
+  await state.sendApprovals.claim("ap_1", { operationId: "op_1", now: () => NOW });
+  await state.sendApprovals.settle("ap_1", {
+    operationId: "op_1",
+    outcome: { sent: false, retryable: true },
+    now: () => NOW,
+  });
+  assert.equal((await state.sendApprovals.get("ap_1"))?.status, "failed_retryable");
+
+  // Certified B2 retry path: a reconciled/unambiguous retryable failure can be
+  // claimed again with a NEW operation id.
+  const reclaimed = await state.sendApprovals.claim("ap_1", { operationId: "op_1b", now: () => NOW });
+  assert.equal(reclaimed?.status, "sending");
+  assert.equal(reclaimed?.operationId, "op_1b");
+
+  // Terminal states cannot be claimed.
+  await state.sendApprovals.insert({ ...approval("ap_3"), status: "failed_terminal" });
+  assert.equal(await state.sendApprovals.claim("ap_3", { operationId: "op_3", now: () => NOW }), null);
+
+  // Expiry: an issued approval can be expired exactly once, then never claimed.
+  await state.sendApprovals.insert(approval("ap_4"));
+  await state.sendApprovals.expire("ap_4", () => LATER);
+  assert.equal((await state.sendApprovals.get("ap_4"))?.status, "expired");
+  assert.equal(await state.sendApprovals.claim("ap_4", { operationId: "op_4", now: () => LATER }), null);
+});
+
+test("send approvals: two store instances over separate pools — exactly one claim wins", async () => {
+  await state.sendApprovals.insert(approval("ap_race"));
+  const pool2 = createMailDbPool({ AALIYAH_DATABASE_URL: DB_URL } as NodeJS.ProcessEnv);
+  const instance2 = createPostgresMailState(pool2);
+  try {
+    const results = await Promise.all([
+      state.sendApprovals.claim("ap_race", { operationId: "op_a", now: () => NOW }),
+      instance2.sendApprovals.claim("ap_race", { operationId: "op_b", now: () => NOW }),
+    ]);
+    assert.equal(results.filter((r) => r !== null).length, 1);
+  } finally {
+    await pool2.end();
+  }
+});
+
+test("send approvals: restart does not restore an invalidated approval; outage fails closed", async () => {
+  await state.sendApprovals.insert(approval("ap_1"));
+  await state.sendApprovals.invalidateForConnection("conn_1", () => NOW);
+
+  // "Restart": a brand-new store instance over a new pool sees the terminal state.
+  const pool2 = createMailDbPool({ AALIYAH_DATABASE_URL: DB_URL } as NodeJS.ProcessEnv);
+  const restarted = createPostgresMailState(pool2);
+  assert.equal((await restarted.sendApprovals.get("ap_1"))?.status, "failed_terminal");
+  assert.equal(await restarted.sendApprovals.claim("ap_1", { operationId: "op_x", now: () => NOW }), null);
+
+  // Database outage: a closed pool refuses claims — nothing proceeds to a send.
+  await pool2.end();
+  await assert.rejects(() =>
+    restarted.sendApprovals.claim("ap_1", { operationId: "op_y", now: () => NOW }),
+  );
 });
 
 test("send approvals: invalidateForConnection terminates pending approvals", async () => {

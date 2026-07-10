@@ -2,25 +2,35 @@ import type { MailSendApproval, SendMessageInput } from "@aaliyah/contracts/v1";
 
 /**
  * Claims an approval for sending — validates every bound field and atomically
- * transitions issued → sending. Adapters call this at the top of `sendMessage`;
- * automated flows hold no claimable approval, so they cannot begin a send.
+ * transitions issued → sending against the DURABLE approval store. Adapters
+ * call this at the top of `sendMessage`; automated flows hold no claimable
+ * approval, so they cannot begin a send. Async since the B4 unlock: the claim
+ * is a conditional database operation, atomic across instances.
  */
-export type ApprovalConsumer = (input: SendMessageInput) => MailSendApproval;
+export type ApprovalConsumer = (input: SendMessageInput) => Promise<MailSendApproval>;
 
 export type SendOutcome =
   | { sent: true; providerMessageId: string }
   | { sent: false; retryable: boolean };
 
+export type SettleSendInput = {
+  approvalId: string;
+  /** The operation id assigned at claim time — settlement must present it. */
+  operationId: string;
+  outcome: SendOutcome;
+};
+
 /** Settles a claimed send. An ambiguous outcome must NOT be settled here — the
- * record stays `sending` for reconciliation. */
-export type SendSettler = (approvalId: string, outcome: SendOutcome) => void;
+ * record stays `sending` for reconciliation. Returns the settled approval, or
+ * null from the fail-closed default settler. */
+export type SendSettler = (input: SettleSendInput) => Promise<MailSendApproval | null>;
 
 /** Default consumer: refuse everything (fail closed; no auto-send). */
-export const denyAllSends: ApprovalConsumer = () => {
+export const denyAllSends: ApprovalConsumer = async () => {
   throw new Error("send refused: no approval subsystem configured (no auto-send)");
 };
 
-export const noopSettler: SendSettler = () => {};
+export const noopSettler: SendSettler = async () => null;
 
 /**
  * Classify a provider send error. Only an UNAMBIGUOUS rejection is settled; an

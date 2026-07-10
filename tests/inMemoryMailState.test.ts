@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import test from "node:test";
 
 import { createInMemoryMailState } from "../src/mail/mailState";
+import { mailStateFromEnv } from "../src/http/createCoreApp";
 import { envelopeSeal, envelopeOpen, localMasterKms } from "../src/crypto/envelopeEncryption";
 
 // The in-memory backend must honor the SAME semantics the Postgres layer
@@ -124,6 +125,68 @@ test("in-memory approval claim: exactly one concurrent winner; ambiguous stays s
 
   const needing = await state.sendApprovals.needingReconciliation(new Date(LATER).getTime());
   assert.deepEqual(needing.map((a) => a.approvalId), ["ap_1"]);
+});
+
+test("in-memory settle: operation id must match; duplicates rejected; retryable reclaimable", async () => {
+  const state = createInMemoryMailState();
+  await state.sendApprovals.insert({
+    approvalId: "ap_1", ...T_A, connectionId: "conn_1",
+    recipientHash: "rh", bodyHash: "bh", approvedByUserId: "u1",
+    approvedAt: NOW, expiresAt: LATER, status: "issued",
+    operationId: null, providerMessageId: null, updatedAt: NOW,
+  });
+  await state.sendApprovals.claim("ap_1", { operationId: "op_1", now: () => NOW });
+
+  await assert.rejects(
+    () =>
+      state.sendApprovals.settle("ap_1", {
+        operationId: "op_WRONG",
+        outcome: { sent: false, retryable: true },
+        now: () => NOW,
+      }),
+    /operation/,
+  );
+
+  await state.sendApprovals.settle("ap_1", {
+    operationId: "op_1",
+    outcome: { sent: false, retryable: true },
+    now: () => NOW,
+  });
+  assert.equal((await state.sendApprovals.get("ap_1"))?.status, "failed_retryable");
+
+  await assert.rejects(
+    () =>
+      state.sendApprovals.settle("ap_1", {
+        operationId: "op_1",
+        outcome: { sent: false, retryable: true },
+        now: () => NOW,
+      }),
+    /not sending/,
+  );
+
+  // Retry path preserved: failed_retryable claims again with a fresh op id.
+  const reclaimed = await state.sendApprovals.claim("ap_1", { operationId: "op_2", now: () => NOW });
+  assert.equal(reclaimed?.status, "sending");
+
+  // Expire is conditional on issued.
+  await state.sendApprovals.insert({
+    approvalId: "ap_2", ...T_A, connectionId: "conn_1",
+    recipientHash: "rh", bodyHash: "bh", approvedByUserId: "u1",
+    approvedAt: NOW, expiresAt: LATER, status: "issued",
+    operationId: null, providerMessageId: null, updatedAt: NOW,
+  });
+  await state.sendApprovals.expire("ap_2", () => LATER);
+  assert.equal((await state.sendApprovals.get("ap_2"))?.status, "expired");
+  assert.equal(await state.sendApprovals.claim("ap_2", { operationId: "op_3", now: () => NOW }), null);
+});
+
+test("production without a database url fails closed — no in-memory fallback", () => {
+  assert.throws(
+    () => mailStateFromEnv({ NODE_ENV: "production" } as NodeJS.ProcessEnv),
+    /AALIYAH_DATABASE_URL/,
+  );
+  // Dev without a database url gets the announced in-memory twin.
+  assert.ok(mailStateFromEnv({} as NodeJS.ProcessEnv));
 });
 
 test("in-memory job markers and audit: durable-parity semantics", async () => {

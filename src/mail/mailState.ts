@@ -122,7 +122,7 @@ export function createInMemoryMailState(): MailStateBackend & {
         // Synchronous check-and-set — atomic within the event loop turn.
         if (
           !approval ||
-          approval.status !== "issued" ||
+          (approval.status !== "issued" && approval.status !== "failed_retryable") ||
           new Date(approval.expiresAt).getTime() <= new Date(at).getTime()
         ) {
           return null;
@@ -136,15 +136,30 @@ export function createInMemoryMailState(): MailStateBackend & {
         approvals.set(approvalId, claimed);
         return claimed;
       },
-      async settle(approvalId, outcome, now = () => new Date().toISOString()) {
+      async settle(approvalId, input) {
+        const now = input.now ?? (() => new Date().toISOString());
+        const { outcome } = input;
         const approval = approvals.get(approvalId);
-        if (!approval || approval.status !== "sending") return;
-        approvals.set(approvalId, {
+        if (!approval) throw new Error("settle refused: no such approval");
+        if (approval.status !== "sending") {
+          throw new Error(`settle refused: approval is not sending (status=${approval.status})`);
+        }
+        if (approval.operationId !== input.operationId) {
+          throw new Error("settle refused: operation id mismatch");
+        }
+        const settled: MailSendApproval = {
           ...approval,
           status: outcome.sent ? "sent" : outcome.retryable ? "failed_retryable" : "failed_terminal",
           providerMessageId: outcome.sent ? outcome.providerMessageId : approval.providerMessageId,
           updatedAt: now(),
-        });
+        };
+        approvals.set(approvalId, settled);
+        return settled;
+      },
+      async expire(approvalId, now = () => new Date().toISOString()) {
+        const approval = approvals.get(approvalId);
+        if (!approval || approval.status !== "issued") return;
+        approvals.set(approvalId, { ...approval, status: "expired", updatedAt: now() });
       },
       async needingReconciliation(staleSinceEpochMs) {
         return [...approvals.values()]

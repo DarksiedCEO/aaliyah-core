@@ -21,7 +21,6 @@ import { createInMemoryMailState } from "../src/mail/mailState";
 import {
   issueSendApproval,
   getApproval,
-  clearSendApprovals,
 } from "../src/mail/security/sendApproval";
 import { readMailAudit } from "../src/mail/security/mailAudit";
 import { connectionIdFor } from "../src/mail/adapters/helpers";
@@ -71,7 +70,6 @@ before(() => {
 });
 beforeEach(() => {
   state = createInMemoryMailState();
-  clearSendApprovals();
 });
 
 test("authorization URL uses PKCE (S256) + state and leaks no secret", async () => {
@@ -99,8 +97,8 @@ test("callback connects: sanitized status, envelope-encrypted-at-rest token, aud
   assert.equal(envelopeOpen(cred.envelope, KMS), "rt-SECRET");
   assert.equal(await openRefreshToken(CONN_ID, SCOPE, vault()), "rt-SECRET");
 
-  // Audit records the connect, and contains no secret.
-  const audit = readMailAudit(SCOPE);
+  // Audit records the connect durably, and contains no secret.
+  const audit = await readMailAudit(SCOPE, state.audit);
   assert.ok(audit.some((e) => e.action === "google.connected"));
   assert.ok(!JSON.stringify(audit).includes("rt-SECRET"));
 });
@@ -183,11 +181,11 @@ test("access token refresh works, and disconnect revokes + destroys + invalidate
   // Refresh works from the encrypted token.
   assert.equal(await refreshGoogleAccessToken(CONN_ID, SCOPE, deps(http)), "at2");
 
-  // A pending send approval exists for this connection.
-  const approval = issueSendApproval({
+  // A pending send approval exists for this connection (durable store).
+  const approval = await issueSendApproval({
     tenantId: "tenant_a", workspaceId: "tenant_a:default", connectionId: CONN_ID,
     to: [{ email: "c@e.com" }], subject: "s", body: "b", approvedByUserId: "u1",
-  });
+  }, { state });
 
   let jobsStopped = false;
   await disconnectGoogle(CONN_ID, SCOPE, {
@@ -204,9 +202,11 @@ test("access token refresh works, and disconnect revokes + destroys + invalidate
   // Credential destroyed → refresh now impossible.
   await assert.rejects(() => refreshGoogleAccessToken(CONN_ID, SCOPE, deps(http)), /revoked|not found/);
 
-  // Pending approval invalidated → terminally failed, cannot be claimed.
-  assert.equal(getApproval(approval.approvalId)!.status, "failed_terminal");
+  // Pending approval invalidated durably → terminally failed, cannot be claimed.
+  assert.equal((await getApproval(approval.approvalId, { state }))!.status, "failed_terminal");
 
-  // Disconnect audited.
-  assert.ok(readMailAudit(SCOPE).some((e) => e.action === "google.disconnected"));
+  // Disconnect audited durably; credential refresh was audited too.
+  const audit = await readMailAudit(SCOPE, state.audit);
+  assert.ok(audit.some((e) => e.action === "google.disconnected"));
+  assert.ok(audit.some((e) => e.action === "mail.credential.refreshed"));
 });

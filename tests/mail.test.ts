@@ -14,15 +14,10 @@ import {
 import { MailTransportNotConfiguredError } from "../src/mail/types";
 import {
   issueSendApproval,
-  beginSend,
-  markSent,
-  markFailed,
-  clearSendApprovals,
+  createBeginSend,
+  createSendSettler,
 } from "../src/mail/security/sendApproval";
-import type { SendOutcome } from "../src/mail/sendGuard";
-
-const settle = (id: string, outcome: SendOutcome) =>
-  outcome.sent ? markSent(id, outcome.providerMessageId) : markFailed(id, outcome.retryable);
+import { createInMemoryMailState } from "../src/mail/mailState";
 
 const NOW = () => "2026-06-23T12:00:00.000Z";
 
@@ -138,16 +133,17 @@ test("NO AUTO-SEND: an adapter with no approval subsystem cannot send", async ()
 });
 
 test("send is refused when content is tampered after approval", async () => {
-  clearSendApprovals();
+  const state = createInMemoryMailState();
   const fetchImpl = fakeFetch([{ match: /\/messages\/send/, body: { id: "sent_1" } }]);
   const adapter = new GoogleMailAdapter({
-    fetchImpl, resolveAccessToken: () => "tok", now: NOW, beginSend, settleSend: settle,
+    fetchImpl, resolveAccessToken: () => "tok", now: NOW,
+    beginSend: createBeginSend({ state }), settleSend: createSendSettler({ state }),
   });
-  const approval = issueSendApproval({
+  const approval = await issueSendApproval({
     tenantId: "t", workspaceId: "w", connectionId: "c1",
     to: [{ email: "c@e.com" }], subject: "Re: Hi", body: "Thanks, we'll review this.",
     approvedByUserId: "boss",
-  });
+  }, { state });
   // Attempt to send different content under the same approval → refused.
   await assert.rejects(
     () => adapter.sendMessage({
@@ -159,15 +155,16 @@ test("send is refused when content is tampered after approval", async () => {
 });
 
 test("send succeeds with a matching approval and cannot be replayed", async () => {
-  clearSendApprovals();
+  const state = createInMemoryMailState();
   const fetchImpl = fakeFetch([{ match: /\/messages\/send/, body: { id: "sent_1", threadId: "th_1" } }]);
   const adapter = new GoogleMailAdapter({
-    fetchImpl, resolveAccessToken: () => "tok", now: NOW, beginSend, settleSend: settle,
+    fetchImpl, resolveAccessToken: () => "tok", now: NOW,
+    beginSend: createBeginSend({ state }), settleSend: createSendSettler({ state }),
   });
-  const approval = issueSendApproval({
+  const approval = await issueSendApproval({
     tenantId: "t", workspaceId: "w", connectionId: "c1",
     to: [{ email: "c@e.com" }], subject: "Re: Hi", body: "Thanks!", approvedByUserId: "boss",
-  });
+  }, { state });
   const send = () =>
     adapter.sendMessage({
       connectionId: "c1", approvalId: approval.approvalId,
@@ -176,8 +173,43 @@ test("send succeeds with a matching approval and cannot be replayed", async () =
 
   const sent = await send();
   assert.equal(sent.messageId, "sent_1");
+  // The durable record carries the settled outcome.
+  assert.equal((await state.sendApprovals.get(approval.approvalId))?.status, "sent");
   // Replay of the same approval is refused (already sent).
   await assert.rejects(send, /already sent/);
+});
+
+test("NO SEND when claim persistence fails — provider is never called", async () => {
+  const state = createInMemoryMailState();
+  // A backend whose claim write fails (e.g. database outage mid-claim).
+  const broken = {
+    ...state,
+    sendApprovals: {
+      ...state.sendApprovals,
+      claim: async () => {
+        throw new Error("database unavailable");
+      },
+    },
+  };
+  const fetchImpl = fakeFetch([{ match: /\/messages\/send/, body: { id: "sent_1" } }]);
+  const adapter = new GoogleMailAdapter({
+    fetchImpl, resolveAccessToken: () => "tok", now: NOW,
+    beginSend: createBeginSend({ state: broken }), settleSend: createSendSettler({ state: broken }),
+  });
+  const approval = await issueSendApproval({
+    tenantId: "t", workspaceId: "w", connectionId: "c1",
+    to: [{ email: "c@e.com" }], subject: "Re: Hi", body: "Thanks!", approvedByUserId: "boss",
+  }, { state });
+
+  await assert.rejects(
+    () => adapter.sendMessage({
+      connectionId: "c1", approvalId: approval.approvalId,
+      to: [{ email: "c@e.com" }], subject: "Re: Hi", body: "Thanks!",
+    }),
+    /database unavailable/,
+  );
+  const calls = (fetchImpl as unknown as { calls: { url: string }[] }).calls;
+  assert.equal(calls.filter((c) => /\/messages\/send/.test(c.url)).length, 0);
 });
 
 test("IMAP/SMTP + Yahoo connect but fail loud without a verified transport (no faking)", async () => {

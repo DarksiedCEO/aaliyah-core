@@ -279,9 +279,11 @@ export function createPostgresMailState(pool: Pool) {
       },
 
       /**
-       * Atomic claim: issued → sending with an operation id, only while
-       * unexpired. Concurrent claims race on the conditional UPDATE — exactly
-       * one wins; the rest get null and must not send.
+       * Atomic claim: issued (or a reconciled/unambiguous failed_retryable —
+       * the certified B2 retry path) → sending with a fresh operation id, only
+       * while unexpired. Concurrent claims race on the conditional UPDATE —
+       * exactly one wins, across any number of instances; the rest get null
+       * and must not send.
        */
       async claim(
         approvalId: string,
@@ -292,34 +294,71 @@ export function createPostgresMailState(pool: Pool) {
         const res = await pool.query(
           `UPDATE mail_send_approvals
            SET status = 'sending', operation_id = $2, updated_at = $3
-           WHERE approval_id = $1 AND status = 'issued' AND expires_at > $3
+           WHERE approval_id = $1 AND status IN ('issued', 'failed_retryable')
+             AND expires_at > $3
            RETURNING *`,
           [approvalId, input.operationId, at],
         );
         return res.rows[0] ? approvalFromRow(res.rows[0]) : null;
       },
 
-      /** Settle a claimed send. Ambiguous outcomes are NEVER settled — the row
-       * stays `sending` and surfaces via needingReconciliation. */
+      /**
+       * Settle a claimed send — only from `sending`, only with the operation
+       * id assigned at claim time. A wrong operation id or a duplicate
+       * settlement is rejected loudly. Ambiguous outcomes are NEVER settled —
+       * the row stays `sending` and surfaces via needingReconciliation.
+       */
       async settle(
         approvalId: string,
-        outcome: { sent: true; providerMessageId: string } | { sent: false; retryable: boolean },
+        input: {
+          operationId: string;
+          outcome: { sent: true; providerMessageId: string } | { sent: false; retryable: boolean };
+          now?: () => string;
+        },
+      ): Promise<MailSendApproval> {
+        const now = input.now ?? (() => new Date().toISOString());
+        const { outcome } = input;
+        const status = outcome.sent
+          ? "sent"
+          : outcome.retryable
+            ? "failed_retryable"
+            : "failed_terminal";
+        const res = await pool.query(
+          `UPDATE mail_send_approvals
+           SET status = $2,
+               provider_message_id = COALESCE($3, provider_message_id),
+               updated_at = $4
+           WHERE approval_id = $1 AND status = 'sending' AND operation_id = $5
+           RETURNING *`,
+          [
+            approvalId, status,
+            outcome.sent ? outcome.providerMessageId : null,
+            now(), input.operationId,
+          ],
+        );
+        if (res.rows[0]) return approvalFromRow(res.rows[0]);
+        const existing = await pool.query(
+          "SELECT * FROM mail_send_approvals WHERE approval_id = $1",
+          [approvalId],
+        );
+        const row = existing.rows[0];
+        if (!row) throw new Error("settle refused: no such approval");
+        if (row.status !== "sending") {
+          throw new Error(`settle refused: approval is not sending (status=${row.status})`);
+        }
+        throw new Error("settle refused: operation id mismatch");
+      },
+
+      /** Expire an approval — conditional on `issued` so nothing in flight is touched. */
+      async expire(
+        approvalId: string,
         now: () => string = () => new Date().toISOString(),
       ): Promise<void> {
-        if (outcome.sent) {
-          await pool.query(
-            `UPDATE mail_send_approvals
-             SET status = 'sent', provider_message_id = $2, updated_at = $3
-             WHERE approval_id = $1 AND status = 'sending'`,
-            [approvalId, outcome.providerMessageId, now()],
-          );
-        } else {
-          await pool.query(
-            `UPDATE mail_send_approvals SET status = $2, updated_at = $3
-             WHERE approval_id = $1 AND status = 'sending'`,
-            [approvalId, outcome.retryable ? "failed_retryable" : "failed_terminal", now()],
-          );
-        }
+        await pool.query(
+          `UPDATE mail_send_approvals SET status = 'expired', updated_at = $2
+           WHERE approval_id = $1 AND status = 'issued'`,
+          [approvalId, now()],
+        );
       },
 
       /** Rows stuck `sending` since before the cutoff — the reconciliation queue. */
