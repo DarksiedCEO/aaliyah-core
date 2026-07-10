@@ -12,6 +12,11 @@ import {
   createYahooMailAdapter,
 } from "../src/mail/adapters/transportBackedAdapter";
 import { MailTransportNotConfiguredError } from "../src/mail/types";
+import {
+  issueSendApproval,
+  consumeSendApproval,
+  clearSendApprovals,
+} from "../src/mail/security/sendApproval";
 
 const NOW = () => "2026-06-23T12:00:00.000Z";
 
@@ -58,13 +63,15 @@ test("autodetect routes emails to the right provider", () => {
   assert.equal(custom.autoConfigured, false);
 });
 
-test("registry exposes all four providers with honest capability flags", () => {
+test("registry exposes all four providers with honest implementation status", () => {
   const caps = new MailProviderRegistry().capabilities();
   assert.equal(caps.length, 4);
-  // Nothing claims to be end-to-end verified yet — honesty by construction.
-  assert.ok(caps.every((c) => c.verified === false));
-  // Yahoo + generic IMAP do not claim applyLabel.
-  assert.equal(caps.find((c) => c.provider === "yahoo")!.applyLabel, false);
+  // Google/Microsoft: real code paths. Yahoo/IMAP: experimental. Nothing claims
+  // a static "verified" — live health is a separate, per-connection concept.
+  assert.equal(caps.find((c) => c.provider === "google")!.implementationStatus, "implemented");
+  assert.equal(caps.find((c) => c.provider === "microsoft")!.implementationStatus, "implemented");
+  assert.equal(caps.find((c) => c.provider === "yahoo")!.implementationStatus, "experimental");
+  assert.equal(caps.find((c) => c.provider === "imap_smtp")!.implementationStatus, "experimental");
   assert.equal(caps.find((c) => c.provider === "imap_smtp")!.applyLabel, false);
 });
 
@@ -115,28 +122,56 @@ test("Microsoft adapter groups messages into threads by conversationId", async (
   assert.equal(threads.length, 2); // two conversations, not three messages
 });
 
-test("NO AUTO-SEND: sendMessage is refused without a valid approval token", async () => {
+test("NO AUTO-SEND: an adapter with no approval subsystem cannot send", async () => {
   const fetchImpl = fakeFetch([{ match: /\/messages\/send/, body: { id: "sent_1" } }]);
-  // Approval oracle rejects everything (simulating no human approval).
-  const adapter = new GoogleMailAdapter({
-    fetchImpl, resolveAccessToken: () => "tok", now: NOW, isSendApproved: () => false,
-  });
+  const adapter = new GoogleMailAdapter({ fetchImpl, resolveAccessToken: () => "tok", now: NOW });
   await assert.rejects(
-    () => adapter.sendMessage({ connectionId: "c1", approvalToken: "forged", to: [{ email: "c@e.com" }], subject: "x", body: "y" }),
-    /Refusing to send/,
+    () => adapter.sendMessage({ connectionId: "c1", approvalId: "x", to: [{ email: "c@e.com" }], subject: "s", body: "b" }),
+    /no approval subsystem/,
   );
 });
 
-test("send succeeds only with a human-approved token", async () => {
+test("send is refused when content is tampered after approval", async () => {
+  clearSendApprovals();
+  const fetchImpl = fakeFetch([{ match: /\/messages\/send/, body: { id: "sent_1" } }]);
+  const adapter = new GoogleMailAdapter({
+    fetchImpl, resolveAccessToken: () => "tok", now: NOW, consumeApproval: consumeSendApproval,
+  });
+  const approval = issueSendApproval({
+    tenantId: "t", workspaceId: "w", connectionId: "c1",
+    to: [{ email: "c@e.com" }], subject: "Re: Hi", body: "Thanks, we'll review this.",
+    approvedByUserId: "boss",
+  });
+  // Attempt to send different content under the same approval → refused.
+  await assert.rejects(
+    () => adapter.sendMessage({
+      connectionId: "c1", approvalId: approval.approvalId,
+      to: [{ email: "c@e.com" }], subject: "Re: Hi", body: "Your refund has been issued.",
+    }),
+    /content mismatch/,
+  );
+});
+
+test("send succeeds with a matching approval and cannot be replayed", async () => {
+  clearSendApprovals();
   const fetchImpl = fakeFetch([{ match: /\/messages\/send/, body: { id: "sent_1", threadId: "th_1" } }]);
   const adapter = new GoogleMailAdapter({
-    fetchImpl, resolveAccessToken: () => "tok", now: NOW,
-    isSendApproved: (_c, t) => t === "human-approved",
+    fetchImpl, resolveAccessToken: () => "tok", now: NOW, consumeApproval: consumeSendApproval,
   });
-  const sent = await adapter.sendMessage({
-    connectionId: "c1", approvalToken: "human-approved", to: [{ email: "c@e.com" }], subject: "x", body: "y",
+  const approval = issueSendApproval({
+    tenantId: "t", workspaceId: "w", connectionId: "c1",
+    to: [{ email: "c@e.com" }], subject: "Re: Hi", body: "Thanks!", approvedByUserId: "boss",
   });
+  const send = () =>
+    adapter.sendMessage({
+      connectionId: "c1", approvalId: approval.approvalId,
+      to: [{ email: "c@e.com" }], subject: "Re: Hi", body: "Thanks!",
+    });
+
+  const sent = await send();
   assert.equal(sent.messageId, "sent_1");
+  // Replay of the same approval is refused (consumed).
+  await assert.rejects(send, /already consumed/);
 });
 
 test("IMAP/SMTP + Yahoo connect but fail loud without a verified transport (no faking)", async () => {
@@ -158,7 +193,7 @@ test("IMAP/SMTP + Yahoo connect but fail loud without a verified transport (no f
   );
 
   const yahoo = createYahooMailAdapter({ deps: { now: NOW } });
-  assert.equal(yahoo.capabilities.verified, false);
+  assert.equal(yahoo.capabilities.implementationStatus, "experimental");
 });
 
 test("registry resolves the adapter straight from an email address", () => {

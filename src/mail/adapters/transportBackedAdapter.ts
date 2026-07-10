@@ -15,7 +15,7 @@ import type {
 } from "@aaliyah/contracts/v1";
 
 import { MailProviderAdapter, MailTransportNotConfiguredError } from "../types";
-import { assertSendApproved } from "../sendGuard";
+import { denyAllSends, type ApprovalConsumer } from "../sendGuard";
 import { makeConnection, type AdapterDeps } from "./helpers";
 
 /**
@@ -45,22 +45,20 @@ export class TransportBackedAdapter implements MailProviderAdapter {
 
   private readonly transport: MailTransport | undefined;
   private readonly now: () => string;
-  private readonly isSendApproved: (connectionId: string, token: string) => boolean;
+  private readonly consumeApproval: ApprovalConsumer;
   private readonly connections = new Map<string, MailboxConnection>();
 
   constructor(config: {
     provider: MailProvider;
     capabilities: MailCapabilities;
     transport?: MailTransport;
-    deps?: AdapterDeps & {
-      isSendApproved?: (connectionId: string, token: string) => boolean;
-    };
+    deps?: AdapterDeps & { consumeApproval?: ApprovalConsumer };
   }) {
     this.provider = config.provider;
     this.capabilities = config.capabilities;
     this.transport = config.transport;
     this.now = config.deps?.now ?? (() => new Date().toISOString());
-    this.isSendApproved = config.deps?.isSendApproved ?? (() => false);
+    this.consumeApproval = config.deps?.consumeApproval ?? denyAllSends;
   }
 
   private requireTransport(operation: string): MailTransport {
@@ -91,12 +89,18 @@ export class TransportBackedAdapter implements MailProviderAdapter {
       return {
         connectionId,
         healthy: false,
+        status: "degraded",
         checkedAt: this.now(),
         detail: `${this.provider}: no verified transport configured`,
       };
     }
     const healthy = await this.transport.verify(this.connection(connectionId));
-    return { connectionId, healthy, checkedAt: this.now() };
+    return {
+      connectionId,
+      healthy,
+      status: healthy ? "active" : "unreachable",
+      checkedAt: this.now(),
+    };
   }
 
   async listThreads(input: ListThreadsInput): Promise<MailThread[]> {
@@ -121,7 +125,7 @@ export class TransportBackedAdapter implements MailProviderAdapter {
   }
 
   async sendMessage(input: SendMessageInput): Promise<SentMessage> {
-    assertSendApproved(input, this.isSendApproved);
+    this.consumeApproval(input);
     return this.requireTransport("sendMessage").sendMessage(
       this.connection(input.connectionId),
       input,
@@ -148,7 +152,7 @@ const GENERIC_CAPS: MailCapabilities = {
   createDraft: true,
   sendMessage: true,
   applyLabel: false, // IMAP folders/flags vary by host; not universally supported
-  verified: false,
+  implementationStatus: "experimental",
 };
 
 const YAHOO_CAPS: MailCapabilities = {
@@ -160,8 +164,8 @@ const YAHOO_CAPS: MailCapabilities = {
   sendMessage: true,
   applyLabel: false,
   // Yahoo is the weaker link: its mailbox API surface is less proven than
-  // Google/Microsoft. Not claimed verified until an end-to-end run proves it.
-  verified: false,
+  // Google/Microsoft — experimental until an end-to-end run proves it.
+  implementationStatus: "experimental",
 };
 
 export function createGenericImapSmtpAdapter(config?: {

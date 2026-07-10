@@ -17,7 +17,7 @@ import {
 } from "@aaliyah/contracts/v1";
 
 import type { MailProviderAdapter } from "../types";
-import { assertSendApproved } from "../sendGuard";
+import { denyAllSends, type ApprovalConsumer } from "../sendGuard";
 import {
   base64url,
   buildRawRfc822,
@@ -68,6 +68,8 @@ function normalizeMessage(threadId: string, msg: GmailMessage): object {
  */
 export class GoogleMailAdapter implements MailProviderAdapter {
   readonly provider = "google" as const;
+  // Adapter code maturity (deliberate, not smoke-test-flipped). Live health of
+  // a given connection is separate and dynamic (see verify()).
   readonly capabilities: MailCapabilities = {
     provider: "google",
     authKinds: ["oauth"],
@@ -76,20 +78,16 @@ export class GoogleMailAdapter implements MailProviderAdapter {
     createDraft: true,
     sendMessage: true,
     applyLabel: true,
-    // Implemented against the real Gmail API but not yet proven end-to-end
-    // against a live account in this environment.
-    verified: false,
+    implementationStatus: "implemented",
   };
 
   private readonly fetchImpl: typeof fetch;
   private readonly resolveToken: (connectionId: string) => string;
   private readonly now: () => string;
-  private readonly isSendApproved: (connectionId: string, token: string) => boolean;
+  private readonly consumeApproval: ApprovalConsumer;
 
   constructor(
-    deps: AdapterDeps & {
-      isSendApproved?: (connectionId: string, token: string) => boolean;
-    } = {},
+    deps: AdapterDeps & { consumeApproval?: ApprovalConsumer } = {},
   ) {
     this.fetchImpl = deps.fetchImpl ?? fetch;
     this.resolveToken =
@@ -98,7 +96,7 @@ export class GoogleMailAdapter implements MailProviderAdapter {
         throw new Error("google: no access-token resolver configured");
       });
     this.now = deps.now ?? (() => new Date().toISOString());
-    this.isSendApproved = deps.isSendApproved ?? (() => false);
+    this.consumeApproval = deps.consumeApproval ?? denyAllSends;
   }
 
   private async call(connectionId: string, path: string, init?: RequestInit): Promise<unknown> {
@@ -127,14 +125,12 @@ export class GoogleMailAdapter implements MailProviderAdapter {
   async verify(connectionId: string): Promise<ConnectionHealth> {
     try {
       await this.call(connectionId, "/profile");
-      return { connectionId, healthy: true, checkedAt: this.now() };
+      return { connectionId, healthy: true, status: "active", checkedAt: this.now() };
     } catch (error) {
-      return {
-        connectionId,
-        healthy: false,
-        checkedAt: this.now(),
-        detail: error instanceof Error ? error.message : "unknown",
-      };
+      const message = error instanceof Error ? error.message : "unknown";
+      // 401/403 → the grant needs re-consent; otherwise the mailbox is unreachable.
+      const status = /\(401\)|\(403\)/.test(message) ? "reauth_required" : "unreachable";
+      return { connectionId, healthy: false, status, checkedAt: this.now(), detail: message };
     }
   }
 
@@ -184,23 +180,20 @@ export class GoogleMailAdapter implements MailProviderAdapter {
   }
 
   async sendMessage(input: SendMessageInput): Promise<SentMessage> {
-    assertSendApproved(input, this.isSendApproved);
-    const body = input.draftId
-      ? JSON.stringify({ id: input.draftId })
-      : JSON.stringify({
-          raw: base64url(
-            buildRawRfc822({
-              to: (input.to ?? []).map((a) => a.email).join(", "),
-              subject: input.subject ?? "",
-              body: input.body ?? "",
-            }),
-          ),
-        });
-    const path = input.draftId ? "/drafts/send" : "/messages/send";
-    const data = (await this.call(input.connectionId, path, { method: "POST", body })) as {
-      id?: string;
-      threadId?: string;
-    };
+    // Validate + atomically consume the approval BEFORE any network call. The
+    // exact approved content is what we transmit, so nothing can be swapped.
+    this.consumeApproval(input);
+    const raw = base64url(
+      buildRawRfc822({
+        to: input.to.map((a) => a.email).join(", "),
+        subject: input.subject,
+        body: input.body,
+      }),
+    );
+    const data = (await this.call(input.connectionId, "/messages/send", {
+      method: "POST",
+      body: JSON.stringify({ raw }),
+    })) as { id?: string; threadId?: string };
     return SentMessageSchema.parse({
       messageId: data.id ?? "unknown",
       ...(data.threadId ? { threadId: data.threadId } : {}),

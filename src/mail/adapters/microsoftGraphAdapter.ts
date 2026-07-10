@@ -17,7 +17,7 @@ import {
 } from "@aaliyah/contracts/v1";
 
 import type { MailProviderAdapter } from "../types";
-import { assertSendApproved } from "../sendGuard";
+import { denyAllSends, type ApprovalConsumer } from "../sendGuard";
 import { makeConnection, type AdapterDeps } from "./helpers";
 
 const GRAPH = "https://graph.microsoft.com/v1.0/me";
@@ -63,19 +63,15 @@ export class MicrosoftGraphAdapter implements MailProviderAdapter {
     createDraft: true,
     sendMessage: true,
     applyLabel: true,
-    verified: false,
+    implementationStatus: "implemented",
   };
 
   private readonly fetchImpl: typeof fetch;
   private readonly resolveToken: (connectionId: string) => string;
   private readonly now: () => string;
-  private readonly isSendApproved: (connectionId: string, token: string) => boolean;
+  private readonly consumeApproval: ApprovalConsumer;
 
-  constructor(
-    deps: AdapterDeps & {
-      isSendApproved?: (connectionId: string, token: string) => boolean;
-    } = {},
-  ) {
+  constructor(deps: AdapterDeps & { consumeApproval?: ApprovalConsumer } = {}) {
     this.fetchImpl = deps.fetchImpl ?? fetch;
     this.resolveToken =
       deps.resolveAccessToken ??
@@ -83,7 +79,7 @@ export class MicrosoftGraphAdapter implements MailProviderAdapter {
         throw new Error("microsoft: no access-token resolver configured");
       });
     this.now = deps.now ?? (() => new Date().toISOString());
-    this.isSendApproved = deps.isSendApproved ?? (() => false);
+    this.consumeApproval = deps.consumeApproval ?? denyAllSends;
   }
 
   private async call(connectionId: string, path: string, init?: RequestInit): Promise<unknown> {
@@ -109,14 +105,11 @@ export class MicrosoftGraphAdapter implements MailProviderAdapter {
   async verify(connectionId: string): Promise<ConnectionHealth> {
     try {
       await this.call(connectionId, "?$select=id");
-      return { connectionId, healthy: true, checkedAt: this.now() };
+      return { connectionId, healthy: true, status: "active", checkedAt: this.now() };
     } catch (error) {
-      return {
-        connectionId,
-        healthy: false,
-        checkedAt: this.now(),
-        detail: error instanceof Error ? error.message : "unknown",
-      };
+      const message = error instanceof Error ? error.message : "unknown";
+      const status = /\(401\)|\(403\)/.test(message) ? "reauth_required" : "unreachable";
+      return { connectionId, healthy: false, status, checkedAt: this.now(), detail: message };
     }
   }
 
@@ -167,18 +160,16 @@ export class MicrosoftGraphAdapter implements MailProviderAdapter {
   }
 
   async sendMessage(input: SendMessageInput): Promise<SentMessage> {
-    assertSendApproved(input, this.isSendApproved);
-    if (input.draftId) {
-      await this.call(input.connectionId, `/messages/${input.draftId}/send`, { method: "POST" });
-      return SentMessageSchema.parse({ messageId: input.draftId, sentAt: this.now() });
-    }
+    // Validate + atomically consume the approval; transmit the exact approved
+    // content (never a draft that could have been altered after approval).
+    this.consumeApproval(input);
     await this.call(input.connectionId, "/sendMail", {
       method: "POST",
       body: JSON.stringify({
         message: {
-          subject: input.subject ?? "",
-          body: { contentType: "Text", content: input.body ?? "" },
-          toRecipients: (input.to ?? []).map((a) => ({ emailAddress: { address: a.email } })),
+          subject: input.subject,
+          body: { contentType: "Text", content: input.body },
+          toRecipients: input.to.map((a) => ({ emailAddress: { address: a.email } })),
         },
       }),
     });
