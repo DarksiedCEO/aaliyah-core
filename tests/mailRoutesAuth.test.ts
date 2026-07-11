@@ -9,11 +9,9 @@ import express from "express";
 
 import { localMasterKms } from "../src/crypto/envelopeEncryption";
 import { createMailRouter, type MailRoutesDeps } from "../src/http/mailRoutes";
-import { createSessionStore, type SessionStore } from "../src/auth/sessionStore";
-import {
-  createMembershipDirectory,
-  type MembershipDirectory,
-} from "../src/auth/membershipDirectory";
+import { createAuthService, type AuthService } from "../src/auth/authService";
+import { createInMemoryIdentityState } from "../src/auth/identityState";
+import type { MailRole } from "@aaliyah/contracts/v1";
 import type { GoogleConnectDeps, GoogleOAuthHttp } from "../src/mail/google/googleConnect";
 import { createInMemoryMailState } from "../src/mail/mailState";
 import { readMailAudit } from "../src/mail/security/mailAudit";
@@ -27,8 +25,8 @@ const WS_A = "tenant_a:default";
 const TENANT_B = "tenant_b";
 const WS_B = "tenant_b:default";
 
-let sessions: SessionStore;
-let directory: MembershipDirectory;
+let identity: ReturnType<typeof createInMemoryIdentityState>;
+let auth: AuthService;
 let mailState: ReturnType<typeof createInMemoryMailState>;
 let server: ReturnType<express.Express["listen"]>;
 let baseUrl: string;
@@ -60,22 +58,38 @@ function routesDeps(): MailRoutesDeps {
     redirectUri: REDIRECT,
     frontendInboxesUrl: "https://app.example/settings/inboxes",
     connectDeps: connectDeps(),
-    auth: { sessions, directory },
+    auth: { principalForToken: auth.principalForToken },
     state: mailState,
   };
 }
 
 type Actor = { token: string; sessionId: string; userId: string };
 
-function loginUser(userId: string, tenantId: string, workspaceIds: string[], roles: string[]): Actor {
-  directory.registerUserMembership({
-    userId,
+/** Provision a durable user + memberships, then issue a durable session. */
+async function loginUser(
+  name: string,
+  tenantId: string,
+  workspaceIds: string[],
+  roles: string[],
+): Promise<Actor> {
+  const user = await auth.provisionUser({
     tenantId,
-    workspaceIds,
-    roles: roles as Parameters<MembershipDirectory["registerUserMembership"]>[0]["roles"],
+    externalProvider: "google",
+    externalSubject: `sub-${name}`,
+    email: `${name}@pussycatalley.com`,
+    emailVerified: true,
   });
-  const { token, sessionId } = sessions.issueSession({ userId, authStrength: "password" });
-  return { token, sessionId, userId };
+  for (const workspaceId of workspaceIds) {
+    await identity.memberships.grant({
+      userId: user.id, tenantId, workspaceId,
+      roleIds: roles as MailRole[], status: "active",
+      createdAt: new Date().toISOString(), revokedAt: null,
+    });
+  }
+  const { token, sessionId } = await auth.issueSession({
+    userId: user.id, tenantId, authStrength: "password",
+  });
+  return { token, sessionId, userId: user.id };
 }
 
 async function api(
@@ -126,8 +140,10 @@ before(() => {
 
 beforeEach(async () => {
   revokedTokens = [];
-  sessions = createSessionStore();
-  directory = createMembershipDirectory();
+  identity = createInMemoryIdentityState();
+  auth = createAuthService(identity, {
+    google: { clientId: "unused", jwks: async () => ({ keys: [] }) },
+  });
   mailState = createInMemoryMailState();
   if (server) server.close();
   const app = express();
@@ -163,7 +179,7 @@ test("requests without a bearer token are 401 even with x-aaliyah identity heade
 });
 
 test("spoofed identity headers cannot redirect an authenticated operation to another tenant", async () => {
-  const admin = loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
+  const admin = await loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
   const connectionId = await connectAs(admin, WS_A);
 
   // Claim tenant_b via headers — the connection must still be found via the
@@ -183,8 +199,8 @@ test("spoofed identity headers cannot redirect an authenticated operation to ano
 // ---- Gate: authorized-but-unpermissioned → 403; role policy on routes ----
 
 test("workspace member can view health but cannot test, connect, or disconnect", async () => {
-  const admin = loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
-  const member = loginUser("u_member", TENANT_A, [WS_A], ["workspace_member"]);
+  const admin = await loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
+  const member = await loginUser("u_member", TENANT_A, [WS_A], ["workspace_member"]);
   const connectionId = await connectAs(admin, WS_A);
 
   const read = await api("GET", `/api/mail/connections/${connectionId}?workspaceId=${WS_A}`, {
@@ -213,7 +229,7 @@ test("workspace member can view health but cannot test, connect, or disconnect",
 });
 
 test("workspace admin can connect and disconnect a shared mailbox", async () => {
-  const admin = loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
+  const admin = await loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
   const connectionId = await connectAs(admin, WS_A);
 
   const delRes = await api("DELETE", `/api/mail/connections/${connectionId}?workspaceId=${WS_A}`, {
@@ -228,7 +244,7 @@ test("workspace admin can connect and disconnect a shared mailbox", async () => 
 // ---- Gate: workspace membership resolved server-side ----
 
 test("naming a workspace outside the principal's membership is 403", async () => {
-  const admin = loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
+  const admin = await loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
   const res = await api("POST", "/api/mail/connections/google/start", {
     token: admin.token,
     body: { workspaceId: "tenant_a:finance" },
@@ -239,8 +255,8 @@ test("naming a workspace outside the principal's membership is 403", async () =>
 // ---- Gate: cross-tenant lookup and disconnect fail ----
 
 test("a tenant_b admin can neither read nor disconnect a tenant_a connection", async () => {
-  const adminA = loginUser("u_admin_a", TENANT_A, [WS_A], ["workspace_admin"]);
-  const adminB = loginUser("u_admin_b", TENANT_B, [WS_B], ["workspace_admin"]);
+  const adminA = await loginUser("u_admin_a", TENANT_A, [WS_A], ["workspace_admin"]);
+  const adminB = await loginUser("u_admin_b", TENANT_B, [WS_B], ["workspace_admin"]);
   const connectionId = await connectAs(adminA, WS_A);
 
   const read = await api("GET", `/api/mail/connections/${connectionId}?workspaceId=${WS_B}`, {
@@ -258,8 +274,8 @@ test("a tenant_b admin can neither read nor disconnect a tenant_a connection", a
 // ---- Gate: OAuth state bound to user+session+tenant+workspace at the route level ----
 
 test("a callback presented by a different user/session fails and connects nothing", async () => {
-  const admin = loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
-  const otherAdmin = loginUser("u_other", TENANT_A, [WS_A], ["workspace_admin"]);
+  const admin = await loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
+  const otherAdmin = await loginUser("u_other", TENANT_A, [WS_A], ["workspace_admin"]);
 
   const start = await api("POST", "/api/mail/connections/google/start", {
     token: admin.token,
@@ -287,7 +303,7 @@ test("a callback presented by a different user/session fails and connects nothin
 });
 
 test("callback query params cannot choose tenant or workspace", async () => {
-  const admin = loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
+  const admin = await loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
   const start = await api("POST", "/api/mail/connections/google/start", {
     token: admin.token,
     body: { workspaceId: WS_A },
@@ -318,8 +334,8 @@ test("callback query params cannot choose tenant or workspace", async () => {
 // ---- Gate: revoked sessions cannot start OAuth ----
 
 test("a revoked session cannot start OAuth or act at all", async () => {
-  const admin = loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
-  sessions.revokeSession(admin.sessionId);
+  const admin = await loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
+  await auth.logout(admin.token);
   const res = await api("POST", "/api/mail/connections/google/start", {
     token: admin.token,
     body: { workspaceId: WS_A },
@@ -330,12 +346,11 @@ test("a revoked session cannot start OAuth or act at all", async () => {
 // ---- Gate: worker identities cannot administer connections ----
 
 test("service identity can read health but cannot start or disconnect", async () => {
-  const admin = loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
+  const admin = await loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
   const connectionId = await connectAs(admin, WS_A);
 
-  const { serviceToken } = directory.registerServiceIdentity({
-    serviceId: "mail.reader",
-    workloadIdentity: "workload://aaliyah/mail-reader",
+  const { serviceToken } = await auth.registerServiceIdentity({
+    name: "mail.reader",
     tenantId: TENANT_A,
     workspaceIds: [WS_A],
     grants: ["mail.connection.read"],
@@ -362,12 +377,11 @@ test("service identity can read health but cannot start or disconnect", async ()
 // ---- Gate: audit distinguishes users from services; no secrets in mail logs ----
 
 test("audit trail distinguishes user and service actors and never contains tokens", async () => {
-  const admin = loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
+  const admin = await loginUser("u_admin", TENANT_A, [WS_A], ["workspace_admin"]);
   const connectionId = await connectAs(admin, WS_A);
 
-  const { serviceToken } = directory.registerServiceIdentity({
-    serviceId: "mail.reader",
-    workloadIdentity: "workload://aaliyah/mail-reader",
+  const { serviceToken } = await auth.registerServiceIdentity({
+    name: "mail.reader",
     tenantId: TENANT_A,
     workspaceIds: [WS_A],
     grants: ["mail.connection.read"],

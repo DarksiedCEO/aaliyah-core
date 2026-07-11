@@ -1,14 +1,12 @@
 import assert from "node:assert/strict";
-import test, { beforeEach } from "node:test";
+import test from "node:test";
 
-import { createSessionStore } from "../src/auth/sessionStore";
-import {
-  createMembershipDirectory,
-  ServiceGrantRefusedError,
-} from "../src/auth/membershipDirectory";
 import { authorizeMail, AuthorizationError } from "../src/auth/permissions";
 
 import type { AuthenticatedPrincipal, ServicePrincipal } from "@aaliyah/contracts/v1";
+
+// The permission engine's role policy. Session/membership/service identity
+// behavior lives in authService.test.ts against the durable identity backend.
 
 const TENANT = "tenant_a";
 const WS = "tenant_a:default";
@@ -25,98 +23,6 @@ function principal(overrides: Partial<AuthenticatedPrincipal> = {}): Authenticat
     ...overrides,
   };
 }
-
-// ---- Session store ----
-
-test("issued session resolves; unknown and revoked tokens do not", () => {
-  const sessions = createSessionStore();
-  const { token, sessionId } = sessions.issueSession({ userId: "u1", authStrength: "mfa" });
-
-  const resolved = sessions.resolveSession(token);
-  assert.ok(resolved);
-  assert.equal(resolved!.userId, "u1");
-  assert.equal(resolved!.sessionId, sessionId);
-  assert.equal(resolved!.authStrength, "mfa");
-
-  assert.equal(sessions.resolveSession("forged-token"), null);
-
-  sessions.revokeSession(sessionId);
-  assert.equal(sessions.resolveSession(token), null);
-});
-
-test("session tokens are opaque and never stored in plaintext", () => {
-  const sessions = createSessionStore();
-  const { token } = sessions.issueSession({ userId: "u1", authStrength: "password" });
-  // The store must not hold the raw token anywhere in its serializable state.
-  assert.ok(!JSON.stringify(sessions.debugState()).includes(token));
-});
-
-// ---- Membership directory: server-side resolution ----
-
-test("tenant and workspace membership are resolved server-side, not from claims", () => {
-  const directory = createMembershipDirectory();
-  directory.registerUserMembership({
-    userId: "u1",
-    tenantId: TENANT,
-    workspaceIds: [WS],
-    roles: ["workspace_admin"],
-  });
-
-  const p = directory.principalForSession({
-    userId: "u1",
-    sessionId: "sess_1",
-    authStrength: "password",
-  });
-  assert.ok(p);
-  assert.equal(p!.tenantId, TENANT);
-  assert.deepEqual(p!.workspaceIds, [WS]);
-  assert.deepEqual(p!.roles, ["workspace_admin"]);
-
-  // A user with a valid session but no registered membership resolves to nothing.
-  assert.equal(
-    directory.principalForSession({ userId: "ghost", sessionId: "sess_2", authStrength: "sso" }),
-    null,
-  );
-});
-
-test("service identities get narrow grants; admin and send grants are refused", () => {
-  const directory = createMembershipDirectory();
-
-  const { serviceToken } = directory.registerServiceIdentity({
-    serviceId: "mail.reader",
-    workloadIdentity: "workload://aaliyah/mail-reader",
-    tenantId: TENANT,
-    workspaceIds: [WS],
-    grants: ["mail.connection.read"],
-  });
-  const sp = directory.servicePrincipalForToken(serviceToken);
-  assert.ok(sp);
-  assert.equal(sp!.actorType, "service");
-  assert.deepEqual(sp!.grants, ["mail.connection.read"]);
-
-  for (const refused of [
-    "mail.connection.create",
-    "mail.connection.disconnect",
-    "mail.send.execute",
-  ] as const) {
-    assert.throws(
-      () =>
-        directory.registerServiceIdentity({
-          serviceId: "greedy.worker",
-          workloadIdentity: "workload://aaliyah/greedy",
-          tenantId: TENANT,
-          workspaceIds: [WS],
-          grants: [refused],
-        }),
-      ServiceGrantRefusedError,
-      refused,
-    );
-  }
-
-  assert.equal(directory.servicePrincipalForToken("forged"), null);
-});
-
-// ---- Permission engine ----
 
 function denied(fn: () => void, code: string): void {
   try {
@@ -188,6 +94,19 @@ test("no role grants mail.send.execute this phase — not even workspace admin",
   }
 });
 
+test("per-workspace role map wins over flat roles when present", () => {
+  const p = principal({
+    workspaceIds: [WS, "tenant_a:ops"],
+    roles: ["workspace_admin", "workspace_member"],
+    workspaceRoles: { [WS]: ["workspace_admin"], "tenant_a:ops": ["workspace_member"] },
+  });
+  authorizeMail(p, "mail.connection.create", { tenantId: TENANT, workspaceId: WS });
+  denied(
+    () => authorizeMail(p, "mail.connection.create", { tenantId: TENANT, workspaceId: "tenant_a:ops" }),
+    "permission_denied",
+  );
+});
+
 test("service principals are authorized by explicit grants and stay tenant/workspace-scoped", () => {
   const reader: ServicePrincipal = {
     actorType: "service",
@@ -207,8 +126,4 @@ test("service principals are authorized by explicit grants and stay tenant/works
     () => authorizeMail(reader, "mail.connection.read", { tenantId: "tenant_b", workspaceId: "tenant_b:x" }),
     "cross_tenant",
   );
-});
-
-beforeEach(() => {
-  // no shared state between tests: each test builds its own stores
 });

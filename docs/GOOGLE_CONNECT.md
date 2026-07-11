@@ -57,12 +57,26 @@ refresh tokens, client secrets, or raw provider errors.
 > AALIYAH_DATABASE_URL. sendGuard.ts is REFROZEN — see the recorded hash in
 > the B4.5 commit message.
 >
-> Remaining gaps, stated plainly: (1) Session store and membership
-> directory are in-memory; no real IdP/login flow yet — sessions are issued
-> programmatically (Phase B5). (2) Sending remains disabled: no role or
-> service grant maps to mail.send.execute, and live sending awaits explicit
-> authorization. (3) Adapters not live-proven until the real Google app
-> registration and the 13-step live run.
+> Identity (Phase B5): durable users/memberships/sessions/service
+> identities on Postgres (in-memory twin for dev/tests only — production
+> boot fails closed without AALIYAH_DATABASE_URL for BOTH mail and identity
+> state). Login = real Google ID-token verification (issuer, audience,
+> RS256 signature against Google JWKS, expiry, nonce, verified email);
+> identity anchors on the external subject, never email. Sessions:
+> hash-at-rest, absolute + idle expiry, rotation, durable revocation;
+> browser flows use Secure/HttpOnly/SameSite=Strict cookies with
+> double-submit CSRF on mutations; logout revokes durably. Membership is
+> the per-request authority — role changes, suspensions, and disables bite
+> without restart, per workspace (admin of one workspace holds nothing in
+> its siblings). Google IDENTITY and Gmail MAILBOX authorization are
+> separate credentials with separate lifecycles: logout never disconnects
+> an inbox; disconnecting an inbox never touches a login.
+>
+> Remaining, stated plainly: (1) Sending remains disabled: no role or
+> service grant maps to mail.send.execute; live sending awaits explicit
+> authorization. (2) Not live-proven until the real Google app registration
+> (both the identity client and the Gmail OAuth app), real KMS, and the
+> controlled live connect/read/draft/disconnect run.
 
 ## Client experience
 
