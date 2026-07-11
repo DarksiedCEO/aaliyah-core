@@ -32,9 +32,14 @@ export const ROLE_PERMISSIONS: Record<MailRole, readonly MailPermission[]> = {
   draft_approver: ["mail.connection.read", "mail.draft.approve"],
 };
 
-function permissionsOf(principal: Principal): readonly MailPermission[] {
+function permissionsOf(principal: Principal, workspaceId: string): readonly MailPermission[] {
   if (principal.actorType === "service") return principal.grants;
-  return principal.roles.flatMap((role) => ROLE_PERMISSIONS[role]);
+  // Durable membership authority (B5): when the principal carries a
+  // per-workspace role map, authorization uses EXACTLY the target
+  // workspace's roles — being admin of one workspace grants nothing in its
+  // siblings. Flat roles remain for single-workspace principals.
+  const roles = principal.workspaceRoles?.[workspaceId] ?? principal.roles;
+  return roles.flatMap((role) => ROLE_PERMISSIONS[role]);
 }
 
 /**
@@ -53,7 +58,7 @@ export function authorizeMail(
   if (!principal.workspaceIds.includes(target.workspaceId)) {
     throw new AuthorizationError("workspace_forbidden", "principal is not a member of the target workspace");
   }
-  if (!permissionsOf(principal).includes(permission)) {
+  if (!permissionsOf(principal, target.workspaceId).includes(permission)) {
     throw new AuthorizationError("permission_denied", `missing ${permission}`);
   }
 }
