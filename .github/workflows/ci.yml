@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # Reproduces the local dev DB: same aaliyah_test name, same postgres user,
+    # only the port and password differ (CI has no reason to dodge 5432).
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: aaliyah_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      AALIYAH_TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/aaliyah_test
+
+    steps:
+      # aaliyah-core depends on @aaliyah/contracts via file:../aaliyah-contracts —
+      # a sibling-directory reference, not a published package. Check out both
+      # repos into sibling paths under the same workspace so that relative
+      # path resolves exactly as it does in local dev.
+      - name: Checkout aaliyah-core
+        uses: actions/checkout@v4
+        with:
+          path: aaliyah-core
+
+      - name: Checkout aaliyah-contracts (main)
+        uses: actions/checkout@v4
+        with:
+          repository: DarksiedCEO/aaliyah-contracts
+          ref: main
+          path: aaliyah-contracts
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: |
+            aaliyah-contracts/pnpm-lock.yaml
+            aaliyah-core/pnpm-lock.yaml
+
+      - name: Build sibling contracts package
+        working-directory: aaliyah-contracts
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Install aaliyah-core
+        working-directory: aaliyah-core
+        run: pnpm install --frozen-lockfile
+
+      # Scoped to src/+tests/ — what's actually shipped and tested. The base
+      # tsconfig.json's include also sweeps up scripts/, and one pre-existing
+      # manual script there (scripts/runFollowupExecution.ts) has an
+      # undeclared build-time dependency on a THIRD sibling repo
+      # (aaliyah-workflows), which itself depends back on aaliyah-core —
+      # a circular coupling unrelated to this rebuild. That script is never
+      # imported by the test suite; excluding it from the CI typecheck gate
+      # doesn't weaken anything this gate previously covered (there was no
+      # CI before now), it just doesn't invent a new requirement for it.
+      - name: Typecheck (src + tests)
+        working-directory: aaliyah-core
+        run: npx tsc -p tsconfig.ci.json --noEmit
+
+      - name: Test (against live Postgres — no in-memory fallback)
+        working-directory: aaliyah-core
+        run: pnpm test
