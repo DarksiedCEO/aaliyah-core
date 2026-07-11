@@ -21,8 +21,6 @@ import {
 } from "../src/http/mailRoutes";
 import { createInMemoryMailState } from "../src/mail/mailState";
 import { connectionIdFor } from "../src/mail/adapters/helpers";
-import { createSessionStore } from "../src/auth/sessionStore";
-import { createMembershipDirectory } from "../src/auth/membershipDirectory";
 import { AuthorizationError } from "../src/auth/permissions";
 import type { AuthenticatedPrincipal } from "@aaliyah/contracts/v1";
 
@@ -145,7 +143,8 @@ function routeDeps(configured = true): MailRoutesDeps & { http: ReturnType<typeo
     redirectUri: REDIRECT,
     frontendInboxesUrl: "https://app.example/settings/inboxes",
     ...(configured ? { connectDeps } : {}),
-    auth: { sessions: createSessionStore(), directory: createMembershipDirectory() },
+    // Handler-level tests pass principals directly; the resolver is unused.
+    auth: { principalForToken: async () => null },
     state,
   };
 }

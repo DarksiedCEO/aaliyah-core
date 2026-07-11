@@ -4,9 +4,7 @@ import type { Principal, SanitizedConnection } from "@aaliyah/contracts/v1";
 
 import { logger } from "../observability/logger";
 import type { TenantScope } from "../persistence/tenantScopedStore";
-import type { MembershipDirectory } from "../auth/membershipDirectory";
 import { authorizeMail, AuthorizationError } from "../auth/permissions";
-import type { SessionStore } from "../auth/sessionStore";
 import { GoogleMailAdapter } from "../mail/adapters/googleMailAdapter";
 import type { MailStateBackend } from "../mail/mailState";
 import {
@@ -20,9 +18,26 @@ import type { GoogleCapability } from "../mail/google/googleConfig";
 import { recordMailAudit } from "../mail/security/mailAudit";
 
 export type MailAuthDeps = {
-  sessions: SessionStore;
-  directory: MembershipDirectory;
+  /** The durable principal resolver (authService.principalForToken in
+   * production; the same resolver over the in-memory identity twin in
+   * dev/tests). One resolver, no parallel identity truth. */
+  principalForToken: (token: string) => Promise<Principal | null>;
 };
+
+export const SESSION_COOKIE = "aaliyah_session";
+export const CSRF_COOKIE = "aaliyah_csrf";
+export const CSRF_HEADER = "x-aaliyah-csrf";
+
+function parseCookies(header: string | undefined): Record<string, string> {
+  const cookies: Record<string, string> = {};
+  if (!header) return cookies;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    cookies[part.slice(0, eq).trim()] = decodeURIComponent(part.slice(eq + 1).trim());
+  }
+  return cookies;
+}
 
 export type MailRoutesDeps = {
   capability: GoogleCapability;
@@ -36,22 +51,42 @@ export type MailRoutesDeps = {
 
 // ---- Server-verified principal resolution ----
 //
-// Identity comes ONLY from a bearer credential resolved against the session
-// store (humans) or the service registry (workloads). x-aaliyah-* headers are
-// never read: a header is a claim, not an identity.
+// Identity comes ONLY from a bearer credential (Authorization header for
+// APIs/services, the httpOnly session cookie for browsers) resolved against
+// the durable identity backend. x-aaliyah-* headers are never read: a header
+// is a claim, not an identity. Cookie-authenticated MUTATIONS additionally
+// require the double-submit CSRF header; bearer callers are CSRF-immune by
+// construction (no ambient credential).
 
-export function authenticateRequest(
+const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+export class CsrfError extends Error {
+  constructor() {
+    super("csrf token missing or mismatched");
+    this.name = "CsrfError";
+  }
+}
+
+export async function authenticateRequest(
   req: express.Request,
   auth: MailAuthDeps,
-): Principal | null {
+): Promise<Principal | null> {
   const header = req.header("authorization");
-  if (!header?.startsWith("Bearer ")) return null;
-  const token = header.slice("Bearer ".length).trim();
-  if (!token) return null;
+  if (header?.startsWith("Bearer ")) {
+    const token = header.slice("Bearer ".length).trim();
+    return token ? auth.principalForToken(token) : null;
+  }
 
-  const session = auth.sessions.resolveSession(token);
-  if (session) return auth.directory.principalForSession(session);
-  return auth.directory.servicePrincipalForToken(token);
+  const cookies = parseCookies(req.header("cookie"));
+  const cookieToken = cookies[SESSION_COOKIE];
+  if (!cookieToken) return null;
+  if (MUTATING_METHODS.has(req.method.toUpperCase())) {
+    const csrfHeader = req.header(CSRF_HEADER);
+    if (!csrfHeader || csrfHeader !== cookies[CSRF_COOKIE]) {
+      throw new CsrfError();
+    }
+  }
+  return auth.principalForToken(cookieToken);
 }
 
 function actorFields(principal: Principal): {
@@ -278,10 +313,20 @@ type AuthedHandler = (
 export function createMailRouter(deps: MailRoutesDeps): Router {
   const router = express.Router();
 
-  /** 401 without a verified principal; 403 (audited) on authorization denial. */
+  /** 401 without a verified principal; 403 (audited) on authorization denial;
+   * 403 on a cookie mutation without a matching CSRF header. */
   const authed = (handler: AuthedHandler) =>
     async (req: express.Request, res: express.Response): Promise<void> => {
-      const principal = authenticateRequest(req, deps.auth);
+      let principal: Principal | null;
+      try {
+        principal = await authenticateRequest(req, deps.auth);
+      } catch (error) {
+        if (error instanceof CsrfError) {
+          res.status(403).json({ error: "csrf_required" });
+          return;
+        }
+        throw error; // identity backend outage: fail closed, loudly
+      }
       if (!principal) {
         res.status(401).json({ error: "unauthenticated" });
         return;
@@ -339,7 +384,8 @@ export function createMailRouter(deps: MailRoutesDeps): Router {
   router.get("/api/mail/connections/google/callback", async (req, res) => {
     // The callback authenticates like every other route, but browser-redirect
     // ergonomics demand a redirect rather than a JSON 401 on failure.
-    const principal = authenticateRequest(req, deps.auth);
+    // GET → the CSRF gate does not apply; the state is session-bound anyway.
+    const principal = await authenticateRequest(req, deps.auth);
     const cb = {
       ...(typeof req.query.code === "string" ? { code: req.query.code } : {}),
       ...(typeof req.query.state === "string" ? { state: req.query.state } : {}),

@@ -1,10 +1,13 @@
 import express, { type Express } from "express";
 import { internalEvalRoutes } from "./internalEvalRoutes";
+import { createAuthRouter } from "./authRoutes";
 import { createMailRouter, type MailAuthDeps, type MailRoutesDeps } from "./mailRoutes";
-import { createMembershipDirectory } from "../auth/membershipDirectory";
-import { createSessionStore } from "../auth/sessionStore";
+import { createAuthService, type AuthService } from "../auth/authService";
+import { fetchGoogleJwks } from "../auth/googleIdentity";
+import { createInMemoryIdentityState, type IdentityBackend } from "../auth/identityState";
 import { createInMemoryMailState, type MailStateBackend } from "../mail/mailState";
 import { createMailDbPool } from "../persistence/postgres/pool";
+import { createPostgresIdentityState } from "../persistence/postgres/identityStateStore";
 import { createPostgresMailState } from "../persistence/postgres/mailStateStore";
 import {
   googleCapability,
@@ -55,8 +58,30 @@ export function mailStateFromEnv(env: NodeJS.ProcessEnv = process.env): MailStat
   return createInMemoryMailState();
 }
 
+/**
+ * Select the identity backend under the same rule: production cannot boot on
+ * the in-memory identity twin — sessions, memberships, and revocations must
+ * survive restarts and be shared across instances.
+ */
+export function identityStateFromEnv(env: NodeJS.ProcessEnv = process.env): IdentityBackend {
+  if (env.AALIYAH_DATABASE_URL) {
+    return createPostgresIdentityState(createMailDbPool(env));
+  }
+  if (env.NODE_ENV === "production") {
+    throw new Error(
+      "durable identity state is required in production: set AALIYAH_DATABASE_URL (no in-memory fallback)",
+    );
+  }
+  return createInMemoryIdentityState();
+}
+
 export function createCoreApp(
-  options: { mailAuth?: MailAuthDeps; mailState?: MailStateBackend } = {},
+  options: {
+    mailAuth?: MailAuthDeps;
+    mailState?: MailStateBackend;
+    identityState?: IdentityBackend;
+    authService?: AuthService;
+  } = {},
 ): Express {
   if (
     process.env.AALIYAH_ENABLE_INTERNAL_EVAL === "true" &&
@@ -67,16 +92,31 @@ export function createCoreApp(
 
   const app = express();
 
-  // Without an injected auth backend the directories are EMPTY: every mail
-  // route fails closed with 401 — never an open header-trusting seam.
-  const mailAuth = options.mailAuth ?? {
-    sessions: createSessionStore(),
-    directory: createMembershipDirectory(),
-  };
   const mailState = options.mailState ?? mailStateFromEnv();
+  const identityState = options.identityState ?? identityStateFromEnv();
+
+  // Google IDENTITY login (who is the human) is configured independently of
+  // Gmail mailbox OAuth (which mailbox authorized Aaliyah) — separate
+  // credentials, separate lifecycles, separate revocation.
+  const googleLoginAvailable = Boolean(process.env.GOOGLE_CLIENT_ID);
+  const authService =
+    options.authService ??
+    createAuthService(identityState, {
+      google: {
+        clientId: process.env.GOOGLE_CLIENT_ID ?? "unconfigured",
+        jwks: fetchGoogleJwks(),
+      },
+    });
+
+  // The ONLY principal source: the durable resolver. With an empty identity
+  // backend every mail route fails closed with 401.
+  const mailAuth = options.mailAuth ?? {
+    principalForToken: authService.principalForToken,
+  };
 
   app.use(express.json());
   app.use(internalEvalRoutes);
+  app.use(createAuthRouter({ auth: authService, googleLoginAvailable }));
   app.use(createMailRouter(mailRoutesDeps(mailAuth, mailState)));
 
   app.get("/health", (_req, res) => {

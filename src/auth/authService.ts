@@ -164,6 +164,11 @@ export function createAuthService(identity: IdentityBackend, opts: AuthServiceOp
 
     resolveSession,
 
+    /** Issue a session directly — the seam for non-Google auth flows
+     * (password/mfa) and for tests. Callers must have authenticated the user
+     * by other verified means first; this never runs from client input. */
+    issueSession,
+
     /** Logout: durably revoke — a revoked record remains for audit. */
     async logout(token: string): Promise<void> {
       const session = await identity.sessions.getByTokenHash(hashToken(token));
