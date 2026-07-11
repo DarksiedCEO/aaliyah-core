@@ -128,6 +128,66 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       CREATE INDEX IF NOT EXISTS idx_mail_audit_scope ON mail_audit_events (tenant_id, workspace_id, at);
       CREATE INDEX IF NOT EXISTS idx_mail_reconciliation_approval ON mail_reconciliation (approval_id, checked_at)`,
   },
+  {
+    id: "010_auth_users",
+    sql: `CREATE TABLE IF NOT EXISTS auth_users (
+      id text PRIMARY KEY,
+      tenant_id text NOT NULL,
+      external_provider text NOT NULL,
+      external_subject text NOT NULL,
+      email text NOT NULL,
+      email_verified boolean NOT NULL,
+      status text NOT NULL,
+      created_at timestamptz NOT NULL,
+      updated_at timestamptz NOT NULL,
+      UNIQUE (external_provider, external_subject)
+    )`,
+  },
+  {
+    id: "011_workspace_memberships",
+    sql: `CREATE TABLE IF NOT EXISTS workspace_memberships (
+      user_id text NOT NULL,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      role_ids jsonb NOT NULL DEFAULT '[]',
+      status text NOT NULL,
+      created_at timestamptz NOT NULL,
+      revoked_at timestamptz,
+      PRIMARY KEY (user_id, tenant_id, workspace_id)
+    )`,
+  },
+  {
+    id: "012_auth_sessions",
+    sql: `CREATE TABLE IF NOT EXISTS auth_sessions (
+      id text PRIMARY KEY,
+      user_id text NOT NULL,
+      tenant_id text NOT NULL,
+      session_token_hash text NOT NULL UNIQUE,
+      auth_strength text NOT NULL,
+      created_at timestamptz NOT NULL,
+      expires_at timestamptz NOT NULL,
+      last_seen_at timestamptz NOT NULL,
+      revoked_at timestamptz
+    )`,
+  },
+  {
+    id: "013_service_identities",
+    sql: `CREATE TABLE IF NOT EXISTS service_identities (
+      id text PRIMARY KEY,
+      tenant_id text,
+      name text NOT NULL,
+      permission_ids jsonb NOT NULL DEFAULT '[]',
+      credential_hash text NOT NULL UNIQUE,
+      status text NOT NULL,
+      created_at timestamptz NOT NULL,
+      rotated_at timestamptz NOT NULL
+    )`,
+  },
+  {
+    id: "014_identity_indexes",
+    sql: `CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions (user_id);
+      CREATE INDEX IF NOT EXISTS idx_memberships_user ON workspace_memberships (user_id, tenant_id, status)`,
+  },
 ];
 
 export async function runMailMigrations(pool: Pool): Promise<void> {
