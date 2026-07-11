@@ -1,10 +1,8 @@
-import fs from "node:fs";
-import path from "node:path";
-
 import { logger } from "./logger";
-import { scopedJsonlPath, type TenantScope } from "../persistence/tenantScopedStore";
+import type { TenantScope } from "../persistence/tenantScopedStore";
+import { applicationStoreFromEnv } from "../persistence/applicationState";
 
-const TRACE_FILENAME = "aaliyah-traces.jsonl";
+const TRACE_STORE = "observability_traces";
 
 function scopeFromTrace(trace: Record<string, unknown>): TenantScope | undefined {
   const tenantId = trace.tenantId;
@@ -36,25 +34,14 @@ export async function persistTrace(trace: Record<string, unknown>): Promise<void
     return;
   }
 
-  const filePath = scopedJsonlPath(TRACE_FILENAME, scope);
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.appendFileSync(filePath, `${JSON.stringify(enriched)}\n`, "utf8");
+  await applicationStoreFromEnv().logs.append(TRACE_STORE, scope, enriched);
 }
 
 /**
  * Read back persisted traces for a single (tenant, workspace). Used by audit
  * tooling and isolation tests — never returns another scope's traces.
  */
-export function readPersistedTraces(scope: TenantScope): Record<string, unknown>[] {
-  const filePath = scopedJsonlPath(TRACE_FILENAME, scope);
-
-  if (!fs.existsSync(filePath)) {
-    return [];
-  }
-
-  return fs
-    .readFileSync(filePath, "utf8")
-    .split("\n")
-    .filter((line) => line.trim().length > 0)
-    .map((line) => JSON.parse(line) as Record<string, unknown>);
+export async function readPersistedTraces(scope: TenantScope): Promise<Record<string, unknown>[]> {
+  const rows = await applicationStoreFromEnv().logs.list(TRACE_STORE, scope);
+  return rows as Record<string, unknown>[];
 }

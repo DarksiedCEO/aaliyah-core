@@ -15,11 +15,13 @@ import {
   loadPreferences,
   clearPreferencesCache,
 } from "../src/application/onboarding/preferencesStore";
+import { resetApplicationStoreForTests } from "../src/persistence/applicationState";
 
 before(() => {
   process.env.AALIYAH_DATA_DIR = fs.mkdtempSync(
     path.join(os.tmpdir(), "aaliyah-onboarding-"),
   );
+  resetApplicationStoreForTests();
 });
 
 afterEach(() => {
@@ -45,26 +47,26 @@ function inbox(): InboundEmail[] {
   ];
 }
 
-function runFullFlow(): OnboardingState {
+async function runFullFlow(): Promise<OnboardingState> {
   let s = startOnboarding({ tenantId: "tenant_a", userId: "user_1" });
   assert.equal(s.step, "welcome");
-  s = advanceOnboarding(s, { type: "begin" });
-  s = advanceOnboarding(s, { type: "set_use_case", useCase: "sales_followup" });
-  s = advanceOnboarding(s, { type: "connect_gmail", connected: true });
-  s = advanceOnboarding(s, { type: "set_mode", mode: "draft_replies" });
-  s = advanceOnboarding(s, { type: "set_style", style: "professional" });
+  s = await advanceOnboarding(s, { type: "begin" });
+  s = await advanceOnboarding(s, { type: "set_use_case", useCase: "sales_followup" });
+  s = await advanceOnboarding(s, { type: "connect_gmail", connected: true });
+  s = await advanceOnboarding(s, { type: "set_mode", mode: "draft_replies" });
+  s = await advanceOnboarding(s, { type: "set_style", style: "professional" });
   const opps = discoverOpportunities(inbox());
-  s = advanceOnboarding(s, { type: "run_discovery", opportunities: opps });
-  s = advanceOnboarding(s, { type: "accept_opportunities" });
+  s = await advanceOnboarding(s, { type: "run_discovery", opportunities: opps });
+  s = await advanceOnboarding(s, { type: "accept_opportunities" });
   return s;
 }
 
-test("onboarding walks the full flow to completion and persists preferences", () => {
-  const final = runFullFlow();
+test("onboarding walks the full flow to completion and persists preferences", async () => {
+  const final = await runFullFlow();
   assert.equal(final.step, "complete");
   assert.ok(final.completedAt);
 
-  const prefs = loadPreferences(SCOPE, "user_1");
+  const prefs = await loadPreferences(SCOPE, "user_1");
   assert.ok(prefs);
   assert.equal(prefs!.useCase, "sales_followup");
   assert.equal(prefs!.operatingMode, "draft_replies");
@@ -72,34 +74,34 @@ test("onboarding walks the full flow to completion and persists preferences", ()
   assert.equal(prefs!.gmailConnected, true);
 });
 
-test("onboarding never enables auto-send", () => {
-  const final = runFullFlow();
-  const prefs = loadPreferences(SCOPE, "user_1");
+test("onboarding never enables auto-send", async () => {
+  const final = await runFullFlow();
+  const prefs = await loadPreferences(SCOPE, "user_1");
   assert.equal(prefs!.autoSend, false);
   // Final state carries no auto-send affordance at all.
   assert.equal((final as Record<string, unknown>).autoSend, undefined);
 });
 
-test("default mode is draft_replies and default style is professional", () => {
+test("default mode is draft_replies and default style is professional", async () => {
   let s = startOnboarding({ tenantId: "tenant_b", userId: "user_2" });
-  s = advanceOnboarding(s, { type: "begin" });
-  s = advanceOnboarding(s, { type: "set_use_case", useCase: "inbox_management" });
-  s = advanceOnboarding(s, { type: "connect_gmail", connected: true });
+  s = await advanceOnboarding(s, { type: "begin" });
+  s = await advanceOnboarding(s, { type: "set_use_case", useCase: "inbox_management" });
+  s = await advanceOnboarding(s, { type: "connect_gmail", connected: true });
   // Skip explicit mode/style by passing through with no override is not allowed
   // — but the persisted defaults apply if the fields were never set. Here we set
   // them to confirm the documented defaults exist as contract constants.
-  s = advanceOnboarding(s, { type: "set_mode", mode: "draft_replies" });
-  s = advanceOnboarding(s, { type: "set_style", style: "professional" });
-  s = advanceOnboarding(s, { type: "run_discovery", opportunities: [] });
-  s = advanceOnboarding(s, { type: "accept_opportunities" });
-  const prefs = loadPreferences({ tenantId: "tenant_b", workspaceId: "tenant_b:default" }, "user_2");
+  s = await advanceOnboarding(s, { type: "set_mode", mode: "draft_replies" });
+  s = await advanceOnboarding(s, { type: "set_style", style: "professional" });
+  s = await advanceOnboarding(s, { type: "run_discovery", opportunities: [] });
+  s = await advanceOnboarding(s, { type: "accept_opportunities" });
+  const prefs = await loadPreferences({ tenantId: "tenant_b", workspaceId: "tenant_b:default" }, "user_2");
   assert.equal(prefs!.operatingMode, "draft_replies");
   assert.equal(prefs!.communicationStyle, "professional");
 });
 
-test("actions are rejected out of order (step machine is enforced)", () => {
+test("actions are rejected out of order (step machine is enforced)", async () => {
   const s = startOnboarding({ tenantId: "tenant_a", userId: "user_3" });
-  assert.throws(
+  await assert.rejects(
     () => advanceOnboarding(s, { type: "set_mode", mode: "observe_only" }),
     /invalid at step/,
   );
@@ -112,7 +114,7 @@ test("inbox discovery surfaces only reply-worthy opportunities, capped at 3", ()
   assert.ok(!opps.some((o) => o.fromEmail.startsWith("no-reply@")));
 });
 
-test("preferences are isolated per tenant/workspace/user", () => {
-  runFullFlow(); // tenant_a / user_1
-  assert.equal(loadPreferences({ tenantId: "tenant_x", workspaceId: "tenant_x:default" }, "user_1"), undefined);
+test("preferences are isolated per tenant/workspace/user", async () => {
+  await runFullFlow(); // tenant_a / user_1
+  assert.equal(await loadPreferences({ tenantId: "tenant_x", workspaceId: "tenant_x:default" }, "user_1"), undefined);
 });

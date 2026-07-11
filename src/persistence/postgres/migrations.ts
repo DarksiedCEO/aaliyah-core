@@ -202,6 +202,65 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
     sql: `ALTER TABLE mail_connection_health
       ADD COLUMN IF NOT EXISTS state text NOT NULL DEFAULT 'healthy'`,
   },
+  {
+    // Durable home for the previously file-backed application stores that hold a
+    // single latest document per key (style profiles, onboarding preferences,
+    // relationship maps). `store` names the logical store; `doc_key` is its
+    // per-store identity (e.g. userId). Payload is the contract-validated JSON.
+    id: "017_aaliyah_documents",
+    sql: `CREATE TABLE IF NOT EXISTS aaliyah_documents (
+      store text NOT NULL,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      doc_key text NOT NULL,
+      payload jsonb NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (store, tenant_id, workspace_id, doc_key)
+    )`,
+  },
+  {
+    // Durable home for the previously file-backed append-only logs (decision
+    // traces, draft-quality, revenue signals, observability traces, reply
+    // outcomes, follow-up outcomes). Insertion order is preserved by `id`.
+    id: "018_aaliyah_append_logs",
+    sql: `CREATE TABLE IF NOT EXISTS aaliyah_append_logs (
+      id bigserial PRIMARY KEY,
+      store text NOT NULL,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      payload jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_aaliyah_append_logs_scope
+      ON aaliyah_append_logs (store, tenant_id, workspace_id, id)`,
+  },
+  {
+    // Follow-up approval reviews were already Postgres-capable via ad-hoc inline
+    // DDL keyed on DATABASE_URL; fold that schema into the ordered migration
+    // runner so it lives on the same durable (AALIYAH_DATABASE_URL) backend as
+    // the rest of the app. Column set matches the prior inline DDL exactly.
+    id: "019_aaliyah_followup_approvals",
+    sql: `CREATE TABLE IF NOT EXISTS aaliyah_followup_approvals (
+      id BIGSERIAL PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
+      approved BOOLEAN NOT NULL,
+      edited BOOLEAN NOT NULL,
+      edit_distance INT NOT NULL,
+      rejection_reason TEXT,
+      reviewer_id TEXT NOT NULL,
+      reviewer_role TEXT,
+      draft_confidence INT,
+      review_source TEXT,
+      category TEXT,
+      live_operator_pilot BOOLEAN,
+      tenant_id TEXT,
+      workspace_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_aaliyah_followup_approvals_scope
+      ON aaliyah_followup_approvals (tenant_id, workspace_id, created_at)`,
+  },
 ];
 
 export async function runMailMigrations(pool: Pool): Promise<void> {

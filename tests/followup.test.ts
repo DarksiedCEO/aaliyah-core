@@ -436,6 +436,6 @@ test("recordReplyOutcome captures downstream reply signal", async () => {
     createdAt: "2026-04-18T18:00:00.000Z",
   });
 
-  assert.equal(listReplyOutcomes().length, 1);
-  assert.equal(listReplyOutcomes()[0]?.replyReceived, true);
+  assert.equal((await listReplyOutcomes()).length, 1);
+  assert.equal((await listReplyOutcomes())[0]?.replyReceived, true);
 });

@@ -150,8 +150,8 @@ test("traces persist per workspace and reads never cross scopes", async () => {
   await persistTrace({ ...TENANT_A, taskId: "task_a", decisionPath: "a" });
   await persistTrace({ ...TENANT_B, taskId: "task_b", decisionPath: "b" });
 
-  const aTraces = readPersistedTraces(TENANT_A);
-  const bTraces = readPersistedTraces(TENANT_B);
+  const aTraces = await readPersistedTraces(TENANT_A);
+  const bTraces = await readPersistedTraces(TENANT_B);
 
   assert.equal(aTraces.length, 1);
   assert.equal(aTraces[0]!.taskId, "task_a");
@@ -197,13 +197,13 @@ test("reply outcomes isolate by scope", async () => {
     TENANT_B,
   );
 
-  assert.deepEqual(listReplyOutcomes(TENANT_A).map((r) => r.taskId), ["t_a"]);
-  assert.deepEqual(listReplyOutcomes(TENANT_B).map((r) => r.taskId), ["t_b"]);
+  assert.deepEqual((await listReplyOutcomes(TENANT_A)).map((r) => r.taskId), ["t_a"]);
+  assert.deepEqual((await listReplyOutcomes(TENANT_B)).map((r) => r.taskId), ["t_b"]);
 });
 
 test("followup outcome transition state is independent per scope", async () => {
-  clearTrackedFollowupOutcomes(TENANT_A);
-  clearTrackedFollowupOutcomes(TENANT_B);
+  await clearTrackedFollowupOutcomes(TENANT_A);
+  await clearTrackedFollowupOutcomes(TENANT_B);
 
   // Identical taskId/threadId in two scopes must not collide on transition state.
   await trackFollowupOutcome(
@@ -227,7 +227,7 @@ test("followup outcome transition state is independent per scope", async () => {
 
   // And B's history never contains A's advanced state.
   assert.ok(
-    !listTrackedFollowupOutcomes(TENANT_B).some((o) => o.status === "drafted"),
+    !(await listTrackedFollowupOutcomes(TENANT_B)).some((o) => o.status === "drafted"),
   );
 });
 

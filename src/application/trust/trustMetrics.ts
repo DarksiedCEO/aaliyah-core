@@ -19,13 +19,13 @@ export type TrustMetrics = {
  * monitoring gate math. `confidence` is supplied by the caller (drafts in
  * flight); traces and quality are read from their scoped stores.
  */
-export function trustMetricsSummary(
+export async function trustMetricsSummary(
   scope: TenantScope,
   confidence: Record<ConfidenceLabel, number> = { high: 0, medium: 0, low: 0 },
-): TrustMetrics {
+): Promise<TrustMetrics> {
   return {
-    traceCount: readDecisionTraces(scope).length,
-    quality: summarizeDraftQuality(scope),
+    traceCount: (await readDecisionTraces(scope)).length,
+    quality: await summarizeDraftQuality(scope),
     confidence,
   };
 }

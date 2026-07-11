@@ -73,11 +73,11 @@ export function startOnboarding(input: {
  * per-(tenant, workspace, user) preferences are written — always with
  * `autoSend: false`. Defaults: mode `draft_replies`, style `professional`.
  */
-export function advanceOnboarding(
+export async function advanceOnboarding(
   state: OnboardingState,
   action: OnboardingAction,
   options?: { now?: () => string },
-): OnboardingState {
+): Promise<OnboardingState> {
   const now = options?.now ?? (() => new Date().toISOString());
 
   switch (action.type) {
@@ -128,7 +128,7 @@ export function advanceOnboarding(
         gmailConnected: state.gmailConnected,
         autoSend: false,
       };
-      savePreferences(prefs);
+      await savePreferences(prefs);
       return { ...state, step: "complete", completedAt: now() };
     }
 

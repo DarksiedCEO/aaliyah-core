@@ -155,7 +155,7 @@ export async function runInboundDraft(raw: unknown): Promise<InboundDraftResult>
     });
 
     // Every inbound draft has a decision trace.
-    recordDecisionTrace({
+    await recordDecisionTrace({
       tenantId: tenant.tenantId,
       workspaceId: tenant.workspaceId,
       userId: tenant.userId,

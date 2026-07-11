@@ -22,11 +22,13 @@ import {
 } from "../src/application/style/styleDirectives";
 import { routerDraftGenerator } from "../src/application/inbound/routerDraftGenerator";
 import { AaliyahModelRouter } from "../src/model-router/AaliyahModelRouter";
+import { resetApplicationStoreForTests } from "../src/persistence/applicationState";
 
 before(() => {
   process.env.AALIYAH_DATA_DIR = fs.mkdtempSync(
     path.join(os.tmpdir(), "aaliyah-style-"),
   );
+  resetApplicationStoreForTests();
 });
 
 afterEach(() => clearStyleCache());
@@ -40,41 +42,41 @@ test("the default style is safe and professional", () => {
   assert.equal(fields.tone.length > 0, true);
 });
 
-test("style profiles store and retrieve by tenant/workspace/user", () => {
-  const profile = saveStyleProfile({
+test("style profiles store and retrieve by tenant/workspace/user", async () => {
+  const profile = await saveStyleProfile({
     tenantId: "tenant_a", workspaceId: "tenant_a:default", userId: "user_1",
     styleId: "friendly", tone: "warm", lengthPreference: "short",
     formality: "casual", ctaBehavior: "soft", greeting: "Hey", signoff: "Cheers",
     forbiddenPhrases: [],
   });
   assert.equal(profile.styleId, "friendly");
-  assert.equal(loadStyleProfile(SCOPE, "user_1")!.styleId, "friendly");
+  assert.equal((await loadStyleProfile(SCOPE, "user_1"))!.styleId, "friendly");
   // Isolated per user.
-  assert.equal(loadStyleProfile(SCOPE, "user_other"), undefined);
+  assert.equal(await loadStyleProfile(SCOPE, "user_other"), undefined);
 });
 
-test("resolve returns stored profile, else default for id, else safe fallback", () => {
+test("resolve returns stored profile, else default for id, else safe fallback", async () => {
   // No stored profile, explicit id -> default for that id.
-  const direct = resolveStyleProfile(SCOPE, "user_2", "direct");
+  const direct = await resolveStyleProfile(SCOPE, "user_2", "direct");
   assert.equal(direct.styleId, "direct");
   assert.equal(direct.lengthPreference, "short");
 
   // No stored profile, no id -> deterministic professional fallback.
-  const fallback = resolveStyleProfile(SCOPE, "user_3");
+  const fallback = await resolveStyleProfile(SCOPE, "user_3");
   assert.equal(fallback.styleId, "professional");
 
   // custom with no stored notes -> safe fallback (custom is unusable without notes).
-  const customFallback = resolveStyleProfile(SCOPE, "user_4", "custom");
+  const customFallback = await resolveStyleProfile(SCOPE, "user_4", "custom");
   assert.equal(customFallback.styleId, "professional");
 
   // Stored profile wins.
-  saveStyleProfile({
+  await saveStyleProfile({
     tenantId: "tenant_a", workspaceId: "tenant_a:default", userId: "user_5",
     styleId: "executive", tone: "executive", lengthPreference: "short",
     formality: "formal", ctaBehavior: "direct", greeting: "Hi", signoff: "Best",
     forbiddenPhrases: [],
   });
-  assert.equal(resolveStyleProfile(SCOPE, "user_5", "friendly").styleId, "executive");
+  assert.equal((await resolveStyleProfile(SCOPE, "user_5", "friendly")).styleId, "executive");
 });
 
 test("custom style profile requires customNotes (validation)", () => {
@@ -113,7 +115,7 @@ test("selected style shapes the draft (directives reach the generator)", async (
       },
     },
   ]);
-  const style = resolveStyleProfile(SCOPE, "user_6", "friendly");
+  const style = await resolveStyleProfile(SCOPE, "user_6", "friendly");
   const generate = routerDraftGenerator(router, { style });
 
   const draft = await generate({

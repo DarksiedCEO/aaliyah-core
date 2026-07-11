@@ -131,7 +131,7 @@ test("follow-up outcomes persist with task and thread linkage", async () => {
     shadowMode: true,
   });
 
-  const stored = listTrackedFollowupOutcomes().filter(
+  const stored = (await listTrackedFollowupOutcomes()).filter(
     (outcome) =>
       outcome.taskId === "task_outcome_1" &&
       outcome.threadId === "thread_outcome_1",
@@ -151,7 +151,7 @@ test("reply outcomes persist downstream reply signals", async () => {
     createdAt: "2026-04-19T18:00:00.000Z",
   });
 
-  const stored = listReplyOutcomes()[0];
+  const stored = (await listReplyOutcomes())[0];
 
   assert.equal(stored?.replyReceived, true);
   assert.equal(stored?.replyTimeHours, 4);
