@@ -56,6 +56,7 @@ function serviceFromRow(r: Record<string, unknown>): ServiceIdentity {
     id: r.id as string,
     tenantId: (r.tenant_id as string | null) ?? null,
     name: r.name as string,
+    workspaceIds: r.workspace_ids as string[],
     permissionIds: r.permission_ids as string[],
     credentialHash: r.credential_hash as string,
     status: r.status as ServiceIdentity["status"],
@@ -204,10 +205,11 @@ export function createPostgresIdentityState(pool: Pool) {
       async register(identity: ServiceIdentity): Promise<void> {
         await pool.query(
           `INSERT INTO service_identities
-           (id, tenant_id, name, permission_ids, credential_hash, status, created_at, rotated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+           (id, tenant_id, name, workspace_ids, permission_ids, credential_hash, status, created_at, rotated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
           [
             identity.id, identity.tenantId, identity.name,
+            JSON.stringify(identity.workspaceIds),
             JSON.stringify(identity.permissionIds), identity.credentialHash,
             identity.status, identity.createdAt, identity.rotatedAt,
           ],

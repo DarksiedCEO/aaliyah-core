@@ -133,10 +133,10 @@ function conformance(name: string, makeBackend: () => Promise<IdentityBackend> |
 
   test(`${name}: service identities are hash-addressed and rotatable`, async () => {
     const ids = await makeBackend();
-    const oldHash = crypto.createHash("sha256").update("old-credential").digest("hex");
     const svcId = `svc_${crypto.randomUUID().slice(0, 8)}`;
+    const oldHash = crypto.createHash("sha256").update(`old-credential-${svcId}`).digest("hex");
     await ids.serviceIdentities.register({
-      id: svcId, tenantId: "tenant_a", name: "mail.reader",
+      id: svcId, tenantId: "tenant_a", name: "mail.reader", workspaceIds: ["tenant_a:default"],
       permissionIds: ["mail.connection.read"], credentialHash: oldHash,
       status: "active", createdAt: NOW, rotatedAt: NOW,
     });
@@ -144,7 +144,7 @@ function conformance(name: string, makeBackend: () => Promise<IdentityBackend> |
     assert.equal((await ids.serviceIdentities.findActiveByCredentialHash(oldHash))?.id, svcId);
 
     // Rotation: new hash works, old hash is dead.
-    const newHash = crypto.createHash("sha256").update("new-credential").digest("hex");
+    const newHash = crypto.createHash("sha256").update(`new-credential-${svcId}`).digest("hex");
     await ids.serviceIdentities.rotate(svcId, newHash, LATER);
     assert.equal(await ids.serviceIdentities.findActiveByCredentialHash(oldHash), null);
     assert.equal((await ids.serviceIdentities.findActiveByCredentialHash(newHash))?.rotatedAt, LATER);

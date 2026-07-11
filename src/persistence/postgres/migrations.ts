@@ -188,6 +188,11 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
     sql: `CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions (user_id);
       CREATE INDEX IF NOT EXISTS idx_memberships_user ON workspace_memberships (user_id, tenant_id, status)`,
   },
+  {
+    id: "015_service_identities_workspaces",
+    sql: `ALTER TABLE service_identities
+      ADD COLUMN IF NOT EXISTS workspace_ids jsonb NOT NULL DEFAULT '[]'`,
+  },
 ];
 
 export async function runMailMigrations(pool: Pool): Promise<void> {
