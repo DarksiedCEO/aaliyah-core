@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 import { Pool } from "pg";
 
+import { scopedKey, type TenantScope } from "./tenantScopedStore";
+
 type IdempotencyRecord = {
   requestHash: string;
   operationType: string;
@@ -110,7 +112,12 @@ export async function ensureIdempotentExecution<T>(
   idempotencyKey: string,
   payload: unknown,
   operationType: string,
+  scope?: TenantScope,
 ): Promise<EnsureIdempotentResult<T>> {
+  // Composite the isolation key so two tenants/workspaces can never collide on
+  // the same idempotency key and a replay can never cross a tenant boundary.
+  const effectiveKey = scopedKey(idempotencyKey, scope);
+
   if (!process.env.DATABASE_URL) {
     if (
       process.env.NODE_ENV !== "test" &&
@@ -119,7 +126,7 @@ export async function ensureIdempotentExecution<T>(
       throw new Error("DATABASE_URL is required for durable idempotency");
     }
 
-    return ensureIdempotentExecutionInMemory<T>(idempotencyKey, payload, operationType);
+    return ensureIdempotentExecutionInMemory<T>(effectiveKey, payload, operationType);
   }
 
   const pool = idempotencyStoreInternals.buildPool();
@@ -147,13 +154,25 @@ export async function ensureIdempotentExecution<T>(
       ADD COLUMN IF NOT EXISTS result_payload JSONB
     `);
 
+    // Multi-tenant migration: queryable isolation columns. Uniqueness is still
+    // carried by the composited idempotency_key, so backfill is safe to run
+    // online and these columns are additive.
+    await client.query(`
+      ALTER TABLE aaliyah_idempotency
+      ADD COLUMN IF NOT EXISTS tenant_id TEXT
+    `);
+    await client.query(`
+      ALTER TABLE aaliyah_idempotency
+      ADD COLUMN IF NOT EXISTS workspace_id TEXT
+    `);
+
     const existing = await client.query(
       `
       SELECT request_hash, status, result_payload, created_at
       FROM aaliyah_idempotency
       WHERE idempotency_key = $1
       `,
-      [idempotencyKey],
+      [effectiveKey],
     );
 
     if ((existing.rowCount ?? 0) > 0) {
@@ -189,7 +208,7 @@ export async function ensureIdempotentExecution<T>(
               created_at = NOW()
           WHERE idempotency_key = $1
           `,
-          [idempotencyKey, "in_progress", requestHash, operationType],
+          [effectiveKey, "in_progress", requestHash, operationType],
         );
 
         await client.query("COMMIT");
@@ -203,10 +222,17 @@ export async function ensureIdempotentExecution<T>(
     await client.query(
       `
       INSERT INTO aaliyah_idempotency
-        (idempotency_key, request_hash, operation_type, status)
-      VALUES ($1, $2, $3, $4)
+        (idempotency_key, request_hash, operation_type, status, tenant_id, workspace_id)
+      VALUES ($1, $2, $3, $4, $5, $6)
       `,
-      [idempotencyKey, requestHash, operationType, "in_progress"],
+      [
+        effectiveKey,
+        requestHash,
+        operationType,
+        "in_progress",
+        scope?.tenantId ?? null,
+        scope?.workspaceId ?? null,
+      ],
     );
 
     await client.query("COMMIT");
@@ -242,9 +268,12 @@ async function updateInMemoryResult(
 export async function markCompleted(
   idempotencyKey: string,
   result: unknown,
+  scope?: TenantScope,
 ): Promise<void> {
+  const effectiveKey = scopedKey(idempotencyKey, scope);
+
   if (!process.env.DATABASE_URL) {
-    await updateInMemoryResult(idempotencyKey, "completed", result);
+    await updateInMemoryResult(effectiveKey, "completed", result);
     return;
   }
 
@@ -259,7 +288,7 @@ export async function markCompleted(
           completed_at = NOW()
       WHERE idempotency_key = $1
       `,
-      [idempotencyKey, JSON.stringify(result)],
+      [effectiveKey, JSON.stringify(result)],
     );
   } finally {
     await pool.end();
@@ -269,17 +298,21 @@ export async function markCompleted(
 export async function recordIdempotentResult(
   idempotencyKey: string,
   result: unknown,
+  scope?: TenantScope,
 ): Promise<void> {
-  await markCompleted(idempotencyKey, result);
+  await markCompleted(idempotencyKey, result, scope);
 }
 
 export async function recordIdempotentFailure(
   idempotencyKey: string,
   message: string,
+  scope?: TenantScope,
 ): Promise<void> {
+  const effectiveKey = scopedKey(idempotencyKey, scope);
+
   if (!process.env.DATABASE_URL) {
     await updateInMemoryResult(
-      idempotencyKey,
+      effectiveKey,
       "failed",
       { success: false, message },
     );
@@ -297,7 +330,7 @@ export async function recordIdempotentFailure(
           completed_at = NOW()
       WHERE idempotency_key = $1
       `,
-      [idempotencyKey, "failed", JSON.stringify({ success: false, message })],
+      [effectiveKey, "failed", JSON.stringify({ success: false, message })],
     );
   } finally {
     await pool.end();
