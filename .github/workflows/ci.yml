@@ -40,12 +40,19 @@ jobs:
         with:
           path: aaliyah-core
 
+      # aaliyah-contracts is private; the default GITHUB_TOKEN is scoped only
+      # to this repo and cannot see it. AALIYAH_CONTRACTS_READ_TOKEN is a
+      # fine-grained PAT scoped to read-only Contents on aaliyah-contracts
+      # alone — nothing else. GitHub withholds repo secrets from
+      # fork-originated pull_request runs by default; do not add
+      # pull_request_target to work around that.
       - name: Checkout aaliyah-contracts (main)
         uses: actions/checkout@v4
         with:
           repository: DarksiedCEO/aaliyah-contracts
           ref: main
           path: aaliyah-contracts
+          token: ${{ secrets.AALIYAH_CONTRACTS_READ_TOKEN }}
 
       - uses: pnpm/action-setup@v4
         with:
