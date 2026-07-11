@@ -31,12 +31,31 @@ function redact(text: string): string {
 export class GoogleHttpError extends Error {
   readonly status: number;
   readonly correlationId: string;
-  constructor(op: string, status: number, correlationId: string) {
+  /** OAuth `error` code (e.g. "invalid_grant") when the body carries one — not
+   * secret material, and the discriminator between permanent and transient. */
+  readonly errorCode?: string;
+  constructor(op: string, status: number, correlationId: string, errorCode?: string) {
     super(`google.${op} failed (${status}) [cid=${correlationId}]`);
     this.name = "GoogleHttpError";
     this.status = status;
     this.correlationId = correlationId;
+    if (errorCode !== undefined) this.errorCode = errorCode;
   }
+}
+
+/** Best-effort read of the OAuth `error` code from an error response body.
+ * Only the short error code is extracted — never tokens or the raw body. */
+async function safeErrorCode(res: Response): Promise<string | undefined> {
+  try {
+    const body = (await res.json()) as unknown;
+    if (body && typeof body === "object" && "error" in body) {
+      const code = (body as { error: unknown }).error;
+      if (typeof code === "string") return code;
+    }
+  } catch {
+    // non-JSON error body — nothing classifiable to extract
+  }
+  return undefined;
 }
 
 export type GoogleHttpOptions = {
@@ -76,13 +95,17 @@ export function createGoogleOAuthHttp(opts: GoogleHttpOptions): GoogleOAuthHttp 
         const res = await doFetch(url, { ...init, signal: controller.signal });
         clearTimeout(timer);
         if (res.ok) return await res.json();
+        const errorCode = await safeErrorCode(res);
         // 5xx are transient for safe ops; 4xx are terminal.
         if (res.status >= 500 && retry && i < attempts - 1) {
-          lastErr = new GoogleHttpError(op, res.status, cid);
+          lastErr = new GoogleHttpError(op, res.status, cid, errorCode);
           continue;
         }
-        logger.warn({ op, status: res.status, cid }, "google.http.error");
-        throw new GoogleHttpError(op, res.status, cid);
+        logger.warn(
+          { op, status: res.status, cid, ...(errorCode ? { errorCode } : {}) },
+          "google.http.error",
+        );
+        throw new GoogleHttpError(op, res.status, cid, errorCode);
       } catch (error) {
         clearTimeout(timer);
         if (error instanceof GoogleHttpError) throw error;

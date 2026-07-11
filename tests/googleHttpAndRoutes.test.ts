@@ -5,7 +5,7 @@ import path from "node:path";
 import test, { before, beforeEach } from "node:test";
 
 import { localMasterKms } from "../src/crypto/envelopeEncryption";
-import { createGoogleOAuthHttp } from "../src/mail/google/googleOAuthHttp";
+import { createGoogleOAuthHttp, GoogleHttpError } from "../src/mail/google/googleOAuthHttp";
 import { googleCapability, loadGoogleConfig } from "../src/mail/google/googleConfig";
 import {
   buildGoogleAuthorizationUrl,
@@ -17,9 +17,11 @@ import {
   handleGoogleCallbackRoute,
   getConnectionStatus,
   disconnectConnection,
+  testConnection,
   type MailRoutesDeps,
 } from "../src/http/mailRoutes";
 import { createInMemoryMailState } from "../src/mail/mailState";
+import { createCredentialLifecycle } from "../src/mail/google/credentialLifecycle";
 import { connectionIdFor } from "../src/mail/adapters/helpers";
 import { AuthorizationError } from "../src/auth/permissions";
 import type { AuthenticatedPrincipal } from "@aaliyah/contracts/v1";
@@ -106,6 +108,26 @@ test("errors carry no secret material", async () => {
   assert.ok(!err!.message.includes("SENSITIVE_CODE"));
 });
 
+test("refresh surfaces the OAuth error code so revocation is classifiable", async () => {
+  // Google returns 400 {error:"invalid_grant"} when a refresh token is revoked
+  // or expired. The lifecycle must be able to tell this permanent failure from
+  // a transient 5xx, so the transport exposes the parsed error code.
+  const http = createGoogleOAuthHttp({
+    clientId: "c", clientSecret: "s",
+    fetchImpl: (async () => jsonRes(400, { error: "invalid_grant" })) as unknown as typeof fetch,
+  });
+  let err: GoogleHttpError | undefined;
+  try {
+    await http.refreshAccessToken("rt-SECRET");
+  } catch (e) {
+    err = e as GoogleHttpError;
+  }
+  assert.ok(err instanceof GoogleHttpError);
+  assert.equal(err!.status, 400);
+  assert.equal(err!.errorCode, "invalid_grant");
+  assert.ok(!err!.message.includes("rt-SECRET"));
+});
+
 // ---- Config / capability ----
 
 test("capability reflects configuration; loadGoogleConfig fails closed when unset", () => {
@@ -142,7 +164,7 @@ function routeDeps(configured = true): MailRoutesDeps & { http: ReturnType<typeo
     capability: configured ? { provider: "google", available: true } : { provider: "google", available: false, reasonCode: "provider_not_configured" },
     redirectUri: REDIRECT,
     frontendInboxesUrl: "https://app.example/settings/inboxes",
-    ...(configured ? { connectDeps } : {}),
+    ...(configured ? { connectDeps, credentialLifecycle: createCredentialLifecycle({ state, kms: KMS, http }) } : {}),
     // Handler-level tests pass principals directly; the resolver is unused.
     auth: { principalForToken: async () => null },
     state,
@@ -185,6 +207,27 @@ test("callback returns only a sanitized redirect and never leaks", async () => {
     (await handleGoogleCallbackRoute({ code: "c", state: "s" }, null, deps)).redirectTo,
     "https://app.example/settings/inboxes?connection=failed",
   );
+});
+
+test("testConnection acquires its token through the lifecycle and records durable health", async () => {
+  const deps = routeDeps(true);
+  const principal = adminPrincipal();
+  const { state: oauthState } = await buildGoogleAuthorizationUrl(
+    { ...ID, sessionId: principal.sessionId, redirectUri: REDIRECT },
+    deps.connectDeps!,
+  );
+  await handleGoogleCallbackRoute({ code: "c", state: oauthState }, principal, deps);
+
+  // The stored grant is now revoked at Google: refresh returns invalid_grant.
+  deps.http.refreshAccessToken = async () => {
+    throw new GoogleHttpError("refresh", 400, "cid", "invalid_grant");
+  };
+
+  await assert.rejects(() => testConnection(CONN_ID, WS, principal, deps));
+  // The runtime boundary must have written the durable lifecycle state — the
+  // health row was previously never populated by any caller.
+  const health = await deps.state.health.get(CONN_ID, SCOPE);
+  assert.equal(health?.state, "reauthorization_required");
 });
 
 test("status is workspace-scoped and disconnect requires admin within the workspace", async () => {
