@@ -1,21 +1,22 @@
 import {
-  MailCredentialSchema,
-  type MailCredential,
-} from "@aaliyah/contracts/v1";
-
-import {
-  openSecret,
-  sealSecret,
-  type KeyProvider,
-} from "../../crypto/authenticatedEncryption";
+  envelopeOpen,
+  envelopeSeal,
+  type KmsKeyWrapper,
+} from "../../crypto/envelopeEncryption";
 import type { TenantScope } from "../../persistence/tenantScopedStore";
+import type { DurableMailCredential } from "../../persistence/postgres/mailStateStore";
+import type { MailStateBackend } from "../mailState";
 
-// Keyed by connectionId (which embeds tenant:workspace:user). In production this
-// MUST be a durable, tenant-scoped table. Refresh tokens are stored only as
-// authenticated ciphertext — plaintext is never persisted, logged, or returned.
-const store = new Map<string, MailCredential>();
+// Refresh tokens rest ONLY as KMS envelopes (fresh data key per secret) —
+// plaintext is never persisted, logged, or returned to a browser. Persistence
+// lives behind MailStateBackend: Postgres in production, in-memory for tests.
 
-export function saveMailCredential(
+export type VaultDeps = {
+  store: MailStateBackend["credentials"];
+  kms: KmsKeyWrapper;
+};
+
+export async function saveMailCredential(
   input: {
     connectionId: string;
     tenantId: string;
@@ -26,73 +27,58 @@ export function saveMailCredential(
     connectedEmail: string;
     accessTokenExpiresAt: string | null;
   },
-  kp: KeyProvider,
-): MailCredential {
-  const sealed = sealSecret(input.refreshToken, kp);
-  const credential = MailCredentialSchema.parse({
+  deps: VaultDeps,
+): Promise<DurableMailCredential> {
+  const credential: DurableMailCredential = {
     connectionId: input.connectionId,
     tenantId: input.tenantId,
     workspaceId: input.workspaceId,
     userId: input.userId,
     provider: "google",
-    encryptedRefreshToken: sealed.ciphertext,
-    encryptionKeyVersion: sealed.keyVersion,
+    envelope: envelopeSeal(input.refreshToken, deps.kms),
     grantedScopes: input.grantedScopes,
     connectedEmail: input.connectedEmail,
     accessTokenExpiresAt: input.accessTokenExpiresAt,
     revokedAt: null,
-  });
-  store.set(credential.connectionId, credential);
+  };
+  await deps.store.save(credential);
   return credential;
 }
 
 /** Tenant-scoped read — returns nothing if the record belongs to another tenant. */
-export function getMailCredential(
+export async function getMailCredential(
   connectionId: string,
   scope: TenantScope,
-): MailCredential | undefined {
-  const record = store.get(connectionId);
-  if (!record) return undefined;
-  if (record.tenantId !== scope.tenantId || record.workspaceId !== scope.workspaceId) {
-    return undefined; // cross-tenant access denied
-  }
-  return record;
+  deps: VaultDeps,
+): Promise<DurableMailCredential | null> {
+  return deps.store.get(connectionId, scope);
 }
 
 /** Decrypt the refresh token for use (never returned to a browser/log). */
-export function openRefreshToken(
+export async function openRefreshToken(
   connectionId: string,
   scope: TenantScope,
-  kp: KeyProvider,
-): string {
-  const record = getMailCredential(connectionId, scope);
+  deps: VaultDeps,
+): Promise<string> {
+  const record = await deps.store.get(connectionId, scope);
   if (!record) throw new Error("credential not found for scope");
   if (record.revokedAt) throw new Error("credential revoked");
-  return openSecret(
-    { ciphertext: record.encryptedRefreshToken, keyVersion: record.encryptionKeyVersion },
-    kp,
-  );
+  return envelopeOpen(record.envelope, deps.kms);
 }
 
 /** Cryptographically destroy the stored secret and mark revoked. */
-export function revokeMailCredential(
+export async function revokeMailCredential(
   connectionId: string,
   scope: TenantScope,
+  deps: VaultDeps,
   now: () => string = () => new Date().toISOString(),
-): void {
-  const record = getMailCredential(connectionId, scope);
-  if (!record) return;
-  store.set(connectionId, {
-    ...record,
-    encryptedRefreshToken: "DESTROYED", // ciphertext gone; cannot be decrypted
-    revokedAt: now(),
-  });
+): Promise<void> {
+  await deps.store.revoke(connectionId, scope, now);
 }
 
-export function deleteMailCredential(connectionId: string): void {
-  store.delete(connectionId);
-}
-
-export function clearMailCredentials(): void {
-  store.clear();
+export async function deleteMailCredential(
+  connectionId: string,
+  deps: VaultDeps,
+): Promise<void> {
+  await deps.store.delete(connectionId);
 }

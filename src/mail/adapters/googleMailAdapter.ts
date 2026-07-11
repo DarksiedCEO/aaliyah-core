@@ -191,7 +191,8 @@ export class GoogleMailAdapter implements MailProviderAdapter {
     // Claim the approval (issued -> sending) BEFORE any network call. The exact
     // approved content is what we transmit. On an ambiguous failure the record
     // stays `sending` for reconciliation — never silently retried.
-    const claim = this.beginSend(input);
+    const claim = await this.beginSend(input);
+    const operationId = claim.operationId!; // assigned at claim, persisted pre-send
     const raw = base64url(
       buildRawRfc822({
         to: input.to.map((a) => a.email).join(", "),
@@ -204,7 +205,7 @@ export class GoogleMailAdapter implements MailProviderAdapter {
         method: "POST",
         body: JSON.stringify({ raw }),
       })) as { id?: string; threadId?: string };
-      this.settleSend(claim.approvalId, { sent: true, providerMessageId: data.id ?? "unknown" });
+      await this.settleSend({ approvalId: claim.approvalId, operationId, outcome: { sent: true, providerMessageId: data.id ?? "unknown" } });
       return SentMessageSchema.parse({
         messageId: data.id ?? "unknown",
         ...(data.threadId ? { threadId: data.threadId } : {}),
@@ -212,7 +213,7 @@ export class GoogleMailAdapter implements MailProviderAdapter {
       });
     } catch (error) {
       const outcome = classifySendError(error);
-      if (outcome) this.settleSend(claim.approvalId, outcome);
+      if (outcome) await this.settleSend({ approvalId: claim.approvalId, operationId, outcome });
       throw error;
     }
   }

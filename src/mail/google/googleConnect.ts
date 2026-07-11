@@ -4,14 +4,10 @@ import {
   type SanitizedConnection,
 } from "@aaliyah/contracts/v1";
 
-import type { KeyProvider } from "../../crypto/authenticatedEncryption";
+import type { KmsKeyWrapper } from "../../crypto/envelopeEncryption";
 import type { TenantScope } from "../../persistence/tenantScopedStore";
 import { connectionIdFor } from "../adapters/helpers";
-import {
-  deleteConnection,
-  getConnection,
-  saveConnection,
-} from "../connectionStore";
+import type { MailStateBackend } from "../mailState";
 import {
   deleteMailCredential,
   getMailCredential,
@@ -19,7 +15,6 @@ import {
   revokeMailCredential,
   saveMailCredential,
 } from "../security/credentialVault";
-import { invalidateApprovalsForConnection } from "../security/sendApproval";
 import { recordMailAudit } from "../security/mailAudit";
 import {
   consumeOAuthState,
@@ -55,7 +50,9 @@ export interface GoogleOAuthHttp {
 
 export type GoogleConnectDeps = {
   http: GoogleOAuthHttp;
-  keyProvider: KeyProvider;
+  kms: KmsKeyWrapper;
+  /** Durable mail state (Postgres in production, in-memory for dev/tests). */
+  state: MailStateBackend;
   clientId: string;
   scopes?: string[];
   now?: () => string;
@@ -64,19 +61,23 @@ export type GoogleConnectDeps = {
 
 /**
  * Build the "Continue with Google" authorization URL. Creates a one-time,
- * tenant-bound PKCE state; the user never types their address — Google returns
- * the verified mailbox identity in the callback.
+ * session-bound PKCE state; the user never types their address — Google
+ * returns the verified mailbox identity in the callback.
  */
-export function buildGoogleAuthorizationUrl(
+export async function buildGoogleAuthorizationUrl(
   input: {
     tenantId: string;
     workspaceId: string;
     userId: string;
+    sessionId: string;
     redirectUri: string;
   },
   deps: GoogleConnectDeps,
-): { url: string; state: string } {
-  const { state, codeChallenge } = createOAuthState(input);
+): Promise<{ url: string; state: string }> {
+  const { stateValue, codeChallenge } = await createOAuthState(input, {
+    store: deps.state.oauthStates,
+    kms: deps.kms,
+  });
   const params = new URLSearchParams({
     client_id: deps.clientId,
     redirect_uri: input.redirectUri,
@@ -87,9 +88,9 @@ export function buildGoogleAuthorizationUrl(
     scope: (deps.scopes ?? DEFAULT_SCOPES).join(" "),
     code_challenge: codeChallenge,
     code_challenge_method: "S256",
-    state: state.state,
+    state: stateValue,
   });
-  return { url: `${AUTHORIZE_URL}?${params.toString()}`, state: state.state };
+  return { url: `${AUTHORIZE_URL}?${params.toString()}`, state: stateValue };
 }
 
 /**
@@ -103,14 +104,22 @@ export async function handleGoogleCallback(
     code: string;
     state: string;
     redirectUri: string;
+    /** sessionId of the authenticated principal presenting the callback. */
+    expectedSessionId: string;
     expectedTenantId?: string;
   },
   deps: GoogleConnectDeps,
 ): Promise<SanitizedConnection> {
   const now = deps.now ?? (() => new Date().toISOString());
+  const vault = { store: deps.state.credentials, kms: deps.kms };
 
-  // 1. One-time state — consumed up front so a replayed callback is dead.
-  const state = consumeOAuthState(input.state, input.redirectUri);
+  // 1. One-time, session-bound state — consumed up front so a replayed or
+  // hijacked callback is dead. Tenant/workspace/user come ONLY from the state.
+  const state = await consumeOAuthState(
+    input.state,
+    { redirectUri: input.redirectUri, sessionId: input.expectedSessionId },
+    { store: deps.state.oauthStates, kms: deps.kms },
+  );
 
   // 2. Tenant-confusion defense.
   if (input.expectedTenantId && state.tenantId !== input.expectedTenantId) {
@@ -126,7 +135,7 @@ export async function handleGoogleCallback(
   if (!tokens.refreshToken) {
     // Nothing persisted yet; revoke the access token we just received.
     await safeRevoke(deps, tokens.accessToken);
-    recordFailureAudit(state, "no_refresh_token", now);
+    await recordFailureAudit(deps, state, "no_refresh_token", now);
     throw new Error("oauth callback rejected: no refresh token granted");
   }
 
@@ -144,7 +153,7 @@ export async function handleGoogleCallback(
     });
     const at = now();
 
-    saveMailCredential(
+    await saveMailCredential(
       {
         connectionId,
         tenantId: state.tenantId,
@@ -155,9 +164,9 @@ export async function handleGoogleCallback(
         connectedEmail: identity.email,
         accessTokenExpiresAt: new Date(Date.now() + tokens.expiresIn * 1000).toISOString(),
       },
-      deps.keyProvider,
+      vault,
     );
-    saveConnection(
+    await deps.state.connections.save(
       MailboxConnectionSchema.parse({
         connectionId,
         tenantId: state.tenantId,
@@ -171,14 +180,20 @@ export async function handleGoogleCallback(
       }),
     );
 
-    recordMailAudit({
-      tenantId: state.tenantId,
-      workspaceId: state.workspaceId,
-      connectionId,
-      actorUserId: state.userId,
-      action: "google.connected",
-      detail: identity.email,
-    });
+    // Inside the transaction on purpose: if the audit record cannot persist,
+    // the whole connect rolls back (administrative mutations fail closed).
+    await recordMailAudit(
+      {
+        tenantId: state.tenantId,
+        workspaceId: state.workspaceId,
+        connectionId,
+        actorType: "user",
+        actorUserId: state.userId,
+        action: "google.connected",
+        detail: identity.email,
+      },
+      deps.state.audit,
+    );
 
     return SanitizedConnectionSchema.parse({
       connectionId,
@@ -188,12 +203,12 @@ export async function handleGoogleCallback(
     });
   } catch (error) {
     if (connectionId) {
-      deleteMailCredential(connectionId);
-      deleteConnection(connectionId);
+      await deleteMailCredential(connectionId, vault);
+      await deps.state.connections.delete(connectionId);
     }
     await safeRevoke(deps, tokens.refreshToken);
     deps.onDisconnect?.(connectionId ?? "");
-    recordFailureAudit(state, "connect_failed", now);
+    await recordFailureAudit(deps, state, "connect_failed", now);
     throw error;
   }
 }
@@ -206,19 +221,30 @@ async function safeRevoke(deps: GoogleConnectDeps, token: string): Promise<void>
   }
 }
 
-function recordFailureAudit(
+/** Audit a callback failure. The operation has already failed and rolled back;
+ * an audit-sink outage here must not mask the original error — log and go on. */
+async function recordFailureAudit(
+  deps: GoogleConnectDeps,
   state: { tenantId: string; workspaceId: string; userId: string },
   reason: string,
   now: () => string,
-): void {
-  recordMailAudit({
-    tenantId: state.tenantId,
-    workspaceId: state.workspaceId,
-    actorUserId: state.userId,
-    action: "google.connect_failed",
-    detail: reason,
-    now,
-  });
+): Promise<void> {
+  try {
+    await recordMailAudit(
+      {
+        tenantId: state.tenantId,
+        workspaceId: state.workspaceId,
+        actorType: "user",
+        actorUserId: state.userId,
+        action: "google.connect_failed",
+        detail: reason,
+        now,
+      },
+      deps.state.audit,
+    );
+  } catch {
+    // Deliberate: the caller is already throwing the real failure.
+  }
 }
 
 /** Refresh an access token from the encrypted refresh token. Never persists plaintext. */
@@ -227,28 +253,44 @@ export async function refreshGoogleAccessToken(
   scope: TenantScope,
   deps: GoogleConnectDeps,
 ): Promise<string> {
-  const refresh = openRefreshToken(connectionId, scope, deps.keyProvider);
+  const refresh = await openRefreshToken(connectionId, scope, {
+    store: deps.state.credentials,
+    kms: deps.kms,
+  });
   const { accessToken } = await deps.http.refreshAccessToken(refresh);
+  // Credential use is security-sensitive: fail closed if it cannot be audited.
+  await recordMailAudit(
+    {
+      tenantId: scope.tenantId,
+      workspaceId: scope.workspaceId,
+      connectionId,
+      action: "mail.credential.refreshed",
+    },
+    deps.state.audit,
+  );
   return accessToken;
 }
 
 /**
  * Disconnect: revoke the provider token, cryptographically destroy the stored
- * credential, invalidate pending send approvals, stop queued work, delete the
- * connection — preserving only non-secret audit records.
+ * credential, invalidate pending send approvals, mark background jobs stopped
+ * (durable) and notify listeners, delete the connection — preserving only
+ * non-secret audit records.
  */
 export async function disconnectGoogle(
   connectionId: string,
   scope: TenantScope,
   deps: GoogleConnectDeps,
 ): Promise<void> {
-  const conn = getConnection(connectionId, scope);
-  const credential = getMailCredential(connectionId, scope);
+  const now = deps.now ?? (() => new Date().toISOString());
+  const vault = { store: deps.state.credentials, kms: deps.kms };
+  const conn = await deps.state.connections.get(connectionId, scope);
+  const credential = await getMailCredential(connectionId, scope, vault);
 
   // 1-2. Revoke at the provider (best effort — already-revoked is fine).
   if (credential && !credential.revokedAt) {
     try {
-      const refresh = openRefreshToken(connectionId, scope, deps.keyProvider);
+      const refresh = await openRefreshToken(connectionId, scope, vault);
       await deps.http.revokeToken(refresh);
     } catch {
       // Revocation failure must not block local teardown.
@@ -256,20 +298,33 @@ export async function disconnectGoogle(
   }
 
   // 3. Destroy the stored secret.
-  revokeMailCredential(connectionId, scope, deps.now);
-  // 4. Stop polling / queued jobs.
+  await revokeMailCredential(connectionId, scope, vault, now);
+  // 4. Stop polling / queued jobs — durable marker + in-process signal.
+  await deps.state.jobMarkers.setStopped({
+    connectionId,
+    tenantId: scope.tenantId,
+    workspaceId: scope.workspaceId,
+    stoppedAt: now(),
+  });
   deps.onDisconnect?.(connectionId);
-  // 5. Invalidate pending send approvals.
-  invalidateApprovalsForConnection(connectionId);
+  // 5. Durably invalidate pending send approvals — the durable store is the
+  // ONLY approval source of truth since the sendGuard unlock; a restart can
+  // never resurrect a claimable approval for this connection.
+  await deps.state.sendApprovals.invalidateForConnection(connectionId, now);
   // 6. Remove the connection record (keep audit).
-  deleteConnection(connectionId);
+  await deps.state.connections.delete(connectionId);
 
   if (conn) {
-    recordMailAudit({
-      tenantId: scope.tenantId,
-      workspaceId: scope.workspaceId,
-      connectionId,
-      action: "google.disconnected",
-    });
+    // Administrative mutation: audit persistence failure fails the disconnect
+    // call loudly (teardown above already happened and is idempotent on retry).
+    await recordMailAudit(
+      {
+        tenantId: scope.tenantId,
+        workspaceId: scope.workspaceId,
+        connectionId,
+        action: "google.disconnected",
+      },
+      deps.state.audit,
+    );
   }
 }

@@ -32,9 +32,37 @@ DELETE /api/mail/connections/:connectionId        -> revoke + destroy + stop job
 The browser NEVER receives authorization codes (post-callback), access tokens,
 refresh tokens, client secrets, or raw provider errors.
 
-> ⚠️ Identity is currently taken from `x-aaliyah-tenant/workspace/user` headers
-> as a temporary seam. Production MUST replace this with an authenticated
-> session before exposure — this is the open auth gap from the audit.
+> Identity comes ONLY from a `Authorization: Bearer` credential resolved
+> server-side (session store for humans, service registry for workloads);
+> tenant, workspaces, and roles are resolved from the membership directory —
+> `x-aaliyah-*` headers are never read (Phase B3).
+>
+> Mail state (Phase B4): OAuth states, connections, credentials, health,
+> send approvals, reconciliation, job markers, and audit all have durable
+> Postgres stores (`AALIYAH_DATABASE_URL`; server runs migrations at boot).
+> Refresh tokens and PKCE verifiers rest as KMS envelopes (fresh data key
+> per secret; local env master today, cloud KMS swaps the wrapper only).
+> The connect vertical (oauth/connections/credentials/job markers) runs on
+> this backend; without a database URL it runs on the conformance-tested
+> in-memory twin — dev only, announced at boot.
+>
+> Send approvals (sendGuard unlock, 2026-07-10): the durable store IS the
+> only approval source of truth — atomic conditional claim (fresh operation
+> id persisted before any provider call), operation-id-matched settlement,
+> ambiguous outcomes stay `sending` for explicit reconciliation, disconnect
+> invalidates durably. The module-level store is gone. Durable audit is the
+> sole production audit sink (JSONL removed): mutations fail closed when
+> the audit record cannot persist; health reads continue with an
+> operational error. Production startup fails closed without
+> AALIYAH_DATABASE_URL. sendGuard.ts is REFROZEN — see the recorded hash in
+> the B4.5 commit message.
+>
+> Remaining gaps, stated plainly: (1) Session store and membership
+> directory are in-memory; no real IdP/login flow yet — sessions are issued
+> programmatically (Phase B5). (2) Sending remains disabled: no role or
+> service grant maps to mail.send.execute, and live sending awaits explicit
+> authorization. (3) Adapters not live-proven until the real Google app
+> registration and the 13-step live run.
 
 ## Client experience
 

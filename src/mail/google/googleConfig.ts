@@ -1,4 +1,5 @@
-import { envKeyProvider, type KeyProvider } from "../../crypto/authenticatedEncryption";
+import { localMasterKms, type KmsKeyWrapper } from "../../crypto/envelopeEncryption";
+import type { MailStateBackend } from "../mailState";
 import { createGoogleOAuthHttp } from "./googleOAuthHttp";
 import type { GoogleConnectDeps } from "./googleConnect";
 
@@ -33,39 +34,41 @@ export type GoogleRuntimeConfig = {
   clientId: string;
   clientSecret: string;
   redirectUri: string;
-  keyProvider: KeyProvider;
+  kms: KmsKeyWrapper;
 };
 
 /**
  * Load validated runtime config. Throws (fail startup / disable cleanly) when
- * anything required is absent — never runs half-configured. The encryption key
- * is bridged into the versioned key provider used by the vault.
+ * anything required is absent — never runs half-configured. The credential
+ * encryption key becomes the local KMS master (keyed by version) that wraps
+ * per-secret data keys; a cloud KMS swaps this wrapper, not the stored data.
  */
 export function loadGoogleConfig(env: NodeJS.ProcessEnv = process.env): GoogleRuntimeConfig {
   const gaps = missing(env);
   if (gaps.length > 0) {
     throw new Error(`Google mail is not configured; missing: ${gaps.join(", ")}`);
   }
-  // Bridge MAIL_CREDENTIAL_* into the key-provider env contract.
-  process.env.AALIYAH_MAIL_ENC_KEY_VERSION = env.MAIL_CREDENTIAL_KEY_VERSION;
-  process.env[`AALIYAH_MAIL_ENC_KEY_${env.MAIL_CREDENTIAL_KEY_VERSION}`] =
-    env.MAIL_CREDENTIAL_ENCRYPTION_KEY;
   return {
     clientId: env.GOOGLE_CLIENT_ID!,
     clientSecret: env.GOOGLE_CLIENT_SECRET!,
     redirectUri: env.GOOGLE_OAUTH_REDIRECT_URI!,
-    keyProvider: envKeyProvider(),
+    kms: localMasterKms({
+      keyId: env.MAIL_CREDENTIAL_KEY_VERSION!,
+      masterKey: Buffer.from(env.MAIL_CREDENTIAL_ENCRYPTION_KEY!, "base64"),
+    }),
   };
 }
 
 /** Build fully-wired GoogleConnectDeps from config (real HTTP transport). */
 export function buildGoogleConnectDeps(
   config: GoogleRuntimeConfig,
+  state: MailStateBackend,
   extra?: Partial<GoogleConnectDeps>,
 ): GoogleConnectDeps {
   return {
     http: createGoogleOAuthHttp({ clientId: config.clientId, clientSecret: config.clientSecret }),
-    keyProvider: config.keyProvider,
+    kms: config.kms,
+    state,
     clientId: config.clientId,
     ...extra,
   };
