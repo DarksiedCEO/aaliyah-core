@@ -94,7 +94,7 @@ test("callback connects: sanitized status, envelope-encrypted-at-rest token, aud
 
   const cred = (await getMailCredential(CONN_ID, SCOPE, vault()))!;
   assert.ok(!JSON.stringify(cred.envelope).includes("rt-SECRET")); // ciphertext at rest
-  assert.equal(envelopeOpen(cred.envelope, KMS), "rt-SECRET");
+  assert.equal(await envelopeOpen(cred.envelope, KMS), "rt-SECRET");
   assert.equal(await openRefreshToken(CONN_ID, SCOPE, vault()), "rt-SECRET");
 
   // Audit records the connect durably, and contains no secret.

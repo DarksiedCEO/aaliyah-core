@@ -35,7 +35,7 @@ export async function saveMailCredential(
     workspaceId: input.workspaceId,
     userId: input.userId,
     provider: "google",
-    envelope: envelopeSeal(input.refreshToken, deps.kms),
+    envelope: await envelopeSeal(input.refreshToken, deps.kms),
     grantedScopes: input.grantedScopes,
     connectedEmail: input.connectedEmail,
     accessTokenExpiresAt: input.accessTokenExpiresAt,
@@ -63,7 +63,7 @@ export async function openRefreshToken(
   const record = await deps.store.get(connectionId, scope);
   if (!record) throw new Error("credential not found for scope");
   if (record.revokedAt) throw new Error("credential revoked");
-  return envelopeOpen(record.envelope, deps.kms);
+  return await envelopeOpen(record.envelope, deps.kms);
 }
 
 /** Cryptographically destroy the stored secret and mark revoked. */

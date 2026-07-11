@@ -53,7 +53,7 @@ export async function createOAuthState(
   const stateValue = b64url(crypto.randomBytes(32));
   const codeVerifier = b64url(crypto.randomBytes(32));
   const codeChallenge = b64url(crypto.createHash("sha256").update(codeVerifier).digest());
-  const sealed = envelopeSeal(codeVerifier, deps.kms);
+  const sealed = await envelopeSeal(codeVerifier, deps.kms);
 
   const state = MailOAuthStateSchema.parse({
     stateHash: hashState(stateValue),
@@ -101,7 +101,7 @@ export async function consumeOAuthState(
     sessionId: input.sessionId,
     ...(input.now ? { now: input.now } : {}),
   });
-  const codeVerifier = envelopeOpen(JSON.parse(consumed.codeVerifierEncrypted), deps.kms);
+  const codeVerifier = await envelopeOpen(JSON.parse(consumed.codeVerifierEncrypted), deps.kms);
   return {
     tenantId: consumed.tenantId,
     workspaceId: consumed.workspaceId,
