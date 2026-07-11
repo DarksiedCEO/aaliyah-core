@@ -4,20 +4,37 @@ import {
   type FollowupDecisionResolverResult,
 } from "../src/application/execution/runFollowupExecution";
 
-async function loadFortressResolver() {
-  try {
-    return (await import(
-      "../../aaliyah-workflows/dist/src/adapters/runFortressFollowupDecision.js"
-    )) as unknown as {
-      runFortressFollowupDecision: (
-        input: FollowupDecisionResolverInput,
-      ) => Promise<FollowupDecisionResolverResult>;
-    };
-  } catch (error) {
+type FollowupDecisionResolver = (
+  input: FollowupDecisionResolverInput,
+) => Promise<FollowupDecisionResolverResult>;
+
+/**
+ * Load the concrete follow-up decision adapter the operator points at via
+ * AALIYAH_FOLLOWUP_ADAPTER_MODULE (an absolute path or package specifier to a
+ * module exporting `runFortressFollowupDecision`).
+ *
+ * aaliyah-core owns the resolver INTERFACE (FollowupDecisionResolverInput /
+ * Result) and never names, imports, or builds against any particular adapter
+ * implementation — so this script introduces no dependency on aaliyah-workflows
+ * (or any sibling repo). The dependency is inverted: the adapter conforms to
+ * core's interface, injected at run time.
+ */
+async function loadFollowupDecisionResolver(): Promise<FollowupDecisionResolver> {
+  const modulePath = process.env.AALIYAH_FOLLOWUP_ADAPTER_MODULE;
+  if (!modulePath) {
     throw new Error(
-      `Unable to load fortress follow-up adapter from aaliyah-workflows dist. Build workflows first. ${String(error)}`,
+      "Set AALIYAH_FOLLOWUP_ADAPTER_MODULE to a module (absolute path or package specifier) exporting runFortressFollowupDecision",
     );
   }
+  const mod = (await import(modulePath)) as {
+    runFortressFollowupDecision?: FollowupDecisionResolver;
+  };
+  if (typeof mod.runFortressFollowupDecision !== "function") {
+    throw new Error(
+      `Adapter module '${modulePath}' does not export a runFortressFollowupDecision function`,
+    );
+  }
+  return mod.runFortressFollowupDecision;
 }
 
 async function main(): Promise<void> {
@@ -41,7 +58,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const { runFortressFollowupDecision } = await loadFortressResolver();
+  const resolveFollowupDecision = await loadFollowupDecisionResolver();
 
   const result = await runFollowupExecution(
     {
@@ -52,7 +69,7 @@ async function main(): Promise<void> {
     {
       accessToken,
       userId,
-      resolveFollowupDecision: runFortressFollowupDecision,
+      resolveFollowupDecision,
     },
   );
 

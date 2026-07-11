@@ -76,18 +76,15 @@ jobs:
         working-directory: aaliyah-core
         run: pnpm install --frozen-lockfile
 
-      # Scoped to src/+tests/ — what's actually shipped and tested. The base
-      # tsconfig.json's include also sweeps up scripts/, and one pre-existing
-      # manual script there (scripts/runFollowupExecution.ts) has an
-      # undeclared build-time dependency on a THIRD sibling repo
-      # (aaliyah-workflows), which itself depends back on aaliyah-core —
-      # a circular coupling unrelated to this rebuild. That script is never
-      # imported by the test suite; excluding it from the CI typecheck gate
-      # doesn't weaken anything this gate previously covered (there was no
-      # CI before now), it just doesn't invent a new requirement for it.
-      - name: Typecheck (src + tests)
+      # Typecheck the full project — src/, tests/, AND scripts/. The former
+      # sibling-repo coupling (scripts/runFollowupExecution.ts hard-loading
+      # aaliyah-workflows' build output) was removed: the script now loads its
+      # follow-up decision adapter through core's own resolver interface via
+      # AALIYAH_FOLLOWUP_ADAPTER_MODULE, so there is no circular dependency and
+      # nothing to exclude. This gate now covers the real runtime path.
+      - name: Typecheck (src + tests + scripts)
         working-directory: aaliyah-core
-        run: npx tsc -p tsconfig.ci.json --noEmit
+        run: pnpm typecheck
 
       - name: Test (against live Postgres — no in-memory fallback)
         working-directory: aaliyah-core
