@@ -193,6 +193,15 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
     sql: `ALTER TABLE service_identities
       ADD COLUMN IF NOT EXISTS workspace_ids jsonb NOT NULL DEFAULT '[]'`,
   },
+  {
+    // Credential lifecycle state (healthy/refreshing/degraded/
+    // reauthorization_required/revoked). Existing rows predate the column;
+    // 'healthy' is the safe backfill since they were written only on a
+    // successful check.
+    id: "016_mail_connection_health_state",
+    sql: `ALTER TABLE mail_connection_health
+      ADD COLUMN IF NOT EXISTS state text NOT NULL DEFAULT 'healthy'`,
+  },
 ];
 
 export async function runMailMigrations(pool: Pool): Promise<void> {

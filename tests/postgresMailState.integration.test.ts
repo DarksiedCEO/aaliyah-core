@@ -200,12 +200,47 @@ test("credentials: envelope at rest, revocation blocks retrieval of the secret",
   assert.equal(await state.credentials.get("conn_1", T_B), null);
 });
 
+test("credentials: touchAfterRefresh bumps expiry, rotates envelope, respects scope + revocation", async () => {
+  const envelope = await envelopeSeal("rt-ORIGINAL-SECRET", KMS);
+  await state.credentials.save({
+    connectionId: "conn_1", ...T_A, userId: "u1", provider: "google", envelope,
+    grantedScopes: ["email"], connectedEmail: "sales@pussycatalley.com",
+    accessTokenExpiresAt: NOW, revokedAt: null,
+  });
+
+  // Expiry-only update (no rotation): envelope untouched.
+  await state.credentials.touchAfterRefresh("conn_1", T_A, { accessTokenExpiresAt: LATER });
+  let stored = await state.credentials.get("conn_1", T_A);
+  assert.equal(stored?.accessTokenExpiresAt, LATER);
+  assert.equal(await envelopeOpen(stored!.envelope, KMS), "rt-ORIGINAL-SECRET");
+
+  // Rotation: the new refresh token replaces the envelope, still encrypted.
+  const rotated = await envelopeSeal("rt-ROTATED-SECRET", KMS);
+  await state.credentials.touchAfterRefresh("conn_1", T_A, { accessTokenExpiresAt: NOW, envelope: rotated });
+  stored = await state.credentials.get("conn_1", T_A);
+  assert.equal(await envelopeOpen(stored!.envelope, KMS), "rt-ROTATED-SECRET");
+  const raw = await pool.query("SELECT * FROM mail_credentials");
+  assert.ok(!JSON.stringify(raw.rows).includes("rt-ROTATED-SECRET"));
+
+  // Wrong scope is a no-op.
+  await state.credentials.touchAfterRefresh("conn_1", T_B, { accessTokenExpiresAt: LATER });
+  stored = await state.credentials.get("conn_1", T_A);
+  assert.equal(stored?.accessTokenExpiresAt, NOW);
+
+  // Revoked credentials cannot be resurrected by a refresh touch.
+  await state.credentials.revoke("conn_1", T_A, () => NOW);
+  await state.credentials.touchAfterRefresh("conn_1", T_A, { accessTokenExpiresAt: LATER });
+  stored = await state.credentials.get("conn_1", T_A);
+  assert.equal(stored?.accessTokenExpiresAt, NOW, "revoked row must not be updated");
+});
+
 // ---- Connection health ----
 
-test("connection health: upsert + scoped read", async () => {
-  await state.health.upsert({ connectionId: "conn_1", ...T_A, healthy: true, detail: "ok", checkedAt: NOW });
-  await state.health.upsert({ connectionId: "conn_1", ...T_A, healthy: false, detail: "token_expired", checkedAt: LATER });
+test("connection health: lifecycle state upsert + scoped read", async () => {
+  await state.health.upsert({ connectionId: "conn_1", ...T_A, state: "healthy", healthy: true, detail: "ok", checkedAt: NOW });
+  await state.health.upsert({ connectionId: "conn_1", ...T_A, state: "reauthorization_required", healthy: false, detail: "token_expired", checkedAt: LATER });
   const h = await state.health.get("conn_1", T_A);
+  assert.equal(h?.state, "reauthorization_required");
   assert.equal(h?.healthy, false);
   assert.equal(h?.detail, "token_expired");
   assert.equal(await state.health.get("conn_1", T_B), null);

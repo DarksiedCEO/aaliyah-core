@@ -14,6 +14,7 @@ import {
   loadGoogleConfig,
   buildGoogleConnectDeps,
 } from "../mail/google/googleConfig";
+import { createCredentialLifecycle } from "../mail/google/credentialLifecycle";
 
 /**
  * Build mail-route deps from the environment. When Google is unconfigured the
@@ -29,11 +30,19 @@ function mailRoutesDeps(auth: MailAuthDeps, state: MailStateBackend): MailRoutes
     return { capability, redirectUri: "", frontendInboxesUrl, auth, state };
   }
   const config = loadGoogleConfig();
+  const connectDeps = buildGoogleConnectDeps(config, state);
   return {
     capability,
     redirectUri: config.redirectUri,
     frontendInboxesUrl,
-    connectDeps: buildGoogleConnectDeps(config, state),
+    connectDeps,
+    // One lifecycle per process: its access-token cache and single-flight guard
+    // are intentionally per-instance (see credentialLifecycle.ts).
+    credentialLifecycle: createCredentialLifecycle({
+      state,
+      kms: connectDeps.kms,
+      http: connectDeps.http,
+    }),
     auth,
     state,
   };

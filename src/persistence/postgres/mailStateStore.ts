@@ -27,10 +27,23 @@ export type DurableMailCredential = {
   revokedAt: string | null;
 };
 
+/**
+ * Credential lifecycle state, persisted so every app instance sees the same
+ * durable health signal. `healthy` is the coarse boolean; `state` is the
+ * precise transition the last check produced.
+ */
+export type CredentialHealthState =
+  | "healthy"
+  | "refreshing"
+  | "degraded"
+  | "reauthorization_required"
+  | "revoked";
+
 export type ConnectionHealthRecord = {
   connectionId: string;
   tenantId: string;
   workspaceId: string;
+  state: CredentialHealthState;
   healthy: boolean;
   detail: string | null;
   checkedAt: string;
@@ -205,6 +218,39 @@ export function createPostgresMailState(pool: Pool) {
         };
       },
 
+      /**
+       * Record a successful refresh: bump the access-token expiry and, when the
+       * provider rotated the refresh token, replace the envelope. Scoped and
+       * refuses to touch a revoked row.
+       */
+      async touchAfterRefresh(
+        connectionId: string,
+        scope: TenantScope,
+        input: { accessTokenExpiresAt: string; envelope?: EnvelopeSealed },
+      ): Promise<void> {
+        if (input.envelope) {
+          await pool.query(
+            `UPDATE mail_credentials
+             SET access_token_expires_at = $4, key_id = $5,
+                 wrapped_data_key = $6, ciphertext = $7
+             WHERE connection_id = $1 AND tenant_id = $2 AND workspace_id = $3
+               AND revoked_at IS NULL`,
+            [
+              connectionId, scope.tenantId, scope.workspaceId,
+              input.accessTokenExpiresAt, input.envelope.keyId,
+              input.envelope.wrappedDataKey, input.envelope.ciphertext,
+            ],
+          );
+        } else {
+          await pool.query(
+            `UPDATE mail_credentials SET access_token_expires_at = $4
+             WHERE connection_id = $1 AND tenant_id = $2 AND workspace_id = $3
+               AND revoked_at IS NULL`,
+            [connectionId, scope.tenantId, scope.workspaceId, input.accessTokenExpiresAt],
+          );
+        }
+      },
+
       /** Revoke = destroy the ciphertext AND mark revoked — unrecoverable. */
       async revoke(connectionId: string, scope: TenantScope, now: () => string = () => new Date().toISOString()): Promise<void> {
         await pool.query(
@@ -224,13 +270,14 @@ export function createPostgresMailState(pool: Pool) {
       async upsert(record: ConnectionHealthRecord): Promise<void> {
         await pool.query(
           `INSERT INTO mail_connection_health
-           (connection_id, tenant_id, workspace_id, healthy, detail, checked_at)
-           VALUES ($1,$2,$3,$4,$5,$6)
+           (connection_id, tenant_id, workspace_id, state, healthy, detail, checked_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)
            ON CONFLICT (connection_id) DO UPDATE SET
-             healthy = EXCLUDED.healthy, detail = EXCLUDED.detail, checked_at = EXCLUDED.checked_at`,
+             state = EXCLUDED.state, healthy = EXCLUDED.healthy,
+             detail = EXCLUDED.detail, checked_at = EXCLUDED.checked_at`,
           [
             record.connectionId, record.tenantId, record.workspaceId,
-            record.healthy, record.detail, record.checkedAt,
+            record.state, record.healthy, record.detail, record.checkedAt,
           ],
         );
       },
@@ -245,8 +292,8 @@ export function createPostgresMailState(pool: Pool) {
         if (!r) return null;
         return {
           connectionId: r.connection_id, tenantId: r.tenant_id,
-          workspaceId: r.workspace_id, healthy: r.healthy,
-          detail: r.detail, checkedAt: iso(r.checked_at)!,
+          workspaceId: r.workspace_id, state: r.state,
+          healthy: r.healthy, detail: r.detail, checkedAt: iso(r.checked_at)!,
         };
       },
     },

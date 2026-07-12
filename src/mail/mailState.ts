@@ -85,6 +85,15 @@ export function createInMemoryMailState(): MailStateBackend & {
       async get(connectionId, scope) {
         return scoped(credentials.get(connectionId), scope);
       },
+      async touchAfterRefresh(connectionId, scope, input) {
+        const record = scoped(credentials.get(connectionId), scope);
+        if (!record || record.revokedAt) return;
+        credentials.set(connectionId, {
+          ...record,
+          accessTokenExpiresAt: input.accessTokenExpiresAt,
+          ...(input.envelope ? { envelope: input.envelope } : {}),
+        });
+      },
       async revoke(connectionId, scope, now = () => new Date().toISOString()) {
         const record = scoped(credentials.get(connectionId), scope);
         if (!record || record.revokedAt) return;

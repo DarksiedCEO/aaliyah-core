@@ -14,6 +14,7 @@ import {
   refreshGoogleAccessToken,
   type GoogleConnectDeps,
 } from "../mail/google/googleConnect";
+import type { CredentialLifecycle } from "../mail/google/credentialLifecycle";
 import type { GoogleCapability } from "../mail/google/googleConfig";
 import { recordMailAudit } from "../mail/security/mailAudit";
 
@@ -44,6 +45,9 @@ export type MailRoutesDeps = {
   redirectUri: string; // exact OAuth redirect URI (must match Google console)
   frontendInboxesUrl: string; // e.g. https://app.example/settings/inboxes
   connectDeps?: GoogleConnectDeps; // present only when configured
+  /** Google credential lifecycle: proactive refresh + durable connection
+   * health. Present whenever connectDeps is (composed together). */
+  credentialLifecycle?: CredentialLifecycle;
   auth: MailAuthDeps;
   /** Durable mail state (Postgres in production, in-memory for dev/tests). */
   state: MailStateBackend;
@@ -263,7 +267,13 @@ export async function testConnection(
   const conn = await deps.state.connections.get(connectionId, scope);
   if (!conn) throw new Error("connection not found");
 
-  const accessToken = await refreshGoogleAccessToken(connectionId, scope, deps.connectDeps);
+  // Acquire the token through the credential lifecycle: it refreshes before
+  // expiry, coordinates concurrent refreshes, and records durable connection
+  // health (healthy/degraded/reauthorization_required/revoked). A revoked or
+  // reauth-required grant throws here — before any mailbox call is attempted.
+  const accessToken = deps.credentialLifecycle
+    ? await deps.credentialLifecycle.getFreshAccessToken(connectionId, scope)
+    : await refreshGoogleAccessToken(connectionId, scope, deps.connectDeps);
   const adapter = new GoogleMailAdapter({ resolveAccessToken: () => accessToken });
 
   const health = await adapter.verify(connectionId);
