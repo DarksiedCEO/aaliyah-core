@@ -89,3 +89,25 @@ jobs:
       - name: Test (against live Postgres — no in-memory fallback)
         working-directory: aaliyah-core
         run: pnpm test
+
+      # Deterministic release guards: frozen-file integrity, no file-backed
+      # production state, no send.execute grant, no new unfinished-work markers,
+      # no committed secrets, no core->workflows code dependency.
+      - name: Release guards
+        working-directory: aaliyah-core
+        run: bash scripts/ci-guards.sh
+
+      # Build the production image from the workspace root (both repos are
+      # checked out as siblings, exactly what the Dockerfile expects) and prove
+      # it fails closed with no configuration.
+      - name: Production image build
+        run: docker build -f aaliyah-core/Dockerfile -t aaliyah-core:ci .
+
+      - name: Container fail-closed smoke test
+        run: |
+          set -e
+          if docker run --rm aaliyah-core:ci > out.txt 2>&1; then
+            echo "FAIL: container booted with no config (should fail closed)"; cat out.txt; exit 1
+          fi
+          grep -q "refusing to boot" out.txt
+          echo "PASS: container fails closed without production config"

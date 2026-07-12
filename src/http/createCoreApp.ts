@@ -15,6 +15,7 @@ import {
   buildGoogleConnectDeps,
 } from "../mail/google/googleConfig";
 import { createCredentialLifecycle } from "../mail/google/credentialLifecycle";
+import type { ReadinessProbe } from "./readiness";
 
 /**
  * Build mail-route deps from the environment. When Google is unconfigured the
@@ -90,6 +91,9 @@ export function createCoreApp(
     mailState?: MailStateBackend;
     identityState?: IdentityBackend;
     authService?: AuthService;
+    /** Readiness probe for /ready. Defaults to trivially-ready (dev); the
+     * server wires a real Postgres ping in production. */
+    readinessProbe?: ReadinessProbe;
   } = {},
 ): Express {
   if (
@@ -128,8 +132,26 @@ export function createCoreApp(
   app.use(createAuthRouter({ auth: authService, googleLoginAvailable }));
   app.use(createMailRouter(mailRoutesDeps(mailAuth, mailState)));
 
+  // Liveness: the process is up and the event loop is responsive. Deliberately
+  // dependency-free — a liveness failure means "restart me", not "back off".
   app.get("/health", (_req, res) => {
     res.status(200).json({ status: "ok" });
+  });
+
+  // Readiness: can we actually serve? Fails 503 when a durable dependency is
+  // unreachable so the load balancer stops routing until it recovers.
+  const readinessProbe: ReadinessProbe =
+    options.readinessProbe ?? (async () => ({ ready: true, checks: {} }));
+  app.get("/ready", async (_req, res) => {
+    try {
+      const result = await readinessProbe();
+      res.status(result.ready ? 200 : 503).json({
+        status: result.ready ? "ready" : "not_ready",
+        checks: result.checks,
+      });
+    } catch {
+      res.status(503).json({ status: "not_ready", checks: { probe: "unavailable" } });
+    }
   });
 
   return app;

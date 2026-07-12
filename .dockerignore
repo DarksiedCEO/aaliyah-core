@@ -1,0 +1,28 @@
+# The build only needs source + manifests; everything below is rebuilt in-image
+# or must never enter the image (secrets, local state, VCS, dev artifacts).
+**/node_modules
+**/dist
+**/.git
+**/.github
+**/coverage
+**/.nyc_output
+**/*.log
+**/.DS_Store
+
+# Secrets & local environment — never copy into an image layer.
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/service-account*.json
+**/gcp-*.json
+
+# Local durable-state dir and scratch (disposable; Postgres is the real store).
+**/.aaliyah
+**/tmp
+**/scratchpad
+
+# Tests and editor cruft are not needed at runtime.
+**/tests
+**/.vscode
+**/.idea

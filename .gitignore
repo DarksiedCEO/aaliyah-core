@@ -3,3 +3,6 @@ dist
 coverage
 *.log
 .idea
+
+# Filled deploy config (identifiers; never secrets) — not committed
+deploy/config.env
