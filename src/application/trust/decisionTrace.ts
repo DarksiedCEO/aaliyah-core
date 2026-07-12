@@ -1,6 +1,4 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 
 import {
   DecisionTraceSchema,
@@ -8,12 +6,10 @@ import {
   type DecisionTrace,
 } from "@aaliyah/contracts/v1";
 
-import {
-  scopedJsonlPath,
-  type TenantScope,
-} from "../../persistence/tenantScopedStore";
+import type { TenantScope } from "../../persistence/tenantScopedStore";
+import { applicationStoreFromEnv } from "../../persistence/applicationState";
 
-const TRACE_FILE = "decision-traces.jsonl";
+const TRACE_STORE = "decision_traces";
 
 export type DecisionTraceInput = {
   tenantId: string;
@@ -31,7 +27,7 @@ export type DecisionTraceInput = {
  * Record a tenant/workspace-scoped decision trace. Audit only — never alters a
  * decision. Doctrine version is stamped automatically.
  */
-export function recordDecisionTrace(input: DecisionTraceInput): DecisionTrace {
+export async function recordDecisionTrace(input: DecisionTraceInput): Promise<DecisionTrace> {
   const now = input.now ?? (() => new Date().toISOString());
   const trace = DecisionTraceSchema.parse({
     traceId: crypto.randomUUID(),
@@ -51,18 +47,11 @@ export function recordDecisionTrace(input: DecisionTraceInput): DecisionTrace {
     tenantId: trace.tenantId,
     workspaceId: trace.workspaceId,
   };
-  const fp = scopedJsonlPath(TRACE_FILE, scope);
-  fs.mkdirSync(path.dirname(fp), { recursive: true });
-  fs.appendFileSync(fp, `${JSON.stringify(trace)}\n`, "utf8");
+  await applicationStoreFromEnv().logs.append(TRACE_STORE, scope, trace);
   return trace;
 }
 
-export function readDecisionTraces(scope: TenantScope): DecisionTrace[] {
-  const fp = scopedJsonlPath(TRACE_FILE, scope);
-  if (!fs.existsSync(fp)) return [];
-  return fs
-    .readFileSync(fp, "utf8")
-    .split("\n")
-    .filter((l) => l.trim().length > 0)
-    .map((l) => DecisionTraceSchema.parse(JSON.parse(l)));
+export async function readDecisionTraces(scope: TenantScope): Promise<DecisionTrace[]> {
+  const rows = await applicationStoreFromEnv().logs.list(TRACE_STORE, scope);
+  return rows.map((r) => DecisionTraceSchema.parse(r));
 }

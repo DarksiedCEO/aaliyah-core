@@ -8,10 +8,9 @@ import {
   type TenantScope,
 } from "../../persistence/tenantScopedStore";
 import {
-  appendJsonlFile,
-  readJsonlFile,
-  removeFileIfExists,
-  replyOutcomeLogPath,
+  appendReplyOutcome,
+  clearReplyOutcomeHistory,
+  listReplyOutcomeHistory,
 } from "./persistence";
 
 // In-memory store partitioned by tenant/workspace bucket so a read for one
@@ -34,12 +33,12 @@ export async function recordReplyOutcome(
 ): Promise<ReplyOutcome> {
   const parsed = ReplyOutcomeSchema.parse(outcome);
   bucket(scope).push(parsed);
-  appendJsonlFile(replyOutcomeLogPath(scope), parsed);
+  await appendReplyOutcome(parsed, scope);
   return parsed;
 }
 
-export function listReplyOutcomes(scope?: TenantScope): ReplyOutcome[] {
-  return [...bucket(scope), ...readJsonlFile<ReplyOutcome>(replyOutcomeLogPath(scope))]
+export async function listReplyOutcomes(scope?: TenantScope): Promise<ReplyOutcome[]> {
+  return [...bucket(scope), ...(await listReplyOutcomeHistory<ReplyOutcome>(scope))]
     .filter(
       (record, index, records) =>
         records.findIndex(
@@ -51,7 +50,7 @@ export function listReplyOutcomes(scope?: TenantScope): ReplyOutcome[] {
     );
 }
 
-export function clearReplyOutcomes(scope?: TenantScope): void {
+export async function clearReplyOutcomes(scope?: TenantScope): Promise<void> {
   bucket(scope).length = 0;
-  removeFileIfExists(replyOutcomeLogPath(scope));
+  await clearReplyOutcomeHistory(scope);
 }

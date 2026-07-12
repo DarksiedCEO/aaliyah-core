@@ -9,10 +9,9 @@ import {
   type TenantScope,
 } from "../../persistence/tenantScopedStore";
 import {
-  appendJsonlFile,
-  followupOutcomeLogPath,
-  readJsonlFile,
-  removeFileIfExists,
+  appendFollowupOutcome,
+  clearFollowupOutcomeHistory,
+  listFollowupOutcomeHistory,
 } from "./persistence";
 
 // Per-(tenant, workspace) bucket of outcomes. Keeping the transition state
@@ -60,7 +59,7 @@ export async function trackFollowupOutcome(
   }
 
   store.set(key(parsed.taskId, parsed.threadId), parsed);
-  appendJsonlFile(followupOutcomeLogPath(scope), parsed);
+  await appendFollowupOutcome(parsed, scope);
   return parsed;
 }
 
@@ -72,10 +71,10 @@ export function getTrackedFollowupOutcome(
   return bucket(scope).get(key(taskId, threadId));
 }
 
-export function listTrackedFollowupOutcomes(scope?: TenantScope): FollowupOutcome[] {
+export async function listTrackedFollowupOutcomes(scope?: TenantScope): Promise<FollowupOutcome[]> {
   return [
     ...bucket(scope).values(),
-    ...readJsonlFile<FollowupOutcome>(followupOutcomeLogPath(scope)),
+    ...(await listFollowupOutcomeHistory<FollowupOutcome>(scope)),
   ].filter(
     (record, index, records) =>
       records.findIndex(
@@ -87,7 +86,7 @@ export function listTrackedFollowupOutcomes(scope?: TenantScope): FollowupOutcom
   );
 }
 
-export function clearTrackedFollowupOutcomes(scope?: TenantScope): void {
+export async function clearTrackedFollowupOutcomes(scope?: TenantScope): Promise<void> {
   bucket(scope).clear();
-  removeFileIfExists(followupOutcomeLogPath(scope));
+  await clearFollowupOutcomeHistory(scope);
 }

@@ -12,8 +12,8 @@ export type RevenueSummary = {
  * Read-only revenue summary for monitoring. Reads scoped signals; it never
  * alters the frozen monitoring gate math.
  */
-export function summarizeRevenue(scope: TenantScope): RevenueSummary {
-  const latest = [...latestRevenueByThread(scope).values()];
+export async function summarizeRevenue(scope: TenantScope): Promise<RevenueSummary> {
+  const latest = [...(await latestRevenueByThread(scope)).values()];
   if (latest.length === 0) {
     return {
       threadCount: 0,

@@ -10,11 +10,13 @@ import {
   latestRevenueByThread,
 } from "../src/application/revenue/revenueStore";
 import { summarizeRevenue } from "../src/application/revenue/revenueMetrics";
+import { resetApplicationStoreForTests } from "../src/persistence/applicationState";
 
 before(() => {
   process.env.AALIYAH_DATA_DIR = fs.mkdtempSync(
     path.join(os.tmpdir(), "aaliyah-revenue-"),
   );
+  resetApplicationStoreForTests();
 });
 
 const A = { tenantId: "tenant_a", workspaceId: "tenant_a:default" };
@@ -47,17 +49,17 @@ test("revenue risk rises when a valuable opportunity goes stale", () => {
   assert.ok(stale.revenueRiskScore > fresh.revenueRiskScore);
 });
 
-test("revenue signals persist and summarize, scoped per tenant", () => {
-  saveRevenueSignals(computeRevenueSignals(A, { threadId: "t10", isFromKnownLead: true, mentionsPricing: true, mentionsBudget: true, mentionsContract: true, daysSinceLastReply: 9 }, NOW));
-  saveRevenueSignals(computeRevenueSignals(A, { threadId: "t11" }, NOW));
-  saveRevenueSignals(computeRevenueSignals(B, { threadId: "t12", isFromKnownLead: true }, NOW));
+test("revenue signals persist and summarize, scoped per tenant", async () => {
+  await saveRevenueSignals(computeRevenueSignals(A, { threadId: "t10", isFromKnownLead: true, mentionsPricing: true, mentionsBudget: true, mentionsContract: true, daysSinceLastReply: 9 }, NOW));
+  await saveRevenueSignals(computeRevenueSignals(A, { threadId: "t11" }, NOW));
+  await saveRevenueSignals(computeRevenueSignals(B, { threadId: "t12", isFromKnownLead: true }, NOW));
 
-  const summaryA = summarizeRevenue(A);
+  const summaryA = await summarizeRevenue(A);
   assert.equal(summaryA.threadCount, 2);
   assert.ok(summaryA.averageOpportunityScore !== null);
   assert.ok(summaryA.highRiskThreads >= 1);
 
   // Scoped — tenant_b's thread is not in tenant_a's summary.
-  assert.equal(summarizeRevenue(B).threadCount, 1);
-  assert.ok(!latestRevenueByThread(A).has("t12"));
+  assert.equal((await summarizeRevenue(B)).threadCount, 1);
+  assert.ok(!(await latestRevenueByThread(A)).has("t12"));
 });

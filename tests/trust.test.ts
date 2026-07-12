@@ -23,6 +23,7 @@ import {
   inboundDraftInternals,
 } from "../src/application/inbound/runInboundDraft";
 import { idempotencyStoreInternals } from "../src/persistence/idempotencyStore";
+import { resetApplicationStoreForTests } from "../src/persistence/applicationState";
 
 process.env.AALIYAH_ALLOW_INMEMORY_IDEMPOTENCY = "true";
 
@@ -30,6 +31,9 @@ before(() => {
   process.env.AALIYAH_DATA_DIR = fs.mkdtempSync(
     path.join(os.tmpdir(), "aaliyah-trust-"),
   );
+  // Fresh in-memory application store per file (mirrors the prior per-file data
+  // dir); data still accumulates across tests within this file.
+  resetApplicationStoreForTests();
 });
 
 const A = { tenantId: "tenant_a", workspaceId: "tenant_a:default" };
@@ -47,30 +51,30 @@ test("confidence labels follow the thresholds and low forces manual review", () 
   assert.equal(c.label, "high");
 });
 
-test("decision traces persist per scope and never cross tenants", () => {
-  recordDecisionTrace({
+test("decision traces persist per scope and never cross tenants", async () => {
+  await recordDecisionTrace({
     ...A, userId: "u1", decision: "draft_reply_awaiting_approval",
     reason: "ok", evidenceUsed: ["t1"],
   });
-  recordDecisionTrace({
+  await recordDecisionTrace({
     ...B, userId: "u2", decision: "draft_reply_awaiting_approval", reason: "ok",
   });
 
-  const aTraces = readDecisionTraces(A);
+  const aTraces = await readDecisionTraces(A);
   assert.equal(aTraces.length, 1);
   assert.equal(aTraces[0]!.doctrineVersion, "v1");
-  assert.equal(readDecisionTraces(B).length, 1);
+  assert.equal((await readDecisionTraces(B)).length, 1);
   // No cross-tenant bleed.
   assert.ok(aTraces.every((t) => t.tenantId === "tenant_a"));
 });
 
-test("draft quality records and summarizes (measurement only), scoped", () => {
+test("draft quality records and summarizes (measurement only), scoped", async () => {
   const base = { ...A, threadId: "t", createdAt: "2026-06-23T12:00:00.000Z" };
-  recordDraftQuality({ ...base, taskId: "k1", outcome: "approved" });
-  recordDraftQuality({ ...base, taskId: "k2", outcome: "edited", editDistance: 12 });
-  recordDraftQuality({ ...base, taskId: "k3", outcome: "rejected", rejectionReason: "tone_off" });
+  await recordDraftQuality({ ...base, taskId: "k1", outcome: "approved" });
+  await recordDraftQuality({ ...base, taskId: "k2", outcome: "edited", editDistance: 12 });
+  await recordDraftQuality({ ...base, taskId: "k3", outcome: "rejected", rejectionReason: "tone_off" });
 
-  const summary = summarizeDraftQuality(A);
+  const summary = await summarizeDraftQuality(A);
   assert.equal(summary.total, 3);
   assert.equal(summary.byOutcome.approved, 1);
   assert.equal(summary.byOutcome.edited, 1);
@@ -78,11 +82,11 @@ test("draft quality records and summarizes (measurement only), scoped", () => {
   assert.equal(summary.averageEditDistance, 12);
 
   // Scoped — tenant_b sees none of tenant_a's quality data.
-  assert.equal(summarizeDraftQuality(B).total, 0);
+  assert.equal((await summarizeDraftQuality(B)).total, 0);
 });
 
-test("trust metrics summary reads scoped traces + quality (read-only)", () => {
-  const metrics = trustMetricsSummary(A, { high: 2, medium: 1, low: 0 });
+test("trust metrics summary reads scoped traces + quality (read-only)", async () => {
+  const metrics = await trustMetricsSummary(A, { high: 2, medium: 1, low: 0 });
   assert.ok(metrics.traceCount >= 1);
   assert.equal(metrics.confidence.high, 2);
   assert.ok(metrics.quality.total >= 3);
@@ -101,7 +105,7 @@ test("every inbound draft carries confidence + a decision trace; low still await
   });
 
   try {
-    const tracesBefore = readDecisionTraces({ tenantId: "tenant_c", workspaceId: "tenant_c:default" }).length;
+    const tracesBefore = (await readDecisionTraces({ tenantId: "tenant_c", workspaceId: "tenant_c:default" })).length;
     const result = await runInboundDraft({
       tenantId: "tenant_c", workspaceId: "tenant_c:default", userId: "u",
       email: {
@@ -115,7 +119,7 @@ test("every inbound draft carries confidence + a decision trace; low still await
     assert.ok(result.confidence);
     assert.equal(result.confidence!.label, "low");
 
-    const tracesAfter = readDecisionTraces({ tenantId: "tenant_c", workspaceId: "tenant_c:default" }).length;
+    const tracesAfter = (await readDecisionTraces({ tenantId: "tenant_c", workspaceId: "tenant_c:default" })).length;
     assert.equal(tracesAfter, tracesBefore + 1);
   } finally {
     inboundDraftInternals.createDraft = realCreate;

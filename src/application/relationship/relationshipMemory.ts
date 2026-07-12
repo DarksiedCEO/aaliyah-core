@@ -15,7 +15,7 @@ const MAX_SUMMARIES = 20;
  * Record an interaction with a contact, upserting the relationship record.
  * Advisory memory only — recording never triggers any action or send.
  */
-export function recordInteraction(input: {
+export async function recordInteraction(input: {
   tenantId: string;
   userId: string;
   workspaceId?: string;
@@ -25,7 +25,7 @@ export function recordInteraction(input: {
   communicationStylePreference?: CommunicationStyle;
   relationshipNotes?: string;
   now?: () => string;
-}): RelationshipRecord {
+}): Promise<RelationshipRecord> {
   const tenant = requireTenantContext({
     tenantId: input.tenantId,
     userId: input.userId,
@@ -38,7 +38,7 @@ export function recordInteraction(input: {
   const now = input.now ?? (() => new Date().toISOString());
   const at = now();
 
-  const existing = getRelationship(scope, tenant.userId, input.contactEmail);
+  const existing = await getRelationship(scope, tenant.userId, input.contactEmail);
   const summaries = [
     ...(existing?.interactionSummaries ?? []),
     { at, summary: input.summary },
@@ -65,12 +65,12 @@ export function recordInteraction(input: {
  * (tenant, workspace, user). Returns undefined when nothing is remembered —
  * the drafting path treats memory as optional.
  */
-export function getRelationshipContext(
+export async function getRelationshipContext(
   scope: TenantScope,
   userId: string,
   contactEmail: string,
-): RelationshipContext | undefined {
-  const record = getRelationship(scope, userId, contactEmail);
+): Promise<RelationshipContext | undefined> {
+  const record = await getRelationship(scope, userId, contactEmail);
   if (!record) return undefined;
 
   return RelationshipContextSchema.parse({

@@ -20,12 +20,12 @@ import { loadStyleProfile } from "./styleStore";
  * Always returns a valid profile — the drafting path never fails for a missing
  * or partial style configuration.
  */
-export function resolveStyleProfile(
+export async function resolveStyleProfile(
   scope: TenantScope,
   userId: string,
   styleId?: CommunicationStyle,
-): StyleProfile {
-  const stored = loadStyleProfile(scope, userId);
+): Promise<StyleProfile> {
+  const stored = await loadStyleProfile(scope, userId);
   if (stored) {
     return stored;
   }
