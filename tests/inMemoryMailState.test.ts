@@ -16,8 +16,8 @@ const T_B = { tenantId: "tenant_b", workspaceId: "tenant_b:default" };
 const NOW = "2026-07-10T12:00:00.000Z";
 const LATER = "2026-07-10T12:10:00.000Z";
 
-function oauthState(over: Record<string, never> | object = {}) {
-  const sealed = envelopeSeal("verifier-secret", KMS);
+async function oauthState(over: Record<string, never> | object = {}) {
+  const sealed = await envelopeSeal("verifier-secret", KMS);
   return {
     stateHash: crypto.randomBytes(16).toString("hex"),
     provider: "google" as const,
@@ -36,7 +36,7 @@ function oauthState(over: Record<string, never> | object = {}) {
 
 test("in-memory oauth states: one-time, session-bound, expiring; raw values never stored", async () => {
   const state = createInMemoryMailState();
-  const s = oauthState();
+  const s = await oauthState();
   await state.oauthStates.put(s);
 
   await assert.rejects(
@@ -54,7 +54,7 @@ test("in-memory oauth states: one-time, session-bound, expiring; raw values neve
     now: () => new Date(NOW).getTime(),
   });
   assert.equal(consumed.tenantId, T_A.tenantId);
-  assert.equal(envelopeOpen(JSON.parse(consumed.codeVerifierEncrypted), KMS), "verifier-secret");
+  assert.equal(await envelopeOpen(JSON.parse(consumed.codeVerifierEncrypted), KMS), "verifier-secret");
   await assert.rejects(
     () =>
       state.oauthStates.consume(s.stateHash, {
@@ -65,7 +65,7 @@ test("in-memory oauth states: one-time, session-bound, expiring; raw values neve
     /already used/,
   );
 
-  const s2 = oauthState();
+  const s2 = await oauthState();
   await state.oauthStates.put(s2);
   await assert.rejects(
     () =>
@@ -91,21 +91,21 @@ test("in-memory connections + credentials: tenant scoping and revocation parity"
   assert.ok(await state.connections.get("conn_1", T_A));
   assert.equal(await state.connections.get("conn_1", T_B), null);
 
-  const envelope = envelopeSeal("rt-SECRET", KMS);
+  const envelope = await envelopeSeal("rt-SECRET", KMS);
   await state.credentials.save({
     connectionId: "conn_1", ...T_A, userId: "u1", provider: "google",
     envelope, grantedScopes: ["email"], connectedEmail: "sales@pussycatalley.com",
     accessTokenExpiresAt: null, revokedAt: null,
   });
   const cred = await state.credentials.get("conn_1", T_A);
-  assert.equal(envelopeOpen(cred!.envelope, KMS), "rt-SECRET");
+  assert.equal(await envelopeOpen(cred!.envelope, KMS), "rt-SECRET");
   assert.equal(await state.credentials.get("conn_1", T_B), null);
 
   await state.credentials.revoke("conn_1", T_A, () => NOW);
   const revoked = await state.credentials.get("conn_1", T_A);
   assert.ok(revoked!.revokedAt);
   // Ciphertext destroyed — even with the right KMS it cannot decrypt.
-  assert.throws(() => envelopeOpen(revoked!.envelope, KMS));
+  await assert.rejects(() => envelopeOpen(revoked!.envelope, KMS));
 });
 
 test("in-memory approval claim: exactly one concurrent winner; ambiguous stays sending", async () => {

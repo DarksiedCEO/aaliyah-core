@@ -4,12 +4,14 @@ import crypto from "node:crypto";
  * Envelope encryption: every secret is encrypted with its own fresh data key
  * (AES-256-GCM); only the data key — never the secret — crosses the KMS
  * boundary for wrapping. This is the storage shape cloud KMS expects, so
- * swapping the local master for AWS/GCP KMS changes the wrapper, not the data.
+ * swapping the local master for a real cloud KMS changes the wrapper, not
+ * the data. wrap/unwrap are async: a real KMS (GCP Cloud KMS, AWS KMS, ...)
+ * wraps a data key via a network RPC, not a local computation.
  */
 export interface KmsKeyWrapper {
   readonly keyId: string;
-  wrapDataKey(plainDataKey: Buffer): Buffer;
-  unwrapDataKey(wrappedDataKey: Buffer): Buffer;
+  wrapDataKey(plainDataKey: Buffer): Promise<Buffer>;
+  unwrapDataKey(wrappedDataKey: Buffer): Promise<Buffer>;
 }
 
 export type EnvelopeSealed = {
@@ -34,12 +36,13 @@ function gcmOpen(key: Buffer, sealed: Buffer): Buffer {
   return Buffer.concat([decipher.update(data), decipher.final()]);
 }
 
-export function envelopeSeal(plaintext: string, kms: KmsKeyWrapper): EnvelopeSealed {
+export async function envelopeSeal(plaintext: string, kms: KmsKeyWrapper): Promise<EnvelopeSealed> {
   const dataKey = crypto.randomBytes(32);
   try {
+    const wrappedDataKey = await kms.wrapDataKey(dataKey);
     return {
       keyId: kms.keyId,
-      wrappedDataKey: kms.wrapDataKey(dataKey).toString("base64"),
+      wrappedDataKey: wrappedDataKey.toString("base64"),
       ciphertext: gcmSeal(dataKey, Buffer.from(plaintext, "utf8")).toString("base64"),
     };
   } finally {
@@ -47,11 +50,11 @@ export function envelopeSeal(plaintext: string, kms: KmsKeyWrapper): EnvelopeSea
   }
 }
 
-export function envelopeOpen(sealed: EnvelopeSealed, kms: KmsKeyWrapper): string {
+export async function envelopeOpen(sealed: EnvelopeSealed, kms: KmsKeyWrapper): Promise<string> {
   if (sealed.keyId !== kms.keyId) {
     throw new Error(`envelope key id mismatch: sealed under ${sealed.keyId}`);
   }
-  const dataKey = kms.unwrapDataKey(Buffer.from(sealed.wrappedDataKey, "base64"));
+  const dataKey = await kms.unwrapDataKey(Buffer.from(sealed.wrappedDataKey, "base64"));
   try {
     return gcmOpen(dataKey, Buffer.from(sealed.ciphertext, "base64")).toString("utf8");
   } finally {
@@ -71,8 +74,8 @@ export function localMasterKms(input: { keyId: string; masterKey: Buffer }): Kms
   }
   return {
     keyId: input.keyId,
-    wrapDataKey: (plainDataKey) => gcmSeal(input.masterKey, plainDataKey),
-    unwrapDataKey: (wrappedDataKey) => gcmOpen(input.masterKey, wrappedDataKey),
+    wrapDataKey: async (plainDataKey) => gcmSeal(input.masterKey, plainDataKey),
+    unwrapDataKey: async (wrappedDataKey) => gcmOpen(input.masterKey, wrappedDataKey),
   };
 }
 

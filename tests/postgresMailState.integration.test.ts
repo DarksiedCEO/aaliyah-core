@@ -48,8 +48,8 @@ test("pool creation fails closed without a database url", () => {
 
 // ---- OAuth states ----
 
-function oauthState(over: Record<string, unknown> = {}) {
-  const sealed = envelopeSeal("verifier-secret", KMS);
+async function oauthState(over: Record<string, unknown> = {}) {
+  const sealed = await envelopeSeal("verifier-secret", KMS);
   return {
     stateHash: crypto.randomBytes(16).toString("hex"),
     provider: "google" as const,
@@ -67,7 +67,7 @@ function oauthState(over: Record<string, unknown> = {}) {
 }
 
 test("oauth state: one-time, session-bound, expiring consume", async () => {
-  const s = oauthState();
+  const s = await oauthState();
   await state.oauthStates.put(s);
 
   // Wrong session refused, state untouched.
@@ -101,7 +101,7 @@ test("oauth state: one-time, session-bound, expiring consume", async () => {
   assert.equal(consumed.tenantId, T_A.tenantId);
   assert.equal(consumed.workspaceId, T_A.workspaceId);
   assert.equal(consumed.userId, "u1");
-  assert.equal(envelopeOpen(JSON.parse(consumed.codeVerifierEncrypted), KMS), "verifier-secret");
+  assert.equal(await envelopeOpen(JSON.parse(consumed.codeVerifierEncrypted), KMS), "verifier-secret");
 
   // Replay is dead.
   await assert.rejects(
@@ -115,7 +115,7 @@ test("oauth state: one-time, session-bound, expiring consume", async () => {
   );
 
   // Expired state refused.
-  const s2 = oauthState();
+  const s2 = await oauthState();
   await state.oauthStates.put(s2);
   await assert.rejects(
     () =>
@@ -129,7 +129,7 @@ test("oauth state: one-time, session-bound, expiring consume", async () => {
 });
 
 test("oauth state: concurrent consumes — exactly one wins", async () => {
-  const s = oauthState();
+  const s = await oauthState();
   await state.oauthStates.put(s);
   const attempt = () =>
     state.oauthStates
@@ -173,7 +173,7 @@ test("connections: tenant-scoped save/get/delete; cross-tenant reads nothing", a
 // ---- Credentials (envelope-encrypted at rest) ----
 
 test("credentials: envelope at rest, revocation blocks retrieval of the secret", async () => {
-  const envelope = envelopeSeal("rt-REFRESH-SECRET", KMS);
+  const envelope = await envelopeSeal("rt-REFRESH-SECRET", KMS);
   await state.credentials.save({
     connectionId: "conn_1",
     ...T_A,
@@ -188,7 +188,7 @@ test("credentials: envelope at rest, revocation blocks retrieval of the secret",
 
   const stored = await state.credentials.get("conn_1", T_A);
   assert.ok(stored);
-  assert.equal(envelopeOpen(stored!.envelope, KMS), "rt-REFRESH-SECRET");
+  assert.equal(await envelopeOpen(stored!.envelope, KMS), "rt-REFRESH-SECRET");
   // Nothing plaintext at rest.
   const raw = await pool.query("SELECT * FROM mail_credentials");
   assert.ok(!JSON.stringify(raw.rows).includes("rt-REFRESH-SECRET"));
