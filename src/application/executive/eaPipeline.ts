@@ -24,7 +24,7 @@ export async function runEaPipeline(deps: EaDeps, input: EaInput): Promise<EaOut
   // Stage 0 — free deterministic filter.
   const stage0 = stage0SystemFilter(input.email, input.signals);
   const triage = stage0 ?? (await classifyInbound(deps.triageRouter, input.email));
-  const degradedTriage = triage.confidence === 0 && /degraded/i.test(triage.reason);
+  const degradedTriage = triage.degraded === true;
 
   // Stage 2 — deterministic authority.
   const decision = decideAuthority(triage);
@@ -37,7 +37,7 @@ export async function runEaPipeline(deps: EaDeps, input: EaInput): Promise<EaOut
     degraded: degradedTriage,
     cautionMarker: decision.cautionMarker,
   };
-  if (degradedTriage) return { ...base, action: "review_only" };
+  if (degradedTriage) return { ...base, action: "review_only", reason: triage.reason };
 
   // Stage 3 — draft only when permitted.
   if (decision.draftable && (triage.category === "real_lead" || triage.category === "vendor_solicitation")) {

@@ -17,6 +17,7 @@ export type TriageResult = {
   risk: RiskLevel;
   reason: string;
   confidence: number; // 0..1
+  degraded?: boolean;
 };
 
 export type MailSignals = { listUnsubscribe: boolean; precedenceBulk: boolean };
@@ -66,6 +67,7 @@ const DEGRADED: TriageResult = {
   risk: "yellow",
   reason: "classification degraded — review-only",
   confidence: 0,
+  degraded: true,
 };
 
 const TRIAGE_SYSTEM = [

@@ -35,4 +35,5 @@ test("all providers failed -> degraded", async () => {
   assert.equal(r.category, "unknown");
   assert.match(r.reason, /degraded/i);
   assert.equal(r.confidence, 0);
+  assert.equal(r.degraded, true);
 });
