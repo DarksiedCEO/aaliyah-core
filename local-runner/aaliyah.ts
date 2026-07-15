@@ -1,10 +1,12 @@
 import { createMailDbPool } from "../src/persistence/postgres/pool";
 import { runMailMigrations } from "../src/persistence/postgres/migrations";
+import { resolveConfiguredModels, verifyModels } from "../src/application/executive/modelResolution";
 
 import { loadLocalEnv, readConnection } from "./env";
 import { runConnect } from "./connect";
 import { runDraftInbox } from "./draftInbox";
 import { runInitProfile } from "./initProfile";
+import { listAccountModels } from "./eaRouters";
 
 /* eslint-disable no-console */
 
@@ -29,6 +31,22 @@ async function runStatus(): Promise<void> {
   console.log(`Database URL:    ${cfg.databaseUrl}`);
   console.log(`Redirect URI:    ${cfg.redirectUri}`);
   console.log(`Anthropic key:   ${cfg.hasAnthropicKey ? "present (model-assisted drafts)" : "absent (deterministic drafts)"}`);
+
+  if (cfg.hasAnthropicKey) {
+    const tiers = resolveConfiguredModels(process.env);
+    try {
+      const v = await verifyModels(tiers, listAccountModels);
+      console.log(
+        v.ok
+          ? `Models:          triage=${tiers.triage}, draft=${tiers.draft} — verified ✅`
+          : `Models:          MISSING ${v.missing.join(", ")} — those stages will fail degraded ❌`,
+      );
+    } catch (error) {
+      console.log(`Models:          could not verify (${error instanceof Error ? error.message : "unknown"})`);
+    }
+  } else {
+    console.log("Models:          no Anthropic key — EA drafting will be review-only (degraded)");
+  }
 
   const pool = createMailDbPool();
   try {
