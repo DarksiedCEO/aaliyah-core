@@ -1,4 +1,5 @@
 import type { InboundEmail } from "@aaliyah/contracts/v1";
+import type { MailSignals } from "../src/application/executive/triage";
 
 /**
  * Read-only Gmail helper for the local runner.
@@ -63,6 +64,14 @@ function extractBody(part: GmailPart | undefined): string {
   return "";
 }
 
+/** Derive bulk-mail signals from a message's raw headers. Pure and total: missing
+ * or undefined headers resolve to `false` rather than throwing. */
+export function extractMailSignals(headers: GmailHeader[] | undefined): MailSignals {
+  const has = (n: string) => (headers ?? []).some((h) => (h.name ?? "").toLowerCase() === n.toLowerCase());
+  const precedence = (headers ?? []).find((h) => (h.name ?? "").toLowerCase() === "precedence")?.value ?? "";
+  return { listUnsubscribe: has("List-Unsubscribe"), precedenceBulk: /bulk|list|junk/i.test(precedence) };
+}
+
 async function getThread(
   fetchImpl: typeof fetch,
   token: string,
@@ -86,7 +95,7 @@ export async function readLatestInbound(
   threadId: string,
   ownerEmail: string,
   fetchImpl: typeof fetch = fetch,
-): Promise<InboundEmail | null> {
+): Promise<{ email: InboundEmail; signals: MailSignals } | null> {
   const messages = await getThread(fetchImpl, token, threadId);
   const owner = ownerEmail.trim().toLowerCase();
 
@@ -107,15 +116,19 @@ export async function readLatestInbound(
     // Gmail message id so the idempotency key is always present.
     const rfcId = header(headers, "Message-ID").trim();
     const toEmail = parseAddress(header(headers, "To"));
+    const signals = extractMailSignals(headers);
 
     return {
-      messageId: rfcId || msg.id || threadId,
-      threadId,
-      fromEmail,
-      ...(toEmail ? { toEmail } : {}),
-      subject: header(headers, "Subject"),
-      body,
-      receivedAt,
+      email: {
+        messageId: rfcId || msg.id || threadId,
+        threadId,
+        fromEmail,
+        ...(toEmail ? { toEmail } : {}),
+        subject: header(headers, "Subject"),
+        body,
+        receivedAt,
+      },
+      signals,
     };
   }
   return null;
