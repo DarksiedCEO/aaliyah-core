@@ -85,6 +85,8 @@ export async function classifyInbound(
   router: Pick<AaliyahModelRouter, "generate"> | MinimalRouter,
   email: InboundEmail,
 ): Promise<TriageResult> {
+  // KNOWN LIMITATION (slice): untrusted-body fencing is prompt-level; a literal </email> in the body can escape it.
+  // Follow-up: sanitize/escape the body before fencing.
   const prompt = [
     "<email>",
     `From: ${email.fromEmail}`,

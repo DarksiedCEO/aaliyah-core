@@ -30,7 +30,7 @@ async function runStatus(): Promise<void> {
   console.log("Aaliyah local runner — status\n");
   console.log(`Database URL:    ${cfg.databaseUrl}`);
   console.log(`Redirect URI:    ${cfg.redirectUri}`);
-  console.log(`Anthropic key:   ${cfg.hasAnthropicKey ? "present (model-assisted drafts)" : "absent (deterministic drafts)"}`);
+  console.log(`Anthropic key:   ${cfg.hasAnthropicKey ? "present (model-assisted drafts)" : "absent (drafting review-only — degraded)"}`);
 
   if (cfg.hasAnthropicKey) {
     const tiers = resolveConfiguredModels(process.env);
