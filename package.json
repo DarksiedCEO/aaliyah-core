@@ -20,7 +20,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --require ts-node/register --test tests/**/*.test.ts",
+    "test": "node --require ts-node/register --test tests/*.test.ts tests/*/*.test.ts",
     "start": "node dist/src/server.js",
     "aaliyah": "node --require ts-node/register local-runner/aaliyah.ts",
     "connect": "node --require ts-node/register local-runner/aaliyah.ts connect",
