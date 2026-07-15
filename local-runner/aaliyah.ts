@@ -4,6 +4,7 @@ import { runMailMigrations } from "../src/persistence/postgres/migrations";
 import { loadLocalEnv, readConnection } from "./env";
 import { runConnect } from "./connect";
 import { runDraftInbox } from "./draftInbox";
+import { runInitProfile } from "./initProfile";
 
 /* eslint-disable no-console */
 
@@ -72,6 +73,9 @@ async function main(): Promise<void> {
     case "status":
       await runStatus();
       break;
+    case "init-profile":
+      runInitProfile();
+      break;
     default:
       console.log(
         [
@@ -81,6 +85,7 @@ async function main(): Promise<void> {
           "  connect                                      Link your Gmail (one-time browser approval)",
           "  draft-inbox [--limit N] [--query Q] [--dry-run]   Draft replies for recent inbox mail (never sends)",
           "                                               --dry-run previews only; creates nothing",
+          "  init-profile                                 Create the editable CEO profile (chmod 600)",
           "  status                                       Show connection + environment health",
         ].join("\n"),
       );
