@@ -12,10 +12,11 @@ ok()   { printf 'PASS  %s\n' "$1"; }
 bad()  { printf 'FAIL  %s\n' "$1"; fail=1; }
 
 # 1. Frozen-file integrity — the fortress doctrine must be byte-identical.
-if shasum -a 256 -c .aegis-frozen.sha256 >/tmp/frozen.out 2>&1; then
-  ok "frozen files byte-identical ($(wc -l < .aegis-frozen.sha256 | tr -d ' ') pinned)"
+if scripts/aegis-frozen.sh verify >/tmp/frozen.out 2>&1; then
+  ok "$(cat /tmp/frozen.out)"
 else
-  bad "frozen file(s) changed:"; grep -v ': OK$' /tmp/frozen.out | sed 's/^/    /'
+  bad "frozen manifest verification failed:"
+  sed 's/^/    /' /tmp/frozen.out
 fi
 
 # 2. No production file-backed state — Postgres is the sole durable store.
@@ -66,6 +67,14 @@ if [ -z "$WF" ]; then
   ok "no core->aaliyah-workflows code dependency"
 else
   bad "core references aaliyah-workflows:"; echo "$WF" | sed 's/^/    /'
+fi
+
+# 7. Shared completion contracts must resolve to the exact reviewed candidate.
+if scripts/contracts-provenance.sh >/tmp/contracts-provenance.out 2>&1; then
+  ok "$(cat /tmp/contracts-provenance.out)"
+else
+  bad "Contracts provenance mismatch:"
+  sed 's/^/    /' /tmp/contracts-provenance.out
 fi
 
 echo

@@ -48,10 +48,29 @@ test("generic completion cannot masquerade as verified execution", async () => {
     /successful_execution_requires_verified_completion/,
   );
 
-  const result = {
-    success: true,
+  const validReceipt = {
+    contractVersion: "aaliyah.postcondition-verification/v1" as const,
+    verified: true as const,
+    tenantId: "tenant_123",
+    workspaceId: "tenant_123:default",
     taskId: "550e8400-e29b-41d4-a716-446655440030",
     idempotencyKey: "idem-exec",
+    executionReceiptId: "provider-execution-30",
+    executorId: "provider-executor-v1",
+    externalRefs: ["provider:1"],
+    verifierId: "readback",
+    verificationMethod: "independent_readback" as const,
+    verifiedAt: new Date().toISOString(),
+  };
+  const result = {
+    success: true,
+    tenantId: validReceipt.tenantId,
+    workspaceId: validReceipt.workspaceId,
+    taskId: validReceipt.taskId,
+    idempotencyKey: validReceipt.idempotencyKey,
+    executionReceiptId: validReceipt.executionReceiptId,
+    executorId: validReceipt.executorId,
+    verificationReceipt: validReceipt,
     approvalState: "not_required" as const,
     externalRefs: ["provider:1"],
     postconditionsMet: true,
@@ -60,14 +79,10 @@ test("generic completion cannot masquerade as verified execution", async () => {
   };
   await assert.rejects(
     () => recordVerifiedExecutionResult("idem-exec", result, {
+      ...validReceipt,
       verified: false,
-      taskId: result.taskId,
-      idempotencyKey: result.idempotencyKey,
-      externalRefs: result.externalRefs,
-      verifier: "readback",
-      verifiedAt: new Date().toISOString(),
-    }),
-    /postcondition_not_verified/,
+    } as never, { nowMs: Date.now() }),
+    /Invalid input/,
   );
 });
 
@@ -76,39 +91,54 @@ test("raw completion writer is not exported", () => {
 });
 
 test("persistence independently rejects invalid verification receipts", async () => {
-  const result = {
-    success: true,
+  const validReceipt = {
+    contractVersion: "aaliyah.postcondition-verification/v1" as const,
+    verified: true as const,
+    tenantId: "tenant_123",
+    workspaceId: "tenant_123:default",
     taskId: "550e8400-e29b-41d4-a716-446655440031",
     idempotencyKey: "550e8400-e29b-41d4-a716-446655440031",
+    executionReceiptId: "provider-execution-31",
+    executorId: "provider-executor-v1",
+    externalRefs: ["provider:1", "provider:2"],
+    verifierId: "provider-readback-v1",
+    verificationMethod: "independent_readback" as const,
+    verifiedAt: new Date().toISOString(),
+  };
+  const result = {
+    success: true,
+    tenantId: validReceipt.tenantId,
+    workspaceId: validReceipt.workspaceId,
+    taskId: validReceipt.taskId,
+    idempotencyKey: validReceipt.idempotencyKey,
+    executionReceiptId: validReceipt.executionReceiptId,
+    executorId: validReceipt.executorId,
+    verificationReceipt: validReceipt,
     approvalState: "not_required" as const,
     externalRefs: ["provider:1", "provider:2"],
     postconditionsMet: true,
     escalated: false,
     message: "verified",
   };
-  const validReceipt = {
-    verified: true,
-    taskId: result.taskId,
-    idempotencyKey: result.idempotencyKey,
-    externalRefs: [...result.externalRefs],
-    verifier: "provider-readback-v1",
-    verifiedAt: new Date().toISOString(),
-  };
-
   const invalidReceipts = [
     { ...validReceipt, verifiedAt: "2020-01-01T00:00:00.000Z" },
     { ...validReceipt, externalRefs: ["provider:1"] },
     { ...validReceipt, externalRefs: ["provider:1", "provider:1"] },
-    { ...validReceipt, verifier: "" },
+    { ...validReceipt, verifierId: "" },
+    { ...validReceipt, executionReceiptId: "provider-execution-other" },
     {
       ...validReceipt,
       taskId: "550e8400-e29b-41d4-a716-446655440999",
     },
   ];
   for (const receipt of invalidReceipts) {
-    await assert.rejects(
-      () => recordVerifiedExecutionResult(result.idempotencyKey, result, receipt),
-      /postcondition_receipt_/,
+    await assert.rejects(() =>
+      recordVerifiedExecutionResult(
+        result.idempotencyKey,
+        result,
+        receipt as never,
+        { nowMs: Date.now() },
+      ),
     );
   }
 });
@@ -132,25 +162,42 @@ test("verified execution persists a stable envelope and run replay unwraps resul
   };
   await ensureIdempotentExecution(task.taskId, task, task.taskType, scope);
 
-  const result = {
-    success: true,
+  const receipt = {
+    contractVersion: "aaliyah.postcondition-verification/v1" as const,
+    verified: true as const,
+    tenantId: task.tenantId,
+    workspaceId: scope.workspaceId,
     taskId: task.taskId,
     idempotencyKey: task.taskId,
+    executionReceiptId: "provider-execution-32",
+    executorId: "provider-executor-v1",
+    externalRefs: ["provider:verified-32"],
+    verifierId: "provider-readback-v1",
+    verificationMethod: "independent_readback" as const,
+    verifiedAt: new Date().toISOString(),
+  };
+  const result = {
+    success: true,
+    tenantId: task.tenantId,
+    workspaceId: scope.workspaceId,
+    taskId: task.taskId,
+    idempotencyKey: task.taskId,
+    executionReceiptId: receipt.executionReceiptId,
+    executorId: receipt.executorId,
+    verificationReceipt: receipt,
     approvalState: "not_required" as const,
     externalRefs: ["provider:verified-32"],
     postconditionsMet: true,
     escalated: false,
     message: "verified execution",
   };
-  const receipt = {
-    verified: true,
-    taskId: task.taskId,
-    idempotencyKey: task.taskId,
-    externalRefs: [...result.externalRefs],
-    verifier: "provider-readback-v1",
-    verifiedAt: new Date().toISOString(),
-  };
-  await recordVerifiedExecutionResult(task.taskId, result, receipt, scope);
+  await recordVerifiedExecutionResult(
+    task.taskId,
+    result,
+    receipt,
+    { nowMs: Date.now() },
+    scope,
+  );
 
   const stored = await ensureIdempotentExecution<{
     kind: string;
@@ -164,7 +211,7 @@ test("verified execution persists a stable envelope and run replay unwraps resul
   assert.deepEqual(await runAaliyahTask(task), result);
 });
 
-test("historical verified envelope remains replayable after freshness window", async () => {
+test("historical verified envelope is rejected after freshness window", async () => {
   const task = {
     taskId: "550e8400-e29b-41d4-a716-446655440033",
     tenantId: "tenant_123",
@@ -181,52 +228,83 @@ test("historical verified envelope remains replayable after freshness window", a
     tenantId: task.tenantId,
     workspaceId: `${task.tenantId}:default`,
   };
-  const result = {
-    success: true,
+  const verifiedAt = "2026-04-18T12:01:00.000Z";
+  const receipt = {
+    contractVersion: "aaliyah.postcondition-verification/v1" as const,
+    verified: true as const,
+    tenantId: task.tenantId,
+    workspaceId: scope.workspaceId,
     taskId: task.taskId,
     idempotencyKey: task.taskId,
+    executionReceiptId: "provider-execution-33",
+    executorId: "provider-executor-v1",
+    externalRefs: ["provider:verified-33"],
+    verifierId: "provider-readback-v1",
+    verificationMethod: "independent_readback" as const,
+    verifiedAt,
+  };
+  const result = {
+    success: true,
+    tenantId: task.tenantId,
+    workspaceId: scope.workspaceId,
+    taskId: task.taskId,
+    idempotencyKey: task.taskId,
+    executionReceiptId: receipt.executionReceiptId,
+    executorId: receipt.executorId,
+    verificationReceipt: receipt,
     approvalState: "not_required" as const,
     externalRefs: ["provider:verified-33"],
     postconditionsMet: true,
     escalated: false,
     message: "historically verified execution",
   };
-  const verifiedAt = "2026-04-18T12:01:00.000Z";
-  const receipt = {
-    verified: true,
-    taskId: task.taskId,
-    idempotencyKey: task.taskId,
-    externalRefs: [...result.externalRefs],
-    verifier: "provider-readback-v1",
-    verifiedAt,
-  };
 
   await ensureIdempotentExecution(task.taskId, task, task.taskType, scope);
   const nowMock = mock.method(Date, "now", () => Date.parse(verifiedAt));
-  await recordVerifiedExecutionResult(task.taskId, result, receipt, scope);
+  await recordVerifiedExecutionResult(
+    task.taskId,
+    result,
+    receipt,
+    { nowMs: Date.parse(verifiedAt) },
+    scope,
+  );
   nowMock.mock.restore();
 
-  assert.deepEqual(await runAaliyahTask(task), result);
+  await assert.rejects(
+    () => runAaliyahTask(task),
+    /verified_execution_record_invalid/,
+  );
 });
 
 test("durable replay still rejects structurally invalid verification envelopes", () => {
-  const result = {
-    success: true,
+  const receipt = {
+    contractVersion: "aaliyah.postcondition-verification/v1" as const,
+    verified: true as const,
+    tenantId: "tenant_123",
+    workspaceId: "tenant_123:default",
     taskId: "550e8400-e29b-41d4-a716-446655440034",
     idempotencyKey: "550e8400-e29b-41d4-a716-446655440034",
+    executionReceiptId: "provider-execution-34",
+    executorId: "provider-executor-v1",
+    externalRefs: ["provider:1", "provider:2"],
+    verifierId: "provider-readback-v1",
+    verificationMethod: "independent_readback" as const,
+    verifiedAt: "2026-04-18T12:01:00.000Z",
+  };
+  const result = {
+    success: true,
+    tenantId: receipt.tenantId,
+    workspaceId: receipt.workspaceId,
+    taskId: receipt.taskId,
+    idempotencyKey: receipt.idempotencyKey,
+    executionReceiptId: receipt.executionReceiptId,
+    executorId: receipt.executorId,
+    verificationReceipt: receipt,
     approvalState: "not_required" as const,
     externalRefs: ["provider:1", "provider:2"],
     postconditionsMet: true,
     escalated: false,
     message: "verified execution",
-  };
-  const receipt = {
-    verified: true,
-    taskId: result.taskId,
-    idempotencyKey: result.idempotencyKey,
-    externalRefs: [...result.externalRefs],
-    verifier: "provider-readback-v1",
-    verifiedAt: "2026-04-18T12:01:00.000Z",
   };
   const envelope = {
     kind: "verified_execution" as const,
@@ -246,13 +324,17 @@ test("durable replay still rejects structurally invalid verification envelopes",
         externalRefs: ["provider:1", "provider:1"],
       },
     },
-    { ...envelope, receipt: { ...receipt, verifier: "" } },
+    { ...envelope, receipt: { ...receipt, verifierId: "" } },
     { ...envelope, receipt: { ...receipt, taskId: crypto.randomUUID() } },
     { ...envelope, receipt: { ...receipt, verifiedAt: "not-a-timestamp" } },
   ];
 
   for (const invalid of invalidEnvelopes) {
-    assert.throws(() => parseVerifiedExecutionRecord(invalid));
+    assert.throws(() =>
+      parseVerifiedExecutionRecord(invalid, {
+        nowMs: Date.parse(receipt.verifiedAt),
+      }),
+    );
   }
 });
 

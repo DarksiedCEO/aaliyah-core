@@ -1,6 +1,8 @@
 import type { Candidate, ExecutionResult } from "@aaliyah/contracts/v1";
 
 type ExecuteOptions = {
+  tenantId: string;
+  workspaceId: string;
   taskId: string;
   idempotencyKey: string;
 };
@@ -27,8 +29,14 @@ export async function executeIdempotent(
   const result = raw as Partial<ExecutionResult>;
   if (
     result.success !== true ||
+    result.tenantId !== options.tenantId ||
+    result.workspaceId !== options.workspaceId ||
     result.taskId !== options.taskId ||
     result.idempotencyKey !== options.idempotencyKey ||
+    typeof result.executionReceiptId !== "string" ||
+    result.executionReceiptId.length === 0 ||
+    typeof result.executorId !== "string" ||
+    result.executorId.length === 0 ||
     !Array.isArray(result.externalRefs) ||
     result.externalRefs.length === 0 ||
     result.externalRefs.some((ref) => typeof ref !== "string" || ref.length === 0)
@@ -39,8 +47,12 @@ export async function executeIdempotent(
   return {
     ...result,
     success: false,
+    tenantId: options.tenantId,
+    workspaceId: options.workspaceId,
     taskId: options.taskId,
     idempotencyKey: options.idempotencyKey,
+    executionReceiptId: result.executionReceiptId,
+    executorId: result.executorId,
     approvalState: result.approvalState ?? "not_required",
     externalRefs: result.externalRefs,
     postconditionsMet: false,

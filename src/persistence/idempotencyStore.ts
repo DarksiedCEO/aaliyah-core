@@ -4,7 +4,9 @@ import { Pool } from "pg";
 import { scopedKey, type TenantScope } from "./tenantScopedStore";
 import {
   ExecutionResultSchema,
+  parseVerifiedExecutionRecordV1,
   type ExecutionResult,
+  type VerifiedExecutionRecordV1,
 } from "@aaliyah/contracts/v1";
 import {
   type PostconditionReceipt,
@@ -323,6 +325,7 @@ export async function recordVerifiedExecutionResult(
   idempotencyKey: string,
   result: ExecutionResult,
   receipt: PostconditionReceipt,
+  options: { nowMs: number },
   scope?: TenantScope,
 ): Promise<void> {
   if (
@@ -333,7 +336,7 @@ export async function recordVerifiedExecutionResult(
     throw new Error("verified_execution_completion_invariant_failed");
   }
 
-  validatePostconditionReceipt(result.taskId, result, receipt);
+  validatePostconditionReceipt(result.taskId, result, receipt, options);
   const record: VerifiedExecutionRecord = {
     kind: "verified_execution",
     version: 1,
@@ -343,34 +346,16 @@ export async function recordVerifiedExecutionResult(
   await markCompleted(idempotencyKey, record, scope);
 }
 
-export type VerifiedExecutionRecord = {
-  kind: "verified_execution";
-  version: 1;
-  result: ExecutionResult;
-  receipt: PostconditionReceipt;
-};
+export type VerifiedExecutionRecord = VerifiedExecutionRecordV1;
 
 export function parseVerifiedExecutionRecord(
   raw: unknown,
+  options: { nowMs: number },
 ): VerifiedExecutionRecord {
-  if (
-    raw === null ||
-    typeof raw !== "object" ||
-    !("kind" in raw) ||
-    raw.kind !== "verified_execution" ||
-    !("version" in raw) ||
-    raw.version !== 1 ||
-    !("result" in raw) ||
-    !("receipt" in raw)
-  ) {
-    throw new Error("verified_execution_record_invalid");
-  }
-
-  const result = ExecutionResultSchema.parse(raw.result);
-  const receipt = raw.receipt as PostconditionReceipt;
-  validatePostconditionReceipt(result.taskId, result, receipt, {
-    enforceFreshness: false,
-  });
+  const record = parseVerifiedExecutionRecordV1(raw, options);
+  const result = ExecutionResultSchema.parse(record.result);
+  const receipt = record.receipt;
+  validatePostconditionReceipt(result.taskId, result, receipt, options);
   return { kind: "verified_execution", version: 1, result, receipt };
 }
 

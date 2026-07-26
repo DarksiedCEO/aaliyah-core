@@ -123,7 +123,9 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
 
   if (idempotency.replay && idempotency.result) {
     logger.info({ taskId: task.taskId }, "aaliyah.task.replayed");
-    return parseVerifiedExecutionRecord(idempotency.result).result;
+    return parseVerifiedExecutionRecord(idempotency.result, {
+      nowMs: Date.now(),
+    }).result;
   }
 
   try {
@@ -257,6 +259,8 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
     if (shadowModeEnabled()) {
       const shadowResult = {
         success: false,
+        tenantId: task.tenantId,
+        workspaceId: tenant.workspaceId,
         taskId: task.taskId,
         idempotencyKey: task.taskId,
         approvalState: "not_required" as const,
@@ -307,6 +311,8 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
     }
 
     const execution = await executeIdempotent(top.candidate, {
+      tenantId: task.tenantId,
+      workspaceId: tenant.workspaceId,
       taskId: task.taskId,
       idempotencyKey: task.taskId,
     });
@@ -315,12 +321,18 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
       throw new Error("unverified_execution_result");
     }
 
-    const receipt = await verifyPostconditions(task, execution);
+    const verificationNowMs = Date.now();
+    const receipt = await verifyPostconditions(
+      task,
+      execution,
+      { nowMs: verificationNowMs },
+    );
     const postconditionsMet = receipt.verified;
     const finalResult: ExecutionResult = {
       ...execution,
       success: postconditionsMet,
       postconditionsMet,
+      verificationReceipt: receipt,
     };
     const finalResultWithTelemetry = {
       ...finalResult,
@@ -370,6 +382,7 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
       task.taskId,
       finalResultWithTelemetry,
       receipt,
+      { nowMs: verificationNowMs },
       idempotencyScope,
     );
     logger.info({ taskId: task.taskId }, "aaliyah.task.completed");

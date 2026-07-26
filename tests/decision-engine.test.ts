@@ -407,6 +407,8 @@ const executionCandidate = {
 test("no executor configured never reports success", async () => {
   await assert.rejects(
     () => executeIdempotent(executionCandidate, {
+      tenantId: "tenant_123",
+      workspaceId: "tenant_123:default",
       taskId: "550e8400-e29b-41d4-a716-446655440020",
       idempotencyKey: "idem-20",
     }),
@@ -420,6 +422,8 @@ test("executor throw and ambiguous result never report success", async () => {
   };
   await assert.rejects(
     () => executeIdempotent(executionCandidate, {
+      tenantId: "tenant_123",
+      workspaceId: "tenant_123:default",
       taskId: "550e8400-e29b-41d4-a716-446655440021",
       idempotencyKey: "idem-21",
     }, throwingExecutor),
@@ -429,6 +433,8 @@ test("executor throw and ambiguous result never report success", async () => {
   const ambiguousExecutor = async () => ({ success: true });
   await assert.rejects(
     () => executeIdempotent(executionCandidate, {
+      tenantId: "tenant_123",
+      workspaceId: "tenant_123:default",
       taskId: "550e8400-e29b-41d4-a716-446655440021",
       idempotencyKey: "idem-21",
     }, ambiguousExecutor),
@@ -442,11 +448,17 @@ test("execution remains unsuccessful until independent read-back verifies it", a
     idempotencyKey: string;
   }) => ({
     success: true,
+    tenantId: "tenant_123",
+    workspaceId: "tenant_123:default",
     taskId: options.taskId,
     idempotencyKey: options.idempotencyKey,
+    executionReceiptId: "provider-execution-1",
+    executorId: "provider-executor-v1",
     externalRefs: ["provider:receipt-1"],
   });
   const result = await executeIdempotent(executionCandidate, {
+    tenantId: "tenant_123",
+    workspaceId: "tenant_123:default",
     taskId: "550e8400-e29b-41d4-a716-446655440022",
     idempotencyKey: "idem-22",
   }, executor);
@@ -466,48 +478,75 @@ test("execution remains unsuccessful until independent read-back verifies it", a
     createdAt: "2026-04-18T12:00:00.000Z",
   };
   await assert.rejects(
-    () => verifyPostconditions(task, result),
+    () => verifyPostconditions(task, result, { nowMs: Date.now() }),
     /postcondition_verifier_unavailable/,
   );
 
   const mismatchVerifier = async () => ({
+    contractVersion: "aaliyah.postcondition-verification/v1",
     verified: false,
+    tenantId: result.tenantId,
+    workspaceId: result.workspaceId,
     taskId: task.taskId,
     idempotencyKey: result.idempotencyKey,
+    executionReceiptId: result.executionReceiptId,
+    executorId: result.executorId,
     externalRefs: ["provider:receipt-1"],
-    verifier: "test-readback",
+    verifierId: "test-readback",
+    verificationMethod: "independent_readback",
     verifiedAt: new Date().toISOString(),
     reason: "read-back mismatch",
   });
   await assert.rejects(
-    () => verifyPostconditions(task, result, mismatchVerifier),
-    /postcondition_not_verified/,
+    () => verifyPostconditions(task, result, { nowMs: Date.now() }, mismatchVerifier),
+    /Invalid input/,
   );
 
   const partialVerifier = async () => ({
+    contractVersion: "aaliyah.postcondition-verification/v1",
     verified: true,
+    tenantId: result.tenantId,
+    workspaceId: result.workspaceId,
     taskId: task.taskId,
     idempotencyKey: result.idempotencyKey,
+    executionReceiptId: result.executionReceiptId,
+    executorId: result.executorId,
     externalRefs: ["provider:different-receipt"],
-    verifier: "test-readback",
+    verifierId: "test-readback",
+    verificationMethod: "independent_readback",
     verifiedAt: new Date().toISOString(),
   });
   await assert.rejects(
-    () => verifyPostconditions(task, result, partialVerifier),
-    /postcondition_receipt_ref_coverage_invalid/,
+    () => verifyPostconditions(task, result, { nowMs: Date.now() }, partialVerifier),
+    /postcondition_verification_ref_coverage_invalid/,
   );
 
   const exactVerifier = async () => ({
+    contractVersion: "aaliyah.postcondition-verification/v1",
     verified: true,
+    tenantId: result.tenantId,
+    workspaceId: result.workspaceId,
     taskId: task.taskId,
     idempotencyKey: result.idempotencyKey,
+    executionReceiptId: result.executionReceiptId,
+    executorId: result.executorId,
     externalRefs: ["provider:receipt-1"],
-    verifier: "test-readback",
+    verifierId: "test-readback",
+    verificationMethod: "independent_readback",
     verifiedAt: new Date().toISOString(),
   });
   assert.equal(
-    (await verifyPostconditions(task, result, exactVerifier)).verified,
+    (await verifyPostconditions(task, result, { nowMs: Date.now() }, exactVerifier)).verified,
     true,
+  );
+
+  const selfVerifier = async () => ({
+    ...(await exactVerifier()),
+    verifierId: result.executorId,
+  });
+  await assert.rejects(
+    () => verifyPostconditions(task, result, { nowMs: Date.now() }, selfVerifier),
+    /verifier must be independent from executor/,
   );
 
   const forgedVerifier = async () => ({
@@ -515,8 +554,8 @@ test("execution remains unsuccessful until independent read-back verifies it", a
     taskId: "550e8400-e29b-41d4-a716-446655440999",
   });
   await assert.rejects(
-    () => verifyPostconditions(task, result, forgedVerifier),
-    /postcondition_receipt_binding_invalid/,
+    () => verifyPostconditions(task, result, { nowMs: Date.now() }, forgedVerifier),
+    /postcondition_verification_binding_invalid/,
   );
 
   const staleVerifier = async () => ({
@@ -524,8 +563,8 @@ test("execution remains unsuccessful until independent read-back verifies it", a
     verifiedAt: "2020-01-01T00:00:00.000Z",
   });
   await assert.rejects(
-    () => verifyPostconditions(task, result, staleVerifier),
-    /postcondition_receipt_stale/,
+    () => verifyPostconditions(task, result, { nowMs: Date.now() }, staleVerifier),
+    /postcondition_verification_receipt_stale/,
   );
 });
 

@@ -12,6 +12,8 @@ export async function requestApproval(
 ): Promise<ExecutionResult> {
   return {
     success: false,
+    tenantId: task.tenantId,
+    workspaceId: task.workspaceId ?? `${task.tenantId}:default`,
     taskId: task.taskId,
     idempotencyKey: task.taskId,
     approvalState: "pending",
