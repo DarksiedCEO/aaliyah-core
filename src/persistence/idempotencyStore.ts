@@ -2,6 +2,14 @@ import crypto from "node:crypto";
 import { Pool } from "pg";
 
 import { scopedKey, type TenantScope } from "./tenantScopedStore";
+import {
+  ExecutionResultSchema,
+  type ExecutionResult,
+} from "@aaliyah/contracts/v1";
+import {
+  type PostconditionReceipt,
+  validatePostconditionReceipt,
+} from "../services/verifyPostconditions";
 
 type IdempotencyRecord = {
   requestHash: string;
@@ -265,7 +273,7 @@ async function updateInMemoryResult(
   });
 }
 
-export async function markCompleted(
+async function markCompleted(
   idempotencyKey: string,
   result: unknown,
   scope?: TenantScope,
@@ -300,7 +308,70 @@ export async function recordIdempotentResult(
   result: unknown,
   scope?: TenantScope,
 ): Promise<void> {
+  if (
+    result !== null &&
+    typeof result === "object" &&
+    "success" in result &&
+    (result as { success?: unknown }).success === true
+  ) {
+    throw new Error("successful_execution_requires_verified_completion");
+  }
   await markCompleted(idempotencyKey, result, scope);
+}
+
+export async function recordVerifiedExecutionResult(
+  idempotencyKey: string,
+  result: ExecutionResult,
+  receipt: PostconditionReceipt,
+  scope?: TenantScope,
+): Promise<void> {
+  if (
+    result.success !== true ||
+    result.postconditionsMet !== true ||
+    receipt.idempotencyKey !== idempotencyKey
+  ) {
+    throw new Error("verified_execution_completion_invariant_failed");
+  }
+
+  validatePostconditionReceipt(result.taskId, result, receipt);
+  const record: VerifiedExecutionRecord = {
+    kind: "verified_execution",
+    version: 1,
+    result,
+    receipt,
+  };
+  await markCompleted(idempotencyKey, record, scope);
+}
+
+export type VerifiedExecutionRecord = {
+  kind: "verified_execution";
+  version: 1;
+  result: ExecutionResult;
+  receipt: PostconditionReceipt;
+};
+
+export function parseVerifiedExecutionRecord(
+  raw: unknown,
+): VerifiedExecutionRecord {
+  if (
+    raw === null ||
+    typeof raw !== "object" ||
+    !("kind" in raw) ||
+    raw.kind !== "verified_execution" ||
+    !("version" in raw) ||
+    raw.version !== 1 ||
+    !("result" in raw) ||
+    !("receipt" in raw)
+  ) {
+    throw new Error("verified_execution_record_invalid");
+  }
+
+  const result = ExecutionResultSchema.parse(raw.result);
+  const receipt = raw.receipt as PostconditionReceipt;
+  validatePostconditionReceipt(result.taskId, result, receipt, {
+    enforceFreshness: false,
+  });
+  return { kind: "verified_execution", version: 1, result, receipt };
 }
 
 export async function recordIdempotentFailure(

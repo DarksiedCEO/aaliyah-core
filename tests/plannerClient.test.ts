@@ -32,15 +32,14 @@ const request = {
   availableTools: [],
 };
 
-test("plannerClient falls back when client is unconfigured", async () => {
+test("plannerClient fails closed when client is unconfigured", async () => {
   const originalKey = process.env.OPENAI_API_KEY;
   delete process.env.OPENAI_API_KEY;
 
-  const result = await plannerClient(request);
-
-  assert.equal(result.telemetry.fallbackReason, "unconfigured_client");
-  assert.equal(result.telemetry.plannerMode, "deterministic_fallback");
-  assert.equal(result.response.candidates.length, 1);
+  await assert.rejects(
+    () => plannerClient(request),
+    /planner_failed_closed:unconfigured_client/,
+  );
 
   process.env.OPENAI_API_KEY = originalKey;
 });
@@ -55,9 +54,10 @@ test("plannerClient classifies invalid structured output", async () => {
     },
   }) as never);
 
-  const result = await plannerClient(request);
-
-  assert.equal(result.telemetry.fallbackReason, "invalid_json");
+  await assert.rejects(
+    () => plannerClient(request),
+    /planner_failed_closed:invalid_json/,
+  );
   restore.mock.restore();
   process.env.OPENAI_API_KEY = originalKey;
 });
@@ -78,9 +78,10 @@ test("plannerClient classifies schema validation failure", async () => {
     },
   }) as never);
 
-  const result = await plannerClient(request);
-
-  assert.equal(result.telemetry.fallbackReason, "schema_validation_failed");
+  await assert.rejects(
+    () => plannerClient(request),
+    /planner_failed_closed:schema_validation_failed/,
+  );
   restore.mock.restore();
   process.env.OPENAI_API_KEY = originalKey;
 });
@@ -97,9 +98,10 @@ test("plannerClient classifies timeout failures", async () => {
     },
   }) as never);
 
-  const result = await plannerClient(request);
-
-  assert.equal(result.telemetry.fallbackReason, "timeout");
+  await assert.rejects(
+    () => plannerClient(request),
+    /planner_failed_closed:timeout/,
+  );
   restore.mock.restore();
   process.env.OPENAI_API_KEY = originalKey;
 });

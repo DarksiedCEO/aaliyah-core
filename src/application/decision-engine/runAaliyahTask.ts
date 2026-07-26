@@ -27,8 +27,10 @@ import {
 } from "../../services/buildEvidence";
 import {
   ensureIdempotentExecution,
+  parseVerifiedExecutionRecord,
   recordIdempotentFailure,
-  recordIdempotentResult,
+  recordVerifiedExecutionResult,
+  type VerifiedExecutionRecord,
 } from "../../persistence/idempotencyStore";
 import { rankEvidenceSources } from "../../ranking/rankEvidenceSources";
 import { plannerClient } from "../planner/plannerClient";
@@ -46,6 +48,33 @@ function defaultPlannerPolicy(): PlannerPolicy {
 
 function shadowModeEnabled(): boolean {
   return process.env.AALIYAH_SHADOW_MODE === "true";
+}
+
+export function assertPlannerGrounding(
+  response: Awaited<ReturnType<typeof plannerClient>>["response"],
+  evidenceSourceIds: Set<string>,
+  availableTools: string[],
+): void {
+  const allowedTools = new Set(availableTools);
+  for (const candidate of response.candidates) {
+    if (
+      candidate.evidenceRefs.some(
+        (ref) =>
+          ref.sourceId.startsWith("synthetic:") ||
+          !evidenceSourceIds.has(ref.sourceId),
+      )
+    ) {
+      throw new Error("planner_evidence_reference_ungrounded");
+    }
+
+    const requestedTool = candidate.args.tool;
+    if (
+      requestedTool !== undefined &&
+      (typeof requestedTool !== "string" || !allowedTools.has(requestedTool))
+    ) {
+      throw new Error("planner_tool_unsupported");
+    }
+  }
 }
 
 async function buildEvidenceWithPolicy(
@@ -85,13 +114,16 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
     workspaceId: tenant.workspaceId,
   };
   const executionId = crypto.randomUUID();
-  const idempotency = await ensureIdempotentExecution<ExecutionResult & {
-    plannerTelemetry?: unknown;
-  }>(task.taskId, task, task.taskType, idempotencyScope);
+  const idempotency = await ensureIdempotentExecution<VerifiedExecutionRecord>(
+    task.taskId,
+    task,
+    task.taskType,
+    idempotencyScope,
+  );
 
   if (idempotency.replay && idempotency.result) {
     logger.info({ taskId: task.taskId }, "aaliyah.task.replayed");
-    return idempotency.result;
+    return parseVerifiedExecutionRecord(idempotency.result).result;
   }
 
   try {
@@ -119,6 +151,11 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
     };
 
     const { response: plannerResponse, telemetry } = await plannerClient(plannerRequest);
+    assertPlannerGrounding(
+      plannerResponse,
+      new Set(evidence.sources.map((source) => source.sourceId)),
+      plannerRequest.availableTools,
+    );
 
     emitMetric("planner_latency_ms", telemetry.latencyMs, {
       planner_mode: telemetry.plannerMode,
@@ -171,7 +208,11 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
         outcome: responseWithTelemetry,
       });
 
-      await recordIdempotentResult(task.taskId, responseWithTelemetry, idempotencyScope);
+      await recordIdempotentFailure(
+        task.taskId,
+        "candidate_verification_failed",
+        idempotencyScope,
+      );
       return responseWithTelemetry;
     }
 
@@ -205,7 +246,11 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
         outcome: responseWithTelemetry,
       });
 
-      await recordIdempotentResult(task.taskId, responseWithTelemetry, idempotencyScope);
+      await recordIdempotentFailure(
+        task.taskId,
+        "approval_required",
+        idempotencyScope,
+      );
       return responseWithTelemetry;
     }
 
@@ -253,7 +298,11 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
         outcome: shadowResult,
       });
 
-      await recordIdempotentResult(task.taskId, shadowResult, idempotencyScope);
+      await recordIdempotentFailure(
+        task.taskId,
+        "shadow_mode_execution_skipped",
+        idempotencyScope,
+      );
       return shadowResult;
     }
 
@@ -262,9 +311,15 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
       idempotencyKey: task.taskId,
     });
 
-    const postconditionsMet = await verifyPostconditions(task, execution);
+    if (execution.success || execution.postconditionsMet) {
+      throw new Error("unverified_execution_result");
+    }
+
+    const receipt = await verifyPostconditions(task, execution);
+    const postconditionsMet = receipt.verified;
     const finalResult: ExecutionResult = {
       ...execution,
+      success: postconditionsMet,
       postconditionsMet,
     };
     const finalResultWithTelemetry = {
@@ -303,11 +358,20 @@ export async function runAaliyahTask(raw: unknown): Promise<ExecutionResult> {
         plannerTelemetry: telemetry,
       };
 
-      await recordIdempotentResult(task.taskId, recoveredWithTelemetry, idempotencyScope);
+      await recordIdempotentFailure(
+        task.taskId,
+        "postcondition_verification_failed",
+        idempotencyScope,
+      );
       return recoveredWithTelemetry;
     }
 
-    await recordIdempotentResult(task.taskId, finalResultWithTelemetry, idempotencyScope);
+    await recordVerifiedExecutionResult(
+      task.taskId,
+      finalResultWithTelemetry,
+      receipt,
+      idempotencyScope,
+    );
     logger.info({ taskId: task.taskId }, "aaliyah.task.completed");
     return finalResultWithTelemetry;
   } catch (error) {

@@ -6,15 +6,11 @@ import type {
 import { PlannerResponseSchema } from "@aaliyah/contracts/v1";
 
 import { logger } from "../../observability/logger";
-import { planTask } from "./planTask";
-
-// Replace this with your actual LLM client (OpenAI / etc.)
-async function callLLM(prompt: string): Promise<string> {
-  void prompt;
-
-  // TODO: wire real client
-  throw new Error("LLM client not implemented");
-}
+export const llmPlannerInternals: {
+  callLLM: ((prompt: string) => Promise<string>) | undefined;
+} = {
+  callLLM: undefined,
+};
 
 function buildPrompt(
   input: PlannerRequest,
@@ -53,8 +49,12 @@ export async function llmPlanner(
 ): Promise<PlannerResponse> {
   const prompt = buildPrompt(request, rankedEvidence);
 
+  if (!llmPlannerInternals.callLLM) {
+    throw new Error("planner_provider_unavailable");
+  }
+
   try {
-    const raw = await callLLM(prompt);
+    const raw = await llmPlannerInternals.callLLM(prompt);
 
     let parsed: unknown;
     try {
@@ -74,16 +74,10 @@ export async function llmPlanner(
 
     return result;
   } catch (error) {
-    logger.warn(
-      {
-        error: error instanceof Error ? error.message : String(error),
-      },
-      "planner.llm.fallback",
+    logger.error(
+      { error: error instanceof Error ? error.message : String(error) },
+      "planner.llm.failed_closed",
     );
-
-    return planTask({
-      request,
-      rankedEvidence,
-    });
+    throw error;
   }
 }

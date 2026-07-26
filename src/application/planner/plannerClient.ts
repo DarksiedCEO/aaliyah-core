@@ -53,46 +53,6 @@ function buildPrompt(request: PlannerRequest): string {
   ].join("\n");
 }
 
-function fallbackResponse(request: PlannerRequest): PlannerResponse {
-  return {
-    plannerVersion: "deterministic-fallback-v1",
-    candidates: [
-      {
-        name: "fallback_candidate",
-        description: `Fallback candidate for ${request.task.taskType}`,
-        args: {
-          requestedOutcome: request.task.requestedOutcome,
-        },
-        rationale:
-          "Fallback deterministic plan due to unavailable or invalid planner provider output.",
-        evidenceRefs: request.evidenceBundleId
-          ? [
-              {
-                sourceId: request.evidenceBundleId,
-                rationale: "Using available evidence bundle",
-              },
-            ]
-          : [
-              {
-                sourceId: "none",
-                rationale: "No evidence bundle available",
-              },
-            ],
-        goalFit: 78,
-        evidenceQuality: 70,
-        policyFit: 90,
-        expectedValue: 60,
-        reversibility: 85,
-        downsideRisk: 15,
-        ambiguity: 20,
-        contradictions: 0,
-        blockers: [],
-      },
-    ],
-    rejectedAlternatives: [],
-  };
-}
-
 function classifyFallbackReason(error: unknown): FallbackReason {
   if (error instanceof Error && error.message === "unconfigured_client") {
     return "unconfigured_client";
@@ -235,19 +195,7 @@ export async function plannerClient(
   } catch (error) {
     logger.warn({ err: error }, "planner.provider.failed");
 
-    const fallback = fallbackResponse(request);
-
-    const telemetry = PlannerTelemetrySchema.parse({
-      plannerMode: "deterministic_fallback",
-      plannerProvider: "openai",
-      fallbackReason: classifyFallbackReason(error),
-      latencyMs: plannerClientInternals.now() - start,
-      candidateCount: fallback.candidates.length,
-    });
-
-    return {
-      response: fallback,
-      telemetry,
-    };
+    const reason = classifyFallbackReason(error);
+    throw new Error(`planner_failed_closed:${reason}`, { cause: error });
   }
 }
