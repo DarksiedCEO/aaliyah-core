@@ -3,9 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-expected_sha="91a6c34b7e02cf9ffc9c17cc14db5f1a9a82d81d"
-expected_tree="b17d06771d6f5e1806e757cdd6e42d3d4069983f"
+expected_sha="5e9295a13cbd36c216d2b55a3d67c68d66122b53"
+expected_tree="fc6ed20237f5bde90f79bec47eefd5650cbf7237"
 expected_contract="aaliyah.postcondition-verification/v1"
+expected_executive_contract="aaliyah.executive-messaging/v1"
 contracts_repo="../aaliyah-contracts"
 
 [ -d "$contracts_repo/.git" ] || {
@@ -47,13 +48,16 @@ if ! pnpm -C "$build_root" build >"$build_root/build.log" 2>&1; then
   exit 1
 fi
 
-actual_contract="$(node -e '
+actual_contracts="$(node -e '
   const contracts = require("@aaliyah/contracts/v1");
-  process.stdout.write(contracts.POSTCONDITION_VERIFICATION_CONTRACT_VERSION ?? "");
+  process.stdout.write([
+    contracts.POSTCONDITION_VERIFICATION_CONTRACT_VERSION ?? "",
+    contracts.EXECUTIVE_MESSAGING_CONTRACT_VERSION ?? "",
+  ].join("|"));
 ')"
-[ "$actual_contract" = "$expected_contract" ] || {
-  printf 'FAIL  installed Contracts version mismatch: expected %s, got %s\n' \
-    "$expected_contract" "${actual_contract:-missing}" >&2
+[ "$actual_contracts" = "$expected_contract|$expected_executive_contract" ] || {
+  printf 'FAIL  installed Contracts version mismatch: expected %s|%s, got %s\n' \
+    "$expected_contract" "$expected_executive_contract" "${actual_contracts:-missing}" >&2
   exit 1
 }
 
@@ -72,5 +76,5 @@ diff -qr "$fresh_dist" "$installed_dist" >/dev/null || {
   exit 1
 }
 
-printf 'PASS  Contracts provenance %s tree %s (%s)\n' \
-  "$expected_sha" "$expected_tree" "$expected_contract"
+printf 'PASS  Contracts provenance %s tree %s (%s, %s)\n' \
+  "$expected_sha" "$expected_tree" "$expected_contract" "$expected_executive_contract"

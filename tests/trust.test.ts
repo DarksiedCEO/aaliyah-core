@@ -22,7 +22,6 @@ import {
   clearInboundDraftRuntime,
   configureInboundDraftRuntime,
   runInboundDraft,
-  inboundDraftInternals,
 } from "../src/application/inbound/runInboundDraft";
 import { idempotencyStoreInternals } from "../src/persistence/idempotencyStore";
 import { resetApplicationStoreForTests } from "../src/persistence/applicationState";
@@ -94,11 +93,7 @@ test("trust metrics summary reads scoped traces + quality (read-only)", async ()
   assert.ok(metrics.quality.total >= 3);
 });
 
-test("every authorized inbound draft carries authorization confidence and a decision trace", async () => {
-  const realCreate = inboundDraftInternals.createDraft;
-  const realToken = inboundDraftInternals.resolveAccessToken;
-  inboundDraftInternals.createDraft = async () => "draft_t1";
-  inboundDraftInternals.resolveAccessToken = () => "token";
+test("legacy inbound drafting cannot create confidence or decision evidence", async () => {
   configureInboundDraftRuntime({
     authorize: async () => ({
       allowed: true,
@@ -124,16 +119,13 @@ test("every authorized inbound draft carries authorization confidence and a deci
       },
     });
 
-    assert.equal(result.status, "awaiting_approval"); // low confidence still gated
+    assert.equal(result.status, "failed");
     assert.equal(result.autoSend, false);
-    assert.ok(result.confidence);
-    assert.equal(result.confidence!.label, "high");
+    assert.equal(result.confidence, undefined);
 
     const tracesAfter = (await readDecisionTraces({ tenantId: "tenant_c", workspaceId: "tenant_c:default" })).length;
-    assert.equal(tracesAfter, tracesBefore + 1);
+    assert.equal(tracesAfter, tracesBefore);
   } finally {
-    inboundDraftInternals.createDraft = realCreate;
-    inboundDraftInternals.resolveAccessToken = realToken;
     clearInboundDraftRuntime();
     idempotencyStoreInternals.resetInMemory();
   }

@@ -72,11 +72,13 @@ test("relationship context is supplied to the drafting system as advisory direct
   assert.match(relationshipDirectives(ctx), /Decision maker/);
 
   let capturedSystem = "";
+  let capturedPrompt = "";
   const router = new AaliyahModelRouter([
     {
       provider: "openai" as const,
       generate: async (req) => {
         capturedSystem = req.system ?? "";
+        capturedPrompt = req.prompt;
         return { text: "Hi Sam, ...", provider: "openai" as const, model: "m", latencyMs: 1 };
       },
     },
@@ -90,6 +92,7 @@ test("relationship context is supplied to the drafting system as advisory direct
     replyType: "first_touch",
   });
 
-  // The relationship context reached the generator (advisory, drafting only).
-  assert.match(capturedSystem, /writing to Sam/);
+  // Relationship context reaches only the untrusted prompt data boundary.
+  assert.doesNotMatch(capturedSystem, /Sam/);
+  assert.match(capturedPrompt, /Sam/);
 });

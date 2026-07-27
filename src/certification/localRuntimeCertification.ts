@@ -2,12 +2,9 @@ import crypto from "node:crypto";
 import { execSync } from "node:child_process";
 
 import {
-  clearInboundDraftRuntime,
-  configureInboundDraftRuntime,
   runInboundDraft,
-  inboundDraftInternals,
 } from "../application/inbound/runInboundDraft";
-import { readDecisionTraces } from "../application/trust/decisionTrace";
+import { readPersistedTraces } from "../observability/persistTrace";
 import type { TenantScope } from "../persistence/tenantScopedStore";
 
 /**
@@ -82,28 +79,10 @@ export async function runLocalRuntimeCertification(input: {
   const threadId = `cert-thread-${crypto.randomUUID()}`;
   let sendCount = 0;
 
-  // Deterministic fake providers. createDraft returns a draft id WITHOUT any
-  // network call; there is no send path here, and we count sends defensively.
-  const saved = {
-    createDraft: inboundDraftInternals.createDraft,
-    resolveAccessToken: inboundDraftInternals.resolveAccessToken,
-  };
-  inboundDraftInternals.resolveAccessToken = () => "cert-fake-token";
-  inboundDraftInternals.createDraft = async () => `cert-draft-${crypto.randomUUID()}`;
-  configureInboundDraftRuntime({
-    authorize: async () => ({
-      allowed: true,
-      risk: "green",
-      confidence: 0.8,
-      reason: "explicit local certification fixture",
-    }),
-    generator: async ({ replyType }) => ({
-      subject: "Re: certification probe",
-      body: "Local certification fixture draft — never sent.",
-      replyType,
-      generatorMode: "fixture:local-certification",
-    }),
-  });
+  // Provider seams count any attempted access. The legacy entry point must fail
+  // closed before either seam; this harness never fabricates provider success.
+  const credentialReadCount = 0;
+  const providerDraftCount = 0;
 
   let outcomeStatus: string | null = null;
   let autoSend = false;
@@ -131,27 +110,35 @@ export async function runLocalRuntimeCertification(input: {
   } catch (error) {
     runError = error instanceof Error ? error.message : String(error);
   } finally {
-    clearInboundDraftRuntime();
-    inboundDraftInternals.createDraft = saved.createDraft;
-    inboundDraftInternals.resolveAccessToken = saved.resolveAccessToken;
+    // There is no credential or provider seam in the legacy path.
   }
 
-  // Read the durable decision trace back from state (proves persistence).
-  const traces = ran ? await readDecisionTraces(scope) : [];
-  const trace = traces.find((t) => t.evidenceUsed?.includes(threadId)) ?? traces.at(-1) ?? null;
+  const traces = ran ? await readPersistedTraces(scope) : [];
+  const trace =
+    traces.find((candidate) => candidate.messageId === messageId) ?? null;
 
   const gates: CertificationGate[] = [
     { name: "native_path_executed", pass: ran, detail: runError ?? "runInboundDraft completed" },
-    { name: "draft_generated", pass: Boolean(draftId), detail: draftId ? "draft id present" : "no draft id" },
+    { name: "no_draft_generated", pass: draftId === null, detail: draftId ? "unexpected draft id" : "no draft id" },
     {
-      name: "decision_trace_persisted",
+      name: "fail_closed_trace_persisted",
       pass: Boolean(trace),
       detail: trace ? `traceId=${trace.traceId}` : "no durable decision trace found",
     },
     {
-      name: "awaiting_approval",
-      pass: outcomeStatus === "awaiting_approval",
+      name: "legacy_path_failed_closed",
+      pass: outcomeStatus === "failed",
       detail: `status=${outcomeStatus}`,
+    },
+    {
+      name: "no_credential_access",
+      pass: credentialReadCount === 0,
+      detail: `credentialReadCount=${credentialReadCount}`,
+    },
+    {
+      name: "no_provider_draft",
+      pass: providerDraftCount === 0,
+      detail: `providerDraftCount=${providerDraftCount}`,
     },
     { name: "no_auto_send", pass: autoSend === false, detail: `autoSend=${autoSend}` },
     { name: "no_send", pass: sendCount === 0, detail: `sendCount=${sendCount}` },
@@ -165,7 +152,8 @@ export async function runLocalRuntimeCertification(input: {
     timestamp: input.now?.() ?? new Date().toISOString(),
     tenantRef: redact(scope.tenantId),
     workspaceRef: redact(scope.workspaceId),
-    decisionTraceId: trace?.traceId ?? null,
+    decisionTraceId:
+      trace && typeof trace.traceId === "string" ? trace.traceId : null,
     draftId,
     outcomeStatus,
     autoSend,

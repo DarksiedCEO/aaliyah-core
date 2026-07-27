@@ -106,11 +106,13 @@ test("forbidden phrases are deterministically stripped from output", () => {
 
 test("selected style shapes the draft (directives reach the generator)", async () => {
   let capturedSystem = "";
+  let capturedPrompt = "";
   const router = new AaliyahModelRouter([
     {
       provider: "openai" as const,
       generate: async (req) => {
         capturedSystem = req.system ?? "";
+        capturedPrompt = req.prompt;
         return { text: "Cheers, here you go.", provider: "openai" as const, model: "m", latencyMs: 1 };
       },
     },
@@ -126,8 +128,9 @@ test("selected style shapes the draft (directives reach the generator)", async (
     replyType: "first_touch",
   });
 
-  // The friendly style's directives were injected into the system prompt.
-  assert.match(capturedSystem, /warm and approachable/);
+  // Style is available only as untrusted prompt data, never system authority.
+  assert.doesNotMatch(capturedSystem, /warm and approachable/);
+  assert.match(capturedPrompt, /warm and approachable/);
   assert.match(styleDirectives(style), /Cheers/);
   assert.equal(draft.generatorMode, "router:openai");
 });

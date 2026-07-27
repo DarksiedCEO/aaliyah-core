@@ -40,7 +40,7 @@ after(async () => {
   resetApplicationStoreForTests();
 });
 
-test("local runtime certification: native path verified, durable trace, zero sends", async () => {
+test("local runtime certification: legacy path fails closed with durable trace and zero writes", async () => {
   const evidence = await runLocalRuntimeCertification({ scope: SCOPE, userId: "cert_user" });
 
   // Every gate passed and the honest marker was emitted.
@@ -48,10 +48,10 @@ test("local runtime certification: native path verified, durable trace, zero sen
   assert.ok(evidence.gates.every((g) => g.pass));
 
   // The certified invariants.
-  assert.equal(evidence.outcomeStatus, "awaiting_approval");
+  assert.equal(evidence.outcomeStatus, "failed");
   assert.equal(evidence.autoSend, false);
   assert.equal(evidence.sendCount, 0);
-  assert.ok(evidence.draftId);
+  assert.equal(evidence.draftId, null);
   assert.ok(evidence.decisionTraceId, "decision trace must be durably persisted");
 
   // Evidence bundle hygiene: redacted tenant/workspace, real commit, honest note.

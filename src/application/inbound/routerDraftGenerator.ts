@@ -22,10 +22,9 @@ const SYSTEM_PROMPT = [
 ].join(" ");
 
 /**
- * Block 3 integration point: adapts the AaliyahModelRouter to the Block 2
- * DraftGenerator seam. Wiring this in is opt-in (set
- * `inboundDraftInternals.generator = routerDraftGenerator(router)`), so the
- * inbound flow itself is unchanged — exactly what the seam was built for.
+ * Adapts the model router to a draft generator. The legacy inbound entry point
+ * no longer accepts this seam; trusted executive runtimes may compose it only
+ * behind their identity, context, model-approval, and quality gates.
  */
 export function routerDraftGenerator(
   router: AaliyahModelRouter,

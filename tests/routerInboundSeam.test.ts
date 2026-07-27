@@ -5,7 +5,6 @@ import {
   clearInboundDraftRuntime,
   configureInboundDraftRuntime,
   runInboundDraft,
-  inboundDraftInternals,
 } from "../src/application/inbound/runInboundDraft";
 import { routerDraftGenerator } from "../src/application/inbound/routerDraftGenerator";
 import { AaliyahModelRouter } from "../src/model-router/AaliyahModelRouter";
@@ -13,37 +12,32 @@ import { idempotencyStoreInternals } from "../src/persistence/idempotencyStore";
 
 process.env.AALIYAH_ALLOW_INMEMORY_IDEMPOTENCY = "true";
 
-const realCreateDraft = inboundDraftInternals.createDraft;
-const realResolveToken = inboundDraftInternals.resolveAccessToken;
 let createdDrafts: { rawMessage: string; accessToken: string }[];
 
 beforeEach(() => {
   createdDrafts = [];
-  inboundDraftInternals.createDraft = async (rawMessage, accessToken) => {
-    createdDrafts.push({ rawMessage, accessToken });
-    return `draft_${createdDrafts.length}`;
-  };
-  inboundDraftInternals.resolveAccessToken = () => "test_access_token";
 });
 
 afterEach(() => {
-  inboundDraftInternals.createDraft = realCreateDraft;
-  inboundDraftInternals.resolveAccessToken = realResolveToken;
   clearInboundDraftRuntime();
   idempotencyStoreInternals.resetInMemory();
 });
 
-test("Block 3: the AaliyahModelRouter plugs into the inbound seam end-to-end", async () => {
+test("legacy router seam is quarantined before model or provider access", async () => {
   // Real router with a fake provider adapter — no network, no keys.
+  let modelCalls = 0;
   const router = new AaliyahModelRouter([
     {
       provider: "anthropic" as const,
-      generate: async () => ({
-        text: "Happy to help — here are the pricing details you asked for.",
-        provider: "anthropic" as const,
-        model: "claude-opus-4-8",
-        latencyMs: 1,
-      }),
+      generate: async () => {
+        modelCalls += 1;
+        return {
+          text: "Happy to help — here are the pricing details you asked for.",
+          provider: "anthropic" as const,
+          model: "claude-opus-4-8",
+          latencyMs: 1,
+        };
+      },
     },
   ]);
   configureInboundDraftRuntime({
@@ -71,8 +65,9 @@ test("Block 3: the AaliyahModelRouter plugs into the inbound seam end-to-end", a
     },
   });
 
-  assert.equal(result.status, "awaiting_approval");
+  assert.equal(result.status, "failed");
   assert.equal(result.autoSend, false);
-  assert.equal(result.generatorMode, "router:anthropic");
-  assert.match(createdDrafts[0]!.rawMessage, /pricing details you asked for/);
+  assert.equal(result.generatorMode, undefined);
+  assert.equal(modelCalls, 0);
+  assert.equal(createdDrafts.length, 0);
 });

@@ -5,25 +5,16 @@ import {
   clearInboundDraftRuntime,
   configureInboundDraftRuntime,
   runInboundDraft,
-  inboundDraftInternals,
 } from "../src/application/inbound/runInboundDraft";
 import { analyzeInbound } from "../src/application/inbound/analyzeInbound";
 import { idempotencyStoreInternals } from "../src/persistence/idempotencyStore";
 
 process.env.AALIYAH_ALLOW_INMEMORY_IDEMPOTENCY = "true";
 
-const realCreateDraft = inboundDraftInternals.createDraft;
-const realResolveToken = inboundDraftInternals.resolveAccessToken;
 let createdDrafts: { rawMessage: string; accessToken: string }[];
 
 beforeEach(() => {
   createdDrafts = [];
-  // Stub Gmail + credentials so no network/credential store is touched.
-  inboundDraftInternals.createDraft = async (rawMessage, accessToken) => {
-    createdDrafts.push({ rawMessage, accessToken });
-    return `draft_${createdDrafts.length}`;
-  };
-  inboundDraftInternals.resolveAccessToken = () => "test_access_token";
   configureInboundDraftRuntime({
     authorize: async () => ({
       allowed: true,
@@ -41,8 +32,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  inboundDraftInternals.createDraft = realCreateDraft;
-  inboundDraftInternals.resolveAccessToken = realResolveToken;
   clearInboundDraftRuntime();
   idempotencyStoreInternals.resetInMemory();
 });
@@ -65,21 +54,15 @@ function request(overrides: Record<string, unknown> = {}) {
   };
 }
 
-test("inbound draft is saved as a Gmail draft, pending approval, never sent", async () => {
+test("legacy inbound entry point fails closed without a trusted principal", async () => {
   const result = await runInboundDraft(request());
 
-  // Acceptance criterion: status=awaiting_approval, mode=inbound_draft, draftId.
-  assert.equal(result.status, "awaiting_approval");
+  assert.equal(result.status, "failed");
   assert.equal(result.mode, "inbound_draft");
   assert.equal(result.autoSend, false);
-  assert.equal(result.draftId, "draft_1");
-  assert.equal(result.replyType, "first_touch");
-
-  // Exactly one DRAFT created, no send path exists.
-  assert.equal(createdDrafts.length, 1);
-  assert.match(createdDrafts[0]!.rawMessage, /^To: client@example.com/m);
-  assert.match(createdDrafts[0]!.rawMessage, /^Subject: Re: Pricing question/m);
-  assert.match(createdDrafts[0]!.rawMessage, /In-Reply-To: msg_1/);
+  assert.equal(result.reason, "trusted_executive_runtime_required");
+  assert.equal(result.draftId, undefined);
+  assert.equal(createdDrafts.length, 0);
 });
 
 test("non-replyable senders are skipped without creating a draft", async () => {
@@ -115,16 +98,15 @@ test("re: subjects are classified as existing conversation", () => {
   assert.equal(analysis.replyType, "existing_conversation");
 });
 
-test("inbound drafting is idempotent on messageId (no duplicate drafts)", async () => {
+test("legacy fail-closed outcome is idempotent and never creates a draft", async () => {
   const first = await runInboundDraft(request());
   const second = await runInboundDraft(request());
 
-  assert.equal(first.draftId, second.draftId);
-  // Replay returns the stored result without creating a second draft.
-  assert.equal(createdDrafts.length, 1);
+  assert.deepEqual(first, second);
+  assert.equal(createdDrafts.length, 0);
 });
 
-test("the generator is a pluggable seam (Block 3 router injection point)", async () => {
+test("legacy generator configuration cannot bypass the trusted runtime boundary", async () => {
   configureInboundDraftRuntime({
     authorize: async () => ({
       allowed: true,
@@ -141,6 +123,7 @@ test("the generator is a pluggable seam (Block 3 router injection point)", async
   });
 
   const result = await runInboundDraft(request());
-  assert.equal(result.generatorMode, "router:test");
-  assert.match(createdDrafts[0]!.rawMessage, /^Subject: Custom subject/m);
+  assert.equal(result.status, "failed");
+  assert.equal(result.generatorMode, undefined);
+  assert.equal(createdDrafts.length, 0);
 });

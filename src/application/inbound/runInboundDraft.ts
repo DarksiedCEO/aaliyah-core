@@ -1,3 +1,5 @@
+import crypto from "node:crypto";
+
 import {
   InboundDraftRequestSchema,
   InboundDraftResultSchema,
@@ -7,81 +9,43 @@ import {
 import { logger } from "../../observability/logger";
 import { persistTrace } from "../../observability/persistTrace";
 import { requireTenantContext } from "../../governance/requireTenantContext";
-import { getCredential } from "../../governance/credentialProvider";
-import { createGmailDraft } from "../../integrations/gmail/createDraft";
 import {
   ensureIdempotentExecution,
   recordIdempotentFailure,
   recordIdempotentResult,
 } from "../../persistence/idempotencyStore";
 import { analyzeInbound } from "./analyzeInbound";
-import { type DraftGenerator } from "./generateInboundDraft";
+import type { DraftGenerator } from "./generateInboundDraft";
 import { requireSafeMailHeader } from "./untrustedContent";
-import { buildConfidence } from "../trust/confidenceEngine";
-import { recordDecisionTrace } from "../trust/decisionTrace";
-
-/**
- * Injectable seams so the flow is testable without Gmail/credentials and so the
- * model router (Block 3) can replace the generator with no flow change.
- */
-export type InboundDraftAuthorization = {
-  allowed: boolean;
-  risk: "green" | "yellow" | "red";
-  confidence: number;
-  reason: string;
-};
 
 export type InboundDraftRuntime = {
   generator: DraftGenerator;
   authorize: (
     email: Parameters<DraftGenerator>[0]["email"],
-  ) => Promise<InboundDraftAuthorization>;
+  ) => Promise<{
+    allowed: boolean;
+    risk: "green" | "yellow" | "red";
+    confidence: number;
+    reason: string;
+  }>;
 };
 
-let configuredRuntime: InboundDraftRuntime | undefined;
+let quarantinedLegacyRuntime: InboundDraftRuntime | undefined;
 
+/** @deprecated Legacy runtime is quarantined and cannot reach a provider. */
 export function configureInboundDraftRuntime(runtime: InboundDraftRuntime): void {
-  configuredRuntime = runtime;
+  quarantinedLegacyRuntime = runtime;
 }
 
+/** @deprecated Legacy runtime is quarantined and cannot reach a provider. */
 export function clearInboundDraftRuntime(): void {
-  configuredRuntime = undefined;
-}
-
-export const inboundDraftInternals: {
-  createDraft: (rawMessage: string, accessToken: string) => Promise<string>;
-  resolveAccessToken: (
-    tenantId: string,
-    userId: string,
-    workspaceId?: string,
-  ) => string;
-} = {
-  createDraft: createGmailDraft,
-  resolveAccessToken: (tenantId, userId, workspaceId) =>
-    getCredential(tenantId, userId, "google", workspaceId).accessToken,
-};
-
-function buildRawReply(input: {
-  toEmail: string;
-  subject: string;
-  body: string;
-  inReplyToMessageId: string;
-}): string {
-  return [
-    `To: ${input.toEmail}`,
-    `Subject: ${input.subject}`,
-    `In-Reply-To: ${input.inReplyToMessageId}`,
-    `References: ${input.inReplyToMessageId}`,
-    'Content-Type: text/plain; charset="UTF-8"',
-    "",
-    input.body,
-  ].join("\r\n");
+  quarantinedLegacyRuntime = undefined;
 }
 
 /**
- * Inbound Draft Mode: analyze an inbound email, draft a reply, save it as a
- * Gmail draft, and leave it pending human approval. NEVER sends. The follow-up
- * doctrine and guarded-execution path are not involved.
+ * Legacy inbound entry point. It may classify no-action mail, but any
+ * reply-worthy message fails closed before model, credential, or provider
+ * access. Trusted executive drafting uses runTrustedExecutiveDraftReviewOnly.
  */
 export async function runInboundDraft(raw: unknown): Promise<InboundDraftResult> {
   const request = InboundDraftRequestSchema.parse(raw);
@@ -113,6 +77,7 @@ export async function runInboundDraft(raw: unknown): Promise<InboundDraftResult>
 
   try {
     const analysis = analyzeInbound(request.email);
+    const traceId = crypto.randomUUID();
 
     if (!analysis.shouldDraft) {
       const skipped = InboundDraftResultSchema.parse({
@@ -124,6 +89,7 @@ export async function runInboundDraft(raw: unknown): Promise<InboundDraftResult>
       });
 
       await persistTrace({
+        traceId,
         ...scope,
         userId: tenant.userId,
         flow: "inbound_draft",
@@ -136,118 +102,29 @@ export async function runInboundDraft(raw: unknown): Promise<InboundDraftResult>
       return skipped;
     }
 
-    const runtime = configuredRuntime;
-    if (!runtime) {
-      throw new Error("inbound_draft_generator_unavailable");
-    }
-
-    const authorization = await runtime.authorize(request.email);
-    if (
-      authorization.allowed !== true ||
-      authorization.risk === "red" ||
-      !Number.isFinite(authorization.confidence) ||
-      authorization.confidence < 0.7 ||
-      authorization.confidence > 1
-    ) {
-      const denied = InboundDraftResultSchema.parse({
-        threadId: request.email.threadId,
-        status: "no_action",
-        mode: "inbound_draft",
-        autoSend: false,
-        reason: `draft_not_authorized:${authorization.reason}`,
-      });
-      await persistTrace({
-        ...scope,
-        userId: tenant.userId,
-        flow: "inbound_draft",
-        messageId: request.email.messageId,
-        decisionPath: "inbound -> review_only_no_draft",
-        analysis,
-        authorization,
-        outcome: denied,
-      });
-      await recordIdempotentResult(idempotencyKey, denied, scope);
-      return denied;
-    }
-
-    const draft = await runtime.generator({
-      email: request.email,
-      replyType: analysis.replyType,
-    });
-    requireSafeMailHeader("draft_subject", draft.subject);
-    if (
-      draft.subject.trim().length === 0 ||
-      draft.body.trim().length === 0 ||
-      draft.generatorMode.trim().length === 0
-    ) {
-      throw new Error("inbound_draft_generator_returned_malformed_output");
-    }
-
-    const accessToken = inboundDraftInternals.resolveAccessToken(
-      tenant.tenantId,
-      tenant.userId,
-      tenant.workspaceId,
-    );
-
-    const rawMessage = buildRawReply({
-      // A reply is addressed to the sender of the inbound message. `toEmail`
-      // (the user's own address that received it) is never the reply target.
-      toEmail: request.email.fromEmail,
-      subject: draft.subject,
-      body: draft.body,
-      inReplyToMessageId: request.email.messageId,
-    });
-
-    const draftId = await inboundDraftInternals.createDraft(rawMessage, accessToken);
-
-    // Trust metadata (Block 6): confidence on every generated draft. Low
-    // confidence forces manual review — inbound already requires approval
-    // unconditionally, so the draft stays awaiting_approval regardless.
-    const confidence = buildConfidence(
-      authorization.confidence * 100,
-      `${analysis.reason}; generator=${draft.generatorMode}`,
-    );
-
-    const result = InboundDraftResultSchema.parse({
+    // This legacy request-body entry point cannot establish a server-authenticated
+    // principal or independently resolve the Phase 5 evidence registries. It is
+    // therefore permanently fail-closed before model, credential, or provider
+    // access. Trusted callers must use runTrustedExecutiveDraftReviewOnly.
+    const blocked = InboundDraftResultSchema.parse({
       threadId: request.email.threadId,
-      status: "awaiting_approval",
+      status: "failed",
       mode: "inbound_draft",
       autoSend: false,
-      draftId,
-      replyType: draft.replyType,
-      generatorMode: draft.generatorMode,
-      confidence,
+      reason: "trusted_executive_runtime_required",
     });
-
-    // Every inbound draft has a decision trace.
-    await recordDecisionTrace({
-      tenantId: tenant.tenantId,
-      workspaceId: tenant.workspaceId,
-      userId: tenant.userId,
-      inputSummary: `inbound ${request.email.messageId} from ${request.email.fromEmail}`,
-      decision: "draft_reply_awaiting_approval",
-      evidenceUsed: [request.email.threadId],
-      reason: confidence.reason,
-      provider: draft.generatorMode,
-    });
-
     await persistTrace({
+      traceId,
       ...scope,
       userId: tenant.userId,
       flow: "inbound_draft",
       messageId: request.email.messageId,
-      decisionPath: "inbound -> awaiting_approval",
+      decisionPath: "inbound -> failed_closed",
       analysis,
-      generatorMode: draft.generatorMode,
-      outcome: result,
+      outcome: blocked,
     });
-    await recordIdempotentResult(idempotencyKey, result, scope);
-
-    logger.info(
-      { messageId: request.email.messageId, tenantId: tenant.tenantId, draftId },
-      "aaliyah.inbound.draft_saved",
-    );
-    return result;
+    await recordIdempotentResult(idempotencyKey, blocked, scope);
+    return blocked;
   } catch (error) {
     await recordIdempotentFailure(
       idempotencyKey,
