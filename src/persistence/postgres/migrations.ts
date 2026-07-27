@@ -292,6 +292,27 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       ADD CONSTRAINT wave1_lifecycle_event_binding
         CHECK (payload->>'eventId' = event_id)`,
   },
+  {
+    id: "022_wave1_lifecycle_strict_payload_binding",
+    sql: `ALTER TABLE wave1_lifecycle_events
+      DROP CONSTRAINT wave1_lifecycle_tenant_binding,
+      DROP CONSTRAINT wave1_lifecycle_workspace_binding,
+      DROP CONSTRAINT wave1_lifecycle_task_binding,
+      DROP CONSTRAINT wave1_lifecycle_idempotency_binding,
+      DROP CONSTRAINT wave1_lifecycle_event_binding,
+      ADD CONSTRAINT wave1_lifecycle_payload_object
+        CHECK (jsonb_typeof(payload) = 'object'),
+      ADD CONSTRAINT wave1_lifecycle_tenant_binding
+        CHECK (payload->>'tenantId' IS NOT NULL AND payload->>'tenantId' = tenant_id),
+      ADD CONSTRAINT wave1_lifecycle_workspace_binding
+        CHECK (payload->>'workspaceId' IS NOT NULL AND payload->>'workspaceId' = workspace_id),
+      ADD CONSTRAINT wave1_lifecycle_task_binding
+        CHECK (payload->>'taskId' IS NOT NULL AND payload->>'taskId' = task_id),
+      ADD CONSTRAINT wave1_lifecycle_idempotency_binding
+        CHECK (payload->>'idempotencyKey' IS NOT NULL AND payload->>'idempotencyKey' = idempotency_key),
+      ADD CONSTRAINT wave1_lifecycle_event_binding
+        CHECK (payload->>'eventId' IS NOT NULL AND payload->>'eventId' = event_id)`,
+  },
 ];
 
 export async function runMailMigrations(pool: Pool): Promise<void> {

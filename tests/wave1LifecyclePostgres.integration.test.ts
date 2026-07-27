@@ -183,6 +183,31 @@ test("database rejects every relational row and payload binding mismatch", async
     "SELECT count(*)::int AS count FROM wave1_lifecycle_events",
   );
   assert.equal(count.rows[0]?.count, 0);
+  for (const payload of [
+    {},
+    { ...received, tenantId: null },
+    { ...received, workspaceId: null },
+    { ...received, taskId: null },
+    { ...received, idempotencyKey: null },
+    { ...received, eventId: null },
+    "not-an-object",
+  ]) {
+    await assert.rejects(() =>
+      poolA.query(
+        `INSERT INTO wave1_lifecycle_events
+           (event_id, tenant_id, workspace_id, task_id, idempotency_key, payload)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [
+          received.eventId,
+          received.tenantId,
+          received.workspaceId,
+          received.taskId,
+          received.idempotencyKey,
+          JSON.stringify(payload),
+        ],
+      ),
+    );
+  }
 });
 
 test("insert failure rolls back and leaves the store connection reusable", async () => {
@@ -190,19 +215,29 @@ test("insert failure rolls back and leaves the store connection reusable", async
   const received = event("received-event", "RECEIVED");
   await record(store, received);
   await assert.rejects(() =>
-    poolA.query(
-      `INSERT INTO wave1_lifecycle_events
-         (event_id, tenant_id, workspace_id, task_id, idempotency_key, payload)
-       VALUES ($1,$2,$3,$4,$5,$6)`,
-      [
-        received.eventId,
-        received.tenantId,
-        received.workspaceId,
-        received.taskId,
-        received.idempotencyKey,
-        JSON.stringify(received),
-      ],
-    ),
+    store.appendIfCurrent({
+      event: {
+        ...received,
+        taskId: "collision-task",
+        requestId: "collision-request",
+        idempotencyKey: "collision-operation",
+      },
+      expectedPreviousEventId: null,
+    }),
+  );
+  const afterFailure = {
+    ...received,
+    eventId: "after-failure-event",
+    taskId: "after-failure-task",
+    requestId: "after-failure-request",
+    idempotencyKey: "after-failure-operation",
+  };
+  assert.deepEqual(
+    await store.appendIfCurrent({
+      event: afterFailure,
+      expectedPreviousEventId: null,
+    }),
+    afterFailure,
   );
   assert.deepEqual(
     await store.findByEventId(
