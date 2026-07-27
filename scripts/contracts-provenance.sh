@@ -49,6 +49,16 @@ if ! pnpm -C "$build_root" build >"$build_root/build.log" 2>&1; then
   exit 1
 fi
 
+installed_manifest="node_modules/@aaliyah/contracts/package.json"
+[ -f "$installed_manifest" ] || {
+  printf 'FAIL  installed Contracts package manifest is unavailable\n' >&2
+  exit 1
+}
+cmp -s "$build_root/package.json" "$installed_manifest" || {
+  printf 'FAIL  installed Contracts package manifest does not match exact SHA\n' >&2
+  exit 1
+}
+
 actual_contracts="$(node -e '
   const contracts = require("@aaliyah/contracts/v1");
   process.stdout.write([
