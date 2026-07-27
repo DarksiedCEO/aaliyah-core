@@ -130,6 +130,10 @@ export function createCapabilityEnforcedMessageProvider(input: {
   resolveReadbackReceipt: Parameters<typeof verifyProviderReadbackReceipt>[2];
   resolveActorAuthority: Parameters<typeof verifyProviderReadbackReceipt>[3];
 }): MessageProvider {
+  const canonicalCapabilities = structuredClone(
+    ProviderCapabilitiesV2Schema.parse(input.capabilities),
+  );
+
   function assertScope<T extends { tenantId: string; workspaceId: string; userId: string }>(
     scope: ProviderScope,
     value: T,
@@ -147,6 +151,7 @@ export function createCapabilityEnforcedMessageProvider(input: {
   function assertDraftBinding(
     request: ProviderDraftInput,
     raw: unknown,
+    expectedProviderDraftId?: string,
   ): ProviderDraftReceipt {
     const receipt = Wave1ProviderDraftReceiptSchema.parse(raw);
     const provider = receipt.providerReceipt;
@@ -163,10 +168,13 @@ export function createCapabilityEnforcedMessageProvider(input: {
       receipt.recipientDigest !== request.recipientDigest ||
       receipt.verifiedEnvelopeDigest !== request.verifiedEnvelopeDigest ||
       provider.connectionId !== request.connectionId ||
+      provider.adapterId !== canonicalCapabilities.adapterId ||
       provider.threadId !== request.threadId ||
       provider.contextDigest !== request.contextDigest ||
       provider.candidateDigest !== request.candidateDigest ||
-      provider.capabilityCandidateDigest !== request.capabilityCandidateDigest
+      provider.capabilityCandidateDigest !== request.capabilityCandidateDigest ||
+      (expectedProviderDraftId !== undefined &&
+        provider.providerDraftId !== expectedProviderDraftId)
     ) {
       throw new Error("provider draft receipt is not bound to the requested operation");
     }
@@ -175,7 +183,7 @@ export function createCapabilityEnforcedMessageProvider(input: {
 
   function capabilities(): ProviderCapabilities {
     return assertProviderCapabilitiesTrusted(
-      input.capabilities,
+      canonicalCapabilities,
       input.now(),
       input.resolveCapabilityEvidence,
     );
@@ -210,29 +218,83 @@ export function createCapabilityEnforcedMessageProvider(input: {
   return {
     getCapabilities: capabilities,
     listMessages: (value) =>
-      invoke("list_messages", value, (raw) =>
-        NormalizedMessageSchema.array().parse(raw).map((item) => assertScope(value, item)),
-      ),
+      invoke("list_messages", value, (raw) => {
+        const envelope = raw as Record<string, unknown>;
+        if (
+          envelope.connectionId !== value.connectionId ||
+          envelope.providerFamily !== capabilities().providerFamily ||
+          envelope.adapterId !== capabilities().adapterId
+        ) {
+          throw new Error("provider result envelope is not bound to the request");
+        }
+        return NormalizedMessageSchema.array()
+          .parse(envelope.messages)
+          .map((item) => assertScope(value, item));
+      }),
     readMessage: (value) =>
-      invoke("read_message", value, (raw) =>
-        assertScope(value, NormalizedMessageSchema.parse(raw)),
-      ),
+      invoke("read_message", value, (raw) => {
+        const envelope = raw as Record<string, unknown>;
+        const message = assertScope(
+          value,
+          NormalizedMessageSchema.parse(envelope.message),
+        );
+        if (
+          envelope.connectionId !== value.connectionId ||
+          envelope.providerFamily !== capabilities().providerFamily ||
+          envelope.adapterId !== capabilities().adapterId ||
+          message.providerFamily !== capabilities().providerFamily ||
+          message.message.messageId !== value.messageId
+        ) {
+          throw new Error("provider message is not bound to the request");
+        }
+        return message;
+      }),
     readThread: (value) =>
-      invoke("read_thread", value, (raw) =>
-        assertScope(value, NormalizedThreadSchema.parse(raw)),
-      ),
+      invoke("read_thread", value, (raw) => {
+        const thread = assertScope(value, NormalizedThreadSchema.parse(raw));
+        if (
+          thread.thread.connectionId !== value.connectionId ||
+          thread.thread.threadId !== value.threadId ||
+          thread.thread.providerFamily !== capabilities().providerFamily ||
+          thread.thread.readReceipt.adapterId !== capabilities().adapterId
+        ) {
+          throw new Error("provider thread is not bound to the request");
+        }
+        return thread;
+      }),
     searchMessages: (value) =>
-      invoke("search_messages", value, (raw) =>
-        NormalizedMessageSchema.array().parse(raw).map((item) => assertScope(value, item)),
-      ),
+      invoke("search_messages", value, (raw) => {
+        const envelope = raw as Record<string, unknown>;
+        if (
+          envelope.connectionId !== value.connectionId ||
+          envelope.providerFamily !== capabilities().providerFamily ||
+          envelope.adapterId !== capabilities().adapterId
+        ) {
+          throw new Error("provider result envelope is not bound to the request");
+        }
+        return NormalizedMessageSchema.array()
+          .parse(envelope.messages)
+          .map((item) => assertScope(value, item));
+      }),
     retrieveAttachments: (value) =>
-      invoke("retrieve_attachments", value, (raw) =>
-        NormalizedAttachmentSchema.array().parse(raw),
-      ),
+      invoke("retrieve_attachments", value, (raw) => {
+        const envelope = raw as Record<string, unknown>;
+        if (
+          envelope.connectionId !== value.connectionId ||
+          envelope.providerFamily !== capabilities().providerFamily ||
+          envelope.adapterId !== capabilities().adapterId ||
+          envelope.messageId !== value.messageId
+        ) {
+          throw new Error("provider attachments are not bound to the request");
+        }
+        return NormalizedAttachmentSchema.array().parse(envelope.attachments);
+      }),
     createDraft: (value) =>
       invoke("create_provider_draft", value, (raw) => assertDraftBinding(value, raw)),
     updateDraft: (value) =>
-      invoke("update_provider_draft", value, (raw) => assertDraftBinding(value, raw)),
+      invoke("update_provider_draft", value, (raw) =>
+        assertDraftBinding(value, raw, value.providerDraftId),
+      ),
     verifyDraftExists: (value) =>
       invoke("verify_draft_exists", value, (raw) => {
         const verified = verifyProviderReadbackReceipt(
@@ -243,7 +305,9 @@ export function createCapabilityEnforcedMessageProvider(input: {
         );
         if (
           JSON.stringify(verified.providerDraftReceipt) !==
-          JSON.stringify(value.providerDraftReceipt)
+            JSON.stringify(value.providerDraftReceipt) ||
+          verified.connectionId !== value.connectionId ||
+          verified.adapterId !== capabilities().adapterId
         ) {
           throw new Error("provider read-back is not bound to the requested draft");
         }
@@ -264,7 +328,7 @@ export function createCapabilityEnforcedMessageProvider(input: {
 export function createGmailMessageProvider(
   input: Parameters<typeof createCapabilityEnforcedMessageProvider>[0],
 ): MessageProvider {
-  const parsed = ProviderCapabilitiesV2Schema.parse(input.capabilities);
+  const parsed = structuredClone(ProviderCapabilitiesV2Schema.parse(input.capabilities));
   if (parsed.providerFamily !== "gmail_api") {
     throw new Error("Gmail provider requires providerFamily gmail_api");
   }

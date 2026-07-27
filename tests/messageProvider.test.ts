@@ -149,6 +149,20 @@ test("capabilities are independently verified and rechecked for freshness", asyn
   await assert.rejects(() => stale.healthCheck(SCOPE), /stale/);
 });
 
+test("provider capabilities are immutable after construction", () => {
+  const declared = capabilities();
+  const p = createGmailMessageProvider({
+    capabilities: declared,
+    handlers: {},
+    now: () => NOW,
+    resolveCapabilityEvidence: (subject) => ({ subject, evidence: EVIDENCE }),
+    resolveReadbackReceipt: () => null,
+    resolveActorAuthority: () => null,
+  });
+  declared.providerFamily = "microsoft_graph" as never;
+  assert.equal(p.getCapabilities().providerFamily, "gmail_api");
+});
+
 test("Gmail fabric preserves normalized thread parsing and exposes no send", async () => {
   const normalized = {
     contractVersion: "aaliyah.executive-communications/wave1",
@@ -200,20 +214,34 @@ test("Gmail fabric preserves normalized thread parsing and exposes no send", asy
       { participantId: "ceo-1", canonicalAddress: "ceo@example.com", aliases: [], resolution: "unresolved" },
     ],
   };
-  const p = createGmailMessageProvider({
-    capabilities: capabilities(["read_thread"]),
-    handlers: { read_thread: async () => normalized },
-    now: () => NOW,
-    resolveCapabilityEvidence: (subject) => ({ subject, evidence: EVIDENCE }),
-    resolveReadbackReceipt: () => null,
-    resolveActorAuthority: () => null,
-  });
+  const makeProvider = (result: unknown) => createGmailMessageProvider({
+      capabilities: capabilities(["read_thread"]),
+      handlers: { read_thread: async () => result },
+      now: () => NOW,
+      resolveCapabilityEvidence: (subject) => ({ subject, evidence: EVIDENCE }),
+      resolveReadbackReceipt: () => null,
+      resolveActorAuthority: () => null,
+    });
+  const p = makeProvider(normalized);
   assert.equal(
     (await p.readThread({ ...SCOPE, threadId: "thread-1" })).thread.threadId,
     "thread-1",
   );
   assert.equal("send" in p, false);
   assert.equal("sendMessage" in p, false);
+  for (const changedThread of [
+    { ...normalized.thread, connectionId: "other-connection" },
+    { ...normalized.thread, threadId: "other-thread", messages: normalized.thread.messages.map((message) => ({ ...message, threadId: "other-thread" })) },
+    { ...normalized.thread, providerFamily: "microsoft_graph" },
+    { ...normalized.thread, readReceipt: { ...normalized.thread.readReceipt, adapterId: "other.adapter" } },
+  ]) {
+    await assert.rejects(
+      () => makeProvider({ ...normalized, thread: changedThread }).readThread({
+        ...SCOPE,
+        threadId: "thread-1",
+      }),
+    );
+  }
 });
 
 test("Gmail factory rejects another provider family", () => {
@@ -286,6 +314,86 @@ test("normalized reads reject a valid artifact from another tenant", async () =>
   );
 });
 
+test("point-message and attachment results require exact provider envelopes", async () => {
+  const normalizedMessage = {
+    contractVersion: "aaliyah.executive-communications/wave1",
+    tenantId: "tenant-1",
+    workspaceId: "workspace-1",
+    userId: "user-1",
+    taskId: "task-1",
+    requestId: "request-1",
+    idempotencyKey: "operation-1",
+    providerFamily: "gmail_api",
+    message: {
+      messageId: "message-1",
+      threadId: "thread-1",
+      externalRef: "gmail:message:message-1",
+      from: [{ email: "sender@example.com" }],
+      to: [],
+      cc: [],
+      bcc: [],
+      replyTo: [],
+      subject: "Subject",
+      receivedAt: "2026-07-26T10:00:00.000Z",
+      timeZone: "UTC",
+      attachments: [],
+    },
+    participants: [{
+      participantId: "sender-1",
+      canonicalAddress: "sender@example.com",
+      aliases: [],
+      resolution: "unresolved",
+    }],
+  };
+  const messageEnvelope = {
+    connectionId: "connection-1",
+    providerFamily: "gmail_api",
+    adapterId: "gmail.adapter",
+    message: normalizedMessage,
+  };
+  for (const mutation of [
+    { connectionId: "other-connection" },
+    { providerFamily: "microsoft_graph" },
+    { adapterId: "other.adapter" },
+    { message: {
+      ...normalizedMessage,
+      message: { ...normalizedMessage.message, messageId: "other-message" },
+    } },
+  ]) {
+    const p = provider(
+      ["read_message"],
+      { read_message: async () => ({ ...messageEnvelope, ...mutation }) },
+    );
+    await assert.rejects(() =>
+      p.readMessage({ ...SCOPE, messageId: "message-1" }),
+    );
+  }
+
+  for (const mutation of [
+    { connectionId: "other-connection" },
+    { providerFamily: "microsoft_graph" },
+    { adapterId: "other.adapter" },
+    { messageId: "other-message" },
+  ]) {
+    const p = provider(
+      ["retrieve_attachments"],
+      {
+        retrieve_attachments: async () => ({
+          connectionId: "connection-1",
+          providerFamily: "gmail_api",
+          adapterId: "gmail.adapter",
+          messageId: "message-1",
+          attachments: [],
+          ...mutation,
+        }),
+      },
+    );
+    await assert.rejects(() =>
+      p.retrieveAttachments({ ...SCOPE, messageId: "message-1" }),
+    );
+  }
+});
+
 test("draft read-back requires an exact independently persisted receipt", async () => {
   const providerReceipt = {
     receiptId: "provider-receipt",
@@ -318,6 +426,79 @@ test("draft read-back requires an exact independently persisted receipt", async 
     verifiedEnvelopeDigest: DIGEST,
     providerReceipt,
   };
+  const draftInput = {
+    ...SCOPE,
+    taskId: "task-1",
+    requestId: "request-1",
+    threadId: "thread-1",
+    idempotencyKey: "operation-1",
+    recipientDigest: DIGEST,
+    candidateDigest: DIGEST,
+    contextDigest: DIGEST,
+    capabilityCandidateDigest: DIGEST,
+    authorizationId: "authorization-1",
+    approvalId: "approval-1",
+    qualityBundleId: "quality-1",
+    verifiedEnvelopeDigest: DIGEST,
+    to: [{ email: "recipient@example.com" }],
+    cc: [],
+    bcc: [],
+    subject: "Subject",
+    body: "Body",
+  };
+  const draftWriter = provider(
+    ["create_provider_draft", "update_provider_draft"],
+    {
+      create_provider_draft: async () => ({
+        ...draftReceipt,
+        providerReceipt: { ...providerReceipt, adapterId: "other.adapter" },
+      }),
+      update_provider_draft: async () => draftReceipt,
+    },
+  );
+  await assert.rejects(
+    () => draftWriter.createDraft(draftInput),
+    /not bound to the requested operation/,
+  );
+  await assert.rejects(
+    () => draftWriter.updateDraft({
+      ...draftInput,
+      providerDraftId: "different-draft",
+    }),
+    /not bound to the requested operation/,
+  );
+  const receiptMutations = [
+    { tenantId: "other" },
+    { workspaceId: "other" },
+    { userId: "other" },
+    { taskId: "other" },
+    { requestId: "other" },
+    { idempotencyKey: "other" },
+    { authorizationId: "other" },
+    { approvalId: "other" },
+    { qualityBundleId: "other" },
+    { recipientDigest: `sha256:${"b".repeat(64)}` },
+    { verifiedEnvelopeDigest: `sha256:${"b".repeat(64)}` },
+    { providerReceipt: { ...providerReceipt, connectionId: "other" } },
+    { providerReceipt: { ...providerReceipt, adapterId: "other.adapter" } },
+    { providerReceipt: { ...providerReceipt, threadId: "other" } },
+    { providerReceipt: { ...providerReceipt, contextDigest: `sha256:${"b".repeat(64)}` } },
+    { providerReceipt: { ...providerReceipt, candidateDigest: `sha256:${"b".repeat(64)}` } },
+    { providerReceipt: { ...providerReceipt, capabilityCandidateDigest: `sha256:${"b".repeat(64)}` } },
+  ];
+  for (const mutation of receiptMutations) {
+    const writer = provider(
+      ["create_provider_draft", "update_provider_draft"],
+      {
+        create_provider_draft: async () => ({ ...draftReceipt, ...mutation }),
+        update_provider_draft: async () => ({ ...draftReceipt, ...mutation }),
+      },
+    );
+    await assert.rejects(() => writer.createDraft(draftInput));
+    await assert.rejects(() =>
+      writer.updateDraft({ ...draftInput, providerDraftId: "draft-1" }),
+    );
+  }
   const readback = {
     contractVersion: "aaliyah.executive-communications/wave1",
     tenantId: "tenant-1",
@@ -390,5 +571,37 @@ test("draft read-back requires an exact independently persisted receipt", async 
   await assert.rejects(
     () => p.verifyDraftExists({ ...SCOPE, providerDraftReceipt: draftReceipt as never }),
     /not independently verified/,
+  );
+
+  const sameAuthority = provider(
+    ["verify_draft_exists"],
+    { verify_draft_exists: async () => readback },
+    {
+      resolveReadbackReceipt: () => readback as never,
+      resolveActorAuthority: () => "shared-authority",
+    },
+  );
+  await assert.rejects(() =>
+    sameAuthority.verifyDraftExists({
+      ...SCOPE,
+      providerDraftReceipt: draftReceipt as never,
+    }),
+  );
+
+  const stale = provider(
+    ["verify_draft_exists"],
+    { verify_draft_exists: async () => readback },
+    {
+      now: () => Date.parse("2026-07-26T11:00:00.000Z"),
+      resolveReadbackReceipt: () => readback as never,
+      resolveActorAuthority: (actorId) =>
+        actorId === "gmail.adapter" ? "draft-writer" : "draft-reader",
+    },
+  );
+  await assert.rejects(() =>
+    stale.verifyDraftExists({
+      ...SCOPE,
+      providerDraftReceipt: draftReceipt as never,
+    }),
   );
 });
