@@ -133,6 +133,16 @@ export function createCapabilityEnforcedMessageProvider(input: {
   const canonicalCapabilities = structuredClone(
     ProviderCapabilitiesV2Schema.parse(input.capabilities),
   );
+  if (
+    canonicalCapabilities.operations.some(
+      (entry) => entry.operation === "retrieve_attachments" && entry.supported,
+    )
+  ) {
+    throw new ProviderCapabilityUnavailableError(
+      "retrieve_attachments",
+      "no independently verifiable attachment retrieval receipt is frozen",
+    );
+  }
 
   function assertScope<T extends { tenantId: string; workspaceId: string; userId: string }>(
     scope: ProviderScope,
@@ -229,7 +239,13 @@ export function createCapabilityEnforcedMessageProvider(input: {
         }
         return NormalizedMessageSchema.array()
           .parse(envelope.messages)
-          .map((item) => assertScope(value, item));
+          .map((item) => {
+            const bound = assertScope(value, item);
+            if (bound.providerFamily !== capabilities().providerFamily) {
+              throw new Error("provider message is not bound to the request");
+            }
+            return bound;
+          });
       }),
     readMessage: (value) =>
       invoke("read_message", value, (raw) => {
@@ -274,7 +290,13 @@ export function createCapabilityEnforcedMessageProvider(input: {
         }
         return NormalizedMessageSchema.array()
           .parse(envelope.messages)
-          .map((item) => assertScope(value, item));
+          .map((item) => {
+            const bound = assertScope(value, item);
+            if (bound.providerFamily !== capabilities().providerFamily) {
+              throw new Error("provider message is not bound to the request");
+            }
+            return bound;
+          });
       }),
     retrieveAttachments: (value) =>
       invoke("retrieve_attachments", value, (raw) => {
@@ -332,5 +354,8 @@ export function createGmailMessageProvider(
   if (parsed.providerFamily !== "gmail_api") {
     throw new Error("Gmail provider requires providerFamily gmail_api");
   }
-  return createCapabilityEnforcedMessageProvider(input);
+  return createCapabilityEnforcedMessageProvider({
+    ...input,
+    capabilities: parsed,
+  });
 }

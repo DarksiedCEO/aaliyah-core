@@ -369,29 +369,32 @@ test("point-message and attachment results require exact provider envelopes", as
     );
   }
 
-  for (const mutation of [
-    { connectionId: "other-connection" },
-    { providerFamily: "microsoft_graph" },
-    { adapterId: "other.adapter" },
-    { messageId: "other-message" },
-  ]) {
+  for (const operation of ["list_messages", "search_messages"] as const) {
     const p = provider(
-      ["retrieve_attachments"],
+      [operation],
       {
-        retrieve_attachments: async () => ({
+        [operation]: async () => ({
           connectionId: "connection-1",
           providerFamily: "gmail_api",
           adapterId: "gmail.adapter",
-          messageId: "message-1",
-          attachments: [],
-          ...mutation,
+          messages: [{
+            ...normalizedMessage,
+            providerFamily: "microsoft_graph",
+          }],
         }),
       },
     );
     await assert.rejects(() =>
-      p.retrieveAttachments({ ...SCOPE, messageId: "message-1" }),
+      operation === "list_messages"
+        ? p.listMessages(SCOPE)
+        : p.searchMessages({ ...SCOPE, query: "query" }),
     );
   }
+
+  assert.throws(
+    () => provider(["retrieve_attachments"]),
+    /no independently verifiable attachment retrieval receipt/,
+  );
 });
 
 test("draft read-back requires an exact independently persisted receipt", async () => {
@@ -459,6 +462,24 @@ test("draft read-back requires an exact independently persisted receipt", async 
   await assert.rejects(
     () => draftWriter.createDraft(draftInput),
     /not bound to the requested operation/,
+  );
+  const successfulWriter = provider(
+    ["create_provider_draft", "update_provider_draft"],
+    {
+      create_provider_draft: async () => draftReceipt,
+      update_provider_draft: async () => draftReceipt,
+    },
+  );
+  assert.equal(
+    (await successfulWriter.createDraft(draftInput)).providerReceipt.providerDraftId,
+    "draft-1",
+  );
+  assert.equal(
+    (await successfulWriter.updateDraft({
+      ...draftInput,
+      providerDraftId: "draft-1",
+    })).providerReceipt.providerDraftId,
+    "draft-1",
   );
   await assert.rejects(
     () => draftWriter.updateDraft({
@@ -600,6 +621,26 @@ test("draft read-back requires an exact independently persisted receipt", async 
   );
   await assert.rejects(() =>
     stale.verifyDraftExists({
+      ...SCOPE,
+      providerDraftReceipt: draftReceipt as never,
+    }),
+  );
+  const futureReadback = {
+    ...readback,
+    observedAt: "2026-07-26T10:03:00.000Z",
+    freshUntil: "2026-07-26T10:05:00.000Z",
+  };
+  const future = provider(
+    ["verify_draft_exists"],
+    { verify_draft_exists: async () => futureReadback },
+    {
+      resolveReadbackReceipt: () => futureReadback as never,
+      resolveActorAuthority: (actorId) =>
+        actorId === "gmail.adapter" ? "draft-writer" : "draft-reader",
+    },
+  );
+  await assert.rejects(() =>
+    future.verifyDraftExists({
       ...SCOPE,
       providerDraftReceipt: draftReceipt as never,
     }),
