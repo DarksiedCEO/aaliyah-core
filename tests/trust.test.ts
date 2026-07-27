@@ -19,6 +19,8 @@ import {
 } from "../src/application/trust/draftQuality";
 import { trustMetricsSummary } from "../src/application/trust/trustMetrics";
 import {
+  clearInboundDraftRuntime,
+  configureInboundDraftRuntime,
   runInboundDraft,
   inboundDraftInternals,
 } from "../src/application/inbound/runInboundDraft";
@@ -92,16 +94,24 @@ test("trust metrics summary reads scoped traces + quality (read-only)", async ()
   assert.ok(metrics.quality.total >= 3);
 });
 
-test("every inbound draft carries confidence + a decision trace; low still awaits approval", async () => {
+test("every authorized inbound draft carries authorization confidence and a decision trace", async () => {
   const realCreate = inboundDraftInternals.createDraft;
   const realToken = inboundDraftInternals.resolveAccessToken;
-  const realGen = inboundDraftInternals.generator;
   inboundDraftInternals.createDraft = async () => "draft_t1";
   inboundDraftInternals.resolveAccessToken = () => "token";
-  // Force a LOW confidence draft.
-  inboundDraftInternals.generator = async ({ replyType }) => ({
-    subject: "Re: hi", body: "draft", replyType, confidence: 20,
-    generatorMode: "deterministic-v1",
+  configureInboundDraftRuntime({
+    authorize: async () => ({
+      allowed: true,
+      risk: "green",
+      confidence: 0.8,
+      reason: "test authorization",
+    }),
+    generator: async ({ replyType }) => ({
+      subject: "Re: hi",
+      body: "draft",
+      replyType,
+      generatorMode: "router:test",
+    }),
   });
 
   try {
@@ -117,14 +127,14 @@ test("every inbound draft carries confidence + a decision trace; low still await
     assert.equal(result.status, "awaiting_approval"); // low confidence still gated
     assert.equal(result.autoSend, false);
     assert.ok(result.confidence);
-    assert.equal(result.confidence!.label, "low");
+    assert.equal(result.confidence!.label, "high");
 
     const tracesAfter = (await readDecisionTraces({ tenantId: "tenant_c", workspaceId: "tenant_c:default" })).length;
     assert.equal(tracesAfter, tracesBefore + 1);
   } finally {
     inboundDraftInternals.createDraft = realCreate;
     inboundDraftInternals.resolveAccessToken = realToken;
-    inboundDraftInternals.generator = realGen;
+    clearInboundDraftRuntime();
     idempotencyStoreInternals.resetInMemory();
   }
 });

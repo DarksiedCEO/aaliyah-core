@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test, { afterEach, beforeEach } from "node:test";
 
 import {
+  clearInboundDraftRuntime,
+  configureInboundDraftRuntime,
   runInboundDraft,
   inboundDraftInternals,
 } from "../src/application/inbound/runInboundDraft";
@@ -13,8 +15,6 @@ process.env.AALIYAH_ALLOW_INMEMORY_IDEMPOTENCY = "true";
 
 const realCreateDraft = inboundDraftInternals.createDraft;
 const realResolveToken = inboundDraftInternals.resolveAccessToken;
-const realGenerator = inboundDraftInternals.generator;
-
 let createdDrafts: { rawMessage: string; accessToken: string }[];
 
 beforeEach(() => {
@@ -29,7 +29,7 @@ beforeEach(() => {
 afterEach(() => {
   inboundDraftInternals.createDraft = realCreateDraft;
   inboundDraftInternals.resolveAccessToken = realResolveToken;
-  inboundDraftInternals.generator = realGenerator;
+  clearInboundDraftRuntime();
   idempotencyStoreInternals.resetInMemory();
 });
 
@@ -46,7 +46,15 @@ test("Block 3: the AaliyahModelRouter plugs into the inbound seam end-to-end", a
       }),
     },
   ]);
-  inboundDraftInternals.generator = routerDraftGenerator(router);
+  configureInboundDraftRuntime({
+    authorize: async () => ({
+      allowed: true,
+      risk: "green",
+      confidence: 0.9,
+      reason: "test authorization",
+    }),
+    generator: routerDraftGenerator(router),
+  });
 
   const result = await runInboundDraft({
     tenantId: "tenant_a",

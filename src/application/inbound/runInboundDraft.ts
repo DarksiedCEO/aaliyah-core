@@ -15,10 +15,8 @@ import {
   recordIdempotentResult,
 } from "../../persistence/idempotencyStore";
 import { analyzeInbound } from "./analyzeInbound";
-import {
-  deterministicDraftGenerator,
-  type DraftGenerator,
-} from "./generateInboundDraft";
+import { type DraftGenerator } from "./generateInboundDraft";
+import { requireSafeMailHeader } from "./untrustedContent";
 import { buildConfidence } from "../trust/confidenceEngine";
 import { recordDecisionTrace } from "../trust/decisionTrace";
 
@@ -26,8 +24,31 @@ import { recordDecisionTrace } from "../trust/decisionTrace";
  * Injectable seams so the flow is testable without Gmail/credentials and so the
  * model router (Block 3) can replace the generator with no flow change.
  */
-export const inboundDraftInternals: {
+export type InboundDraftAuthorization = {
+  allowed: boolean;
+  risk: "green" | "yellow" | "red";
+  confidence: number;
+  reason: string;
+};
+
+export type InboundDraftRuntime = {
   generator: DraftGenerator;
+  authorize: (
+    email: Parameters<DraftGenerator>[0]["email"],
+  ) => Promise<InboundDraftAuthorization>;
+};
+
+let configuredRuntime: InboundDraftRuntime | undefined;
+
+export function configureInboundDraftRuntime(runtime: InboundDraftRuntime): void {
+  configuredRuntime = runtime;
+}
+
+export function clearInboundDraftRuntime(): void {
+  configuredRuntime = undefined;
+}
+
+export const inboundDraftInternals: {
   createDraft: (rawMessage: string, accessToken: string) => Promise<string>;
   resolveAccessToken: (
     tenantId: string,
@@ -35,7 +56,6 @@ export const inboundDraftInternals: {
     workspaceId?: string,
   ) => string;
 } = {
-  generator: deterministicDraftGenerator,
   createDraft: createGmailDraft,
   resolveAccessToken: (tenantId, userId, workspaceId) =>
     getCredential(tenantId, userId, "google", workspaceId).accessToken,
@@ -65,6 +85,9 @@ function buildRawReply(input: {
  */
 export async function runInboundDraft(raw: unknown): Promise<InboundDraftResult> {
   const request = InboundDraftRequestSchema.parse(raw);
+  requireSafeMailHeader("from", request.email.fromEmail);
+  requireSafeMailHeader("subject", request.email.subject);
+  requireSafeMailHeader("message_id", request.email.messageId);
   const tenant = requireTenantContext({
     tenantId: request.tenantId,
     userId: request.userId,
@@ -113,10 +136,52 @@ export async function runInboundDraft(raw: unknown): Promise<InboundDraftResult>
       return skipped;
     }
 
-    const draft = await inboundDraftInternals.generator({
+    const runtime = configuredRuntime;
+    if (!runtime) {
+      throw new Error("inbound_draft_generator_unavailable");
+    }
+
+    const authorization = await runtime.authorize(request.email);
+    if (
+      authorization.allowed !== true ||
+      authorization.risk === "red" ||
+      !Number.isFinite(authorization.confidence) ||
+      authorization.confidence < 0.7 ||
+      authorization.confidence > 1
+    ) {
+      const denied = InboundDraftResultSchema.parse({
+        threadId: request.email.threadId,
+        status: "no_action",
+        mode: "inbound_draft",
+        autoSend: false,
+        reason: `draft_not_authorized:${authorization.reason}`,
+      });
+      await persistTrace({
+        ...scope,
+        userId: tenant.userId,
+        flow: "inbound_draft",
+        messageId: request.email.messageId,
+        decisionPath: "inbound -> review_only_no_draft",
+        analysis,
+        authorization,
+        outcome: denied,
+      });
+      await recordIdempotentResult(idempotencyKey, denied, scope);
+      return denied;
+    }
+
+    const draft = await runtime.generator({
       email: request.email,
       replyType: analysis.replyType,
     });
+    requireSafeMailHeader("draft_subject", draft.subject);
+    if (
+      draft.subject.trim().length === 0 ||
+      draft.body.trim().length === 0 ||
+      draft.generatorMode.trim().length === 0
+    ) {
+      throw new Error("inbound_draft_generator_returned_malformed_output");
+    }
 
     const accessToken = inboundDraftInternals.resolveAccessToken(
       tenant.tenantId,
@@ -139,7 +204,7 @@ export async function runInboundDraft(raw: unknown): Promise<InboundDraftResult>
     // confidence forces manual review — inbound already requires approval
     // unconditionally, so the draft stays awaiting_approval regardless.
     const confidence = buildConfidence(
-      draft.confidence,
+      authorization.confidence * 100,
       `${analysis.reason}; generator=${draft.generatorMode}`,
     );
 

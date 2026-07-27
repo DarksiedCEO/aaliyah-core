@@ -1,7 +1,12 @@
 import crypto from "node:crypto";
 import { execSync } from "node:child_process";
 
-import { runInboundDraft, inboundDraftInternals } from "../application/inbound/runInboundDraft";
+import {
+  clearInboundDraftRuntime,
+  configureInboundDraftRuntime,
+  runInboundDraft,
+  inboundDraftInternals,
+} from "../application/inbound/runInboundDraft";
 import { readDecisionTraces } from "../application/trust/decisionTrace";
 import type { TenantScope } from "../persistence/tenantScopedStore";
 
@@ -80,18 +85,24 @@ export async function runLocalRuntimeCertification(input: {
   // Deterministic fake providers. createDraft returns a draft id WITHOUT any
   // network call; there is no send path here, and we count sends defensively.
   const saved = {
-    generator: inboundDraftInternals.generator,
     createDraft: inboundDraftInternals.createDraft,
     resolveAccessToken: inboundDraftInternals.resolveAccessToken,
   };
   inboundDraftInternals.resolveAccessToken = () => "cert-fake-token";
   inboundDraftInternals.createDraft = async () => `cert-draft-${crypto.randomUUID()}`;
-  inboundDraftInternals.generator = async ({ replyType }) => ({
-    subject: "Re: certification probe",
-    body: "Deterministic certification draft — never sent.",
-    replyType,
-    confidence: 20, // low → stays awaiting_approval
-    generatorMode: "deterministic-v1",
+  configureInboundDraftRuntime({
+    authorize: async () => ({
+      allowed: true,
+      risk: "green",
+      confidence: 0.8,
+      reason: "explicit local certification fixture",
+    }),
+    generator: async ({ replyType }) => ({
+      subject: "Re: certification probe",
+      body: "Local certification fixture draft — never sent.",
+      replyType,
+      generatorMode: "fixture:local-certification",
+    }),
   });
 
   let outcomeStatus: string | null = null;
@@ -120,7 +131,7 @@ export async function runLocalRuntimeCertification(input: {
   } catch (error) {
     runError = error instanceof Error ? error.message : String(error);
   } finally {
-    inboundDraftInternals.generator = saved.generator;
+    clearInboundDraftRuntime();
     inboundDraftInternals.createDraft = saved.createDraft;
     inboundDraftInternals.resolveAccessToken = saved.resolveAccessToken;
   }

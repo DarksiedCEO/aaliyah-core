@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test, { afterEach, beforeEach } from "node:test";
 
 import {
+  clearInboundDraftRuntime,
+  configureInboundDraftRuntime,
   runInboundDraft,
   inboundDraftInternals,
 } from "../src/application/inbound/runInboundDraft";
@@ -12,8 +14,6 @@ process.env.AALIYAH_ALLOW_INMEMORY_IDEMPOTENCY = "true";
 
 const realCreateDraft = inboundDraftInternals.createDraft;
 const realResolveToken = inboundDraftInternals.resolveAccessToken;
-const realGenerator = inboundDraftInternals.generator;
-
 let createdDrafts: { rawMessage: string; accessToken: string }[];
 
 beforeEach(() => {
@@ -24,12 +24,26 @@ beforeEach(() => {
     return `draft_${createdDrafts.length}`;
   };
   inboundDraftInternals.resolveAccessToken = () => "test_access_token";
+  configureInboundDraftRuntime({
+    authorize: async () => ({
+      allowed: true,
+      risk: "green",
+      confidence: 0.9,
+      reason: "test authorization",
+    }),
+    generator: async ({ email, replyType }) => ({
+      subject: /^\s*re:/i.test(email.subject) ? email.subject : `Re: ${email.subject}`,
+      body: "Model-generated test body.",
+      replyType,
+      generatorMode: "router:test",
+    }),
+  });
 });
 
 afterEach(() => {
   inboundDraftInternals.createDraft = realCreateDraft;
   inboundDraftInternals.resolveAccessToken = realResolveToken;
-  inboundDraftInternals.generator = realGenerator;
+  clearInboundDraftRuntime();
   idempotencyStoreInternals.resetInMemory();
 });
 
@@ -111,12 +125,19 @@ test("inbound drafting is idempotent on messageId (no duplicate drafts)", async 
 });
 
 test("the generator is a pluggable seam (Block 3 router injection point)", async () => {
-  inboundDraftInternals.generator = async ({ replyType }) => ({
-    subject: "Custom subject",
-    body: "Router-generated body",
-    replyType,
-    confidence: 90,
-    generatorMode: "router:test",
+  configureInboundDraftRuntime({
+    authorize: async () => ({
+      allowed: true,
+      risk: "green",
+      confidence: 0.9,
+      reason: "test authorization",
+    }),
+    generator: async ({ replyType }) => ({
+      subject: "Custom subject",
+      body: "Router-generated body",
+      replyType,
+      generatorMode: "router:test",
+    }),
   });
 
   const result = await runInboundDraft(request());
