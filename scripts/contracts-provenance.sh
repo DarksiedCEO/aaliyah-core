@@ -3,13 +3,14 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-expected_sha="5e9295a13cbd36c216d2b55a3d67c68d66122b53"
-expected_tree="fc6ed20237f5bde90f79bec47eefd5650cbf7237"
+expected_sha="31801a029c79f8286a63300058e82b3c2687fb60"
+expected_tree="84c440d8211a91bb2ec551cc1d3a3603bb7b32f0"
 expected_contract="aaliyah.postcondition-verification/v1"
 expected_executive_contract="aaliyah.executive-messaging/v1"
-contracts_repo="../aaliyah-contracts"
+expected_wave1_contract="aaliyah.executive-communications/wave1"
+contracts_repo="../aaliyah-wave1-contracts"
 
-[ -d "$contracts_repo/.git" ] || {
+git -C "$contracts_repo" rev-parse --git-dir >/dev/null 2>&1 || {
   printf 'FAIL  Contracts repository unavailable at %s\n' "$contracts_repo" >&2
   exit 1
 }
@@ -53,11 +54,13 @@ actual_contracts="$(node -e '
   process.stdout.write([
     contracts.POSTCONDITION_VERIFICATION_CONTRACT_VERSION ?? "",
     contracts.EXECUTIVE_MESSAGING_CONTRACT_VERSION ?? "",
+    contracts.AALIYAH_EXECUTIVE_COMMUNICATIONS_CONTRACT_VERSION ?? "",
   ].join("|"));
 ')"
-[ "$actual_contracts" = "$expected_contract|$expected_executive_contract" ] || {
-  printf 'FAIL  installed Contracts version mismatch: expected %s|%s, got %s\n' \
-    "$expected_contract" "$expected_executive_contract" "${actual_contracts:-missing}" >&2
+[ "$actual_contracts" = "$expected_contract|$expected_executive_contract|$expected_wave1_contract" ] || {
+  printf 'FAIL  installed Contracts version mismatch: expected %s|%s|%s, got %s\n' \
+    "$expected_contract" "$expected_executive_contract" "$expected_wave1_contract" \
+    "${actual_contracts:-missing}" >&2
   exit 1
 }
 
@@ -76,5 +79,6 @@ diff -qr "$fresh_dist" "$installed_dist" >/dev/null || {
   exit 1
 }
 
-printf 'PASS  Contracts provenance %s tree %s (%s, %s)\n' \
-  "$expected_sha" "$expected_tree" "$expected_contract" "$expected_executive_contract"
+printf 'PASS  Contracts provenance %s tree %s (%s, %s, %s)\n' \
+  "$expected_sha" "$expected_tree" "$expected_contract" \
+  "$expected_executive_contract" "$expected_wave1_contract"

@@ -6,13 +6,13 @@ import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 const coreRoot = path.resolve(__dirname, "..");
-const contractsRoot = path.resolve(coreRoot, "../aaliyah-contracts");
+const contractsRoot = path.resolve(coreRoot, "../aaliyah-wave1-contracts");
 const targetArtifact = "dist/src/v1/postcondition-verification.js";
 
 test("Contracts provenance rejects equally stale sibling and installed artifacts", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "contracts-provenance-"));
   const fixtureCore = path.join(root, "aaliyah-core");
-  const fixtureContracts = path.join(root, "aaliyah-contracts");
+  const fixtureContracts = path.join(root, "aaliyah-wave1-contracts");
   try {
     fs.mkdirSync(path.join(fixtureCore, "scripts"), { recursive: true });
     fs.copyFileSync(

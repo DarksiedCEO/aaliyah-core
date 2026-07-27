@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@aaliyah/contracts':
-        specifier: file:../aaliyah-contracts
-        version: file:../aaliyah-contracts
+        specifier: file:../aaliyah-wave1-contracts
+        version: file:../aaliyah-wave1-contracts
       '@anthropic-ai/sdk':
         specifier: ^0.105.0
         version: 0.105.0(zod@4.4.3)
@@ -54,8 +54,8 @@ importers:
 
 packages:
 
-  '@aaliyah/contracts@file:../aaliyah-contracts':
-    resolution: {directory: ../aaliyah-contracts, type: directory}
+  '@aaliyah/contracts@file:../aaliyah-wave1-contracts':
+    resolution: {directory: ../aaliyah-wave1-contracts, type: directory}
     engines: {node: '>=20'}
 
   '@anthropic-ai/sdk@0.105.0':
@@ -934,7 +934,7 @@ packages:
 
 snapshots:
 
-  '@aaliyah/contracts@file:../aaliyah-contracts':
+  '@aaliyah/contracts@file:../aaliyah-wave1-contracts':
     dependencies:
       zod: 4.4.3
 

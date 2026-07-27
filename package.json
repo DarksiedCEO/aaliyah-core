@@ -36,7 +36,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@aaliyah/contracts": "file:../aaliyah-contracts",
+    "@aaliyah/contracts": "file:../aaliyah-wave1-contracts",
     "@anthropic-ai/sdk": "^0.105.0",
     "@google-cloud/kms": "^5.5.1",
     "express": "^5.2.1",
