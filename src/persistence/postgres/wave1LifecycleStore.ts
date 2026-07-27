@@ -3,13 +3,36 @@ import type { Pool } from "pg";
 
 import type { Wave1LifecycleStore } from "../../application/executive/wave1Lifecycle";
 
+type LifecycleRow = {
+  event_id: string;
+  tenant_id: string;
+  workspace_id: string;
+  task_id: string;
+  idempotency_key: string;
+  payload: unknown;
+};
+
+function parseBoundRow(row: LifecycleRow) {
+  const event = AuditLifecycleEventSchema.parse(row.payload);
+  if (
+    event.eventId !== row.event_id ||
+    event.tenantId !== row.tenant_id ||
+    event.workspaceId !== row.workspace_id ||
+    event.taskId !== row.task_id ||
+    event.idempotencyKey !== row.idempotency_key
+  ) {
+    throw new Error("lifecycle relational row and payload binding mismatch");
+  }
+  return event;
+}
+
 export function createPostgresWave1LifecycleStore(
   pool: Pool,
 ): Wave1LifecycleStore {
   return {
     async findByEventId(tenantId, workspaceId, eventId) {
       const result = await pool.query(
-        `SELECT payload
+        `SELECT event_id, tenant_id, workspace_id, task_id, idempotency_key, payload
          FROM wave1_lifecycle_events
          WHERE tenant_id = $1
            AND workspace_id = $2
@@ -17,9 +40,7 @@ export function createPostgresWave1LifecycleStore(
          LIMIT 1`,
         [tenantId, workspaceId, eventId],
       );
-      return result.rows[0]
-        ? AuditLifecycleEventSchema.parse(result.rows[0].payload)
-        : null;
+      return result.rows[0] ? parseBoundRow(result.rows[0] as LifecycleRow) : null;
     },
 
     async findByIdempotencyKey(
@@ -29,7 +50,7 @@ export function createPostgresWave1LifecycleStore(
       idempotencyKey,
     ) {
       const result = await pool.query(
-        `SELECT payload
+        `SELECT event_id, tenant_id, workspace_id, task_id, idempotency_key, payload
          FROM wave1_lifecycle_events
          WHERE tenant_id = $1
            AND workspace_id = $2
@@ -39,9 +60,7 @@ export function createPostgresWave1LifecycleStore(
          LIMIT 1`,
         [tenantId, workspaceId, taskId, idempotencyKey],
       );
-      return result.rows[0]
-        ? AuditLifecycleEventSchema.parse(result.rows[0].payload)
-        : null;
+      return result.rows[0] ? parseBoundRow(result.rows[0] as LifecycleRow) : null;
     },
 
     async appendIfCurrent({ event, expectedPreviousEventId }) {

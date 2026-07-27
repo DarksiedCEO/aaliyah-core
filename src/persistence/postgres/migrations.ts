@@ -278,6 +278,20 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       ON wave1_lifecycle_events
       (tenant_id, workspace_id, task_id, idempotency_key, id DESC)`,
   },
+  {
+    id: "021_wave1_lifecycle_payload_binding",
+    sql: `ALTER TABLE wave1_lifecycle_events
+      ADD CONSTRAINT wave1_lifecycle_tenant_binding
+        CHECK (payload->>'tenantId' = tenant_id),
+      ADD CONSTRAINT wave1_lifecycle_workspace_binding
+        CHECK (payload->>'workspaceId' = workspace_id),
+      ADD CONSTRAINT wave1_lifecycle_task_binding
+        CHECK (payload->>'taskId' = task_id),
+      ADD CONSTRAINT wave1_lifecycle_idempotency_binding
+        CHECK (payload->>'idempotencyKey' = idempotency_key),
+      ADD CONSTRAINT wave1_lifecycle_event_binding
+        CHECK (payload->>'eventId' = event_id)`,
+  },
 ];
 
 export async function runMailMigrations(pool: Pool): Promise<void> {

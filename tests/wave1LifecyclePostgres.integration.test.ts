@@ -151,3 +151,65 @@ test("event-id lookup cannot cross tenant or workspace boundaries", async () => 
     null,
   );
 });
+
+test("database rejects every relational row and payload binding mismatch", async () => {
+  const received = event("received-event", "RECEIVED");
+  for (const [column, value] of [
+    ["event_id", "other-event"],
+    ["tenant_id", "other-tenant"],
+    ["workspace_id", "other-workspace"],
+    ["task_id", "other-task"],
+    ["idempotency_key", "other-operation"],
+  ] as const) {
+    await assert.rejects(() =>
+      poolA.query(
+        `INSERT INTO wave1_lifecycle_events
+           (event_id, tenant_id, workspace_id, task_id, idempotency_key, payload)
+         VALUES (
+           $1, $2, $3, $4, $5, $6
+         )`,
+        [
+          column === "event_id" ? value : received.eventId,
+          column === "tenant_id" ? value : received.tenantId,
+          column === "workspace_id" ? value : received.workspaceId,
+          column === "task_id" ? value : received.taskId,
+          column === "idempotency_key" ? value : received.idempotencyKey,
+          JSON.stringify(received),
+        ],
+      ),
+    );
+  }
+  const count = await poolA.query(
+    "SELECT count(*)::int AS count FROM wave1_lifecycle_events",
+  );
+  assert.equal(count.rows[0]?.count, 0);
+});
+
+test("insert failure rolls back and leaves the store connection reusable", async () => {
+  const store = createPostgresWave1LifecycleStore(poolA);
+  const received = event("received-event", "RECEIVED");
+  await record(store, received);
+  await assert.rejects(() =>
+    poolA.query(
+      `INSERT INTO wave1_lifecycle_events
+         (event_id, tenant_id, workspace_id, task_id, idempotency_key, payload)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [
+        received.eventId,
+        received.tenantId,
+        received.workspaceId,
+        received.taskId,
+        received.idempotencyKey,
+        JSON.stringify(received),
+      ],
+    ),
+  );
+  assert.deepEqual(
+    await store.findByEventId(
+      received.tenantId,
+      received.workspaceId,
+      received.eventId,
+    ),
+    received,
+  );
+});
