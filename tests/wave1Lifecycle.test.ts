@@ -48,7 +48,7 @@ function memoryStore(): Wave1LifecycleStore & {
   return {
     events,
     appendCalls: 0,
-    async findByEventId(eventId) {
+    async findByEventId(_tenantId, _workspaceId, eventId) {
       return events.get(eventId) ?? null;
     },
     async findByIdempotencyKey(tenantId, workspaceId, taskId, key) {

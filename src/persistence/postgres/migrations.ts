@@ -261,6 +261,23 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
     CREATE INDEX IF NOT EXISTS idx_aaliyah_followup_approvals_scope
       ON aaliyah_followup_approvals (tenant_id, workspace_id, created_at)`,
   },
+  {
+    id: "020_wave1_lifecycle_events",
+    sql: `CREATE TABLE IF NOT EXISTS wave1_lifecycle_events (
+      id bigserial PRIMARY KEY,
+      event_id text NOT NULL,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      task_id text NOT NULL,
+      idempotency_key text NOT NULL,
+      payload jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      UNIQUE (tenant_id, workspace_id, event_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_wave1_lifecycle_operation_tail
+      ON wave1_lifecycle_events
+      (tenant_id, workspace_id, task_id, idempotency_key, id DESC)`,
+  },
 ];
 
 export async function runMailMigrations(pool: Pool): Promise<void> {

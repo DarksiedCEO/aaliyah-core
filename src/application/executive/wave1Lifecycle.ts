@@ -25,7 +25,11 @@ const INTERMEDIATE_ARTIFACT = {
 } as const satisfies Record<string, z.infer<typeof LifecycleArtifactKindSchema>>;
 
 export interface Wave1LifecycleStore {
-  findByEventId(eventId: string): Promise<LifecycleEvent | null>;
+  findByEventId(
+    tenantId: string,
+    workspaceId: string,
+    eventId: string,
+  ): Promise<LifecycleEvent | null>;
   findByIdempotencyKey(
     tenantId: string,
     workspaceId: string,
@@ -125,7 +129,11 @@ export async function recordWave1LifecycleEvent(
     const parsedExisting = AuditLifecycleEventSchema.safeParse(existing);
     if (parsedExisting.success && exactRecord(parsedExisting.data, event)) {
       const independentlyRead = AuditLifecycleEventSchema.safeParse(
-        await input.store.findByEventId(event.eventId),
+        await input.store.findByEventId(
+          event.tenantId,
+          event.workspaceId,
+          event.eventId,
+        ),
       );
       if (
         !independentlyRead.success ||
@@ -145,7 +153,11 @@ export async function recordWave1LifecycleEvent(
 
   if (event.previousEventId) {
     const parsedPrevious = AuditLifecycleEventSchema.safeParse(
-      await input.store.findByEventId(event.previousEventId),
+      await input.store.findByEventId(
+        event.tenantId,
+        event.workspaceId,
+        event.previousEventId,
+      ),
     );
     if (
       !parsedPrevious.success ||
@@ -168,7 +180,11 @@ export async function recordWave1LifecycleEvent(
     throw new Error("lifecycle persistence read-back failed");
   }
   const independentlyRead = AuditLifecycleEventSchema.safeParse(
-    await input.store.findByEventId(event.eventId),
+    await input.store.findByEventId(
+      event.tenantId,
+      event.workspaceId,
+      event.eventId,
+    ),
   );
   if (
     !independentlyRead.success ||
