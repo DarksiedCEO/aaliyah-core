@@ -1,5 +1,6 @@
 import {
   AuditLifecycleEventSchema,
+  LifecycleArtifactKindSchema,
   LifecycleEvidenceRecordSchema,
   Wave1AuthorityIdSchema,
   assertWave1EvidenceFresh,
@@ -13,15 +14,15 @@ type LifecycleEvidence = z.infer<typeof LifecycleEvidenceRecordSchema>;
 const INTERMEDIATE_ARTIFACT = {
   RECEIVED: "inbound_message",
   NORMALIZED: "normalized_thread",
-  CONTEXT_ASSEMBLED: "context_bundle",
+  CONTEXT_ASSEMBLED: "context_assembly",
   SCREENED: "injection_screening",
   TRIAGED: "triage_result",
   AUTHORITY_DECIDED: "authority_decision",
   DRAFT_PROPOSED: "draft_proposal",
-  QUALITY_REVIEWED: "quality_bundle",
+  QUALITY_REVIEWED: "quality_evidence_bundle",
   AWAITING_HUMAN_REVIEW: "human_review_record",
   FAILED: "failure_record",
-} as const;
+} as const satisfies Record<string, z.infer<typeof LifecycleArtifactKindSchema>>;
 
 export interface Wave1LifecycleStore {
   findByEventId(eventId: string): Promise<LifecycleEvent | null>;
@@ -44,6 +45,7 @@ export interface RecordWave1LifecycleEventInput {
   resolveEvidence: (evidenceRef: string) => LifecycleEvidence | null;
   resolveActorAuthority: (
     actorId: string,
+    state: LifecycleEvent["state"],
     tenantId: string,
     workspaceId: string,
   ) => string | null;
@@ -78,6 +80,7 @@ export async function recordWave1LifecycleEvent(
   const authority = Wave1AuthorityIdSchema.safeParse(
     input.resolveActorAuthority(
       event.actorId,
+      event.state,
       event.tenantId,
       event.workspaceId,
     ),
@@ -121,7 +124,16 @@ export async function recordWave1LifecycleEvent(
   if (existing) {
     const parsedExisting = AuditLifecycleEventSchema.safeParse(existing);
     if (parsedExisting.success && exactRecord(parsedExisting.data, event)) {
-      return parsedExisting.data;
+      const independentlyRead = AuditLifecycleEventSchema.safeParse(
+        await input.store.findByEventId(event.eventId),
+      );
+      if (
+        !independentlyRead.success ||
+        !exactRecord(independentlyRead.data, parsedExisting.data)
+      ) {
+        throw new Error("lifecycle replay persistence read-back failed");
+      }
+      return independentlyRead.data;
     }
     if (
       !parsedExisting.success ||
