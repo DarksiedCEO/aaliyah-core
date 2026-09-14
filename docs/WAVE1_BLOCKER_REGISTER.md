@@ -133,14 +133,6 @@ makes a current-head check stale.
 
 ---
 
-## Cross-cutting note carried forward from the W1.3 review
-
-The W1.3 candidate's suite was green while 25 of 31 applied mutations survived,
-including a mutant that deleted 71 of 73 lines of runtime verification. Any
-entry above that is later claimed CLOSED must be closed with tests that
-**fail when the control is deleted** — not merely tests that pass while it is
-present. See founder authorization Part G, mandatory mutation targets.
-
 ## W1BR-006 — Canonical digest: fractional numeric residual
 
 - **Gate:** W1.3 · **Source:** Mutation + Security, confirmed by orchestrator against live PostgreSQL 16
@@ -182,3 +174,13 @@ verbatim, so the collapse is on the JS side, before the digest.
   strings.
 - **Interim control required in Part B:** Core must be the only writer on the
   receipt path, and that exclusivity must be enforced, not assumed.
+
+---
+
+## Cross-cutting note carried forward from the W1.3 review
+
+The W1.3 candidate's suite was green while 25 of 31 applied mutations survived,
+including a mutant that deleted 71 of 73 lines of runtime verification. Any
+entry above that is later claimed CLOSED must be closed with tests that
+**fail when the control is deleted** — not merely tests that pass while it is
+present. See founder authorization Part G, mandatory mutation targets.
