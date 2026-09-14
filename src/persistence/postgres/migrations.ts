@@ -810,6 +810,265 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       ON memory_authorization_receipts, memory_authorization_nonces
       TO aaliyah_memory_revoker`,
   },
+  {
+    // W1.3 PART D — THE CROSS-WORKSPACE POLICY, AS A TABLE.
+    //
+    // "Explicit, not implicit" has to be enforced by something. This table is
+    // that something: a tenant with no row here cannot bind an alias, because
+    // `memory_alias_bindings` carries a FOREIGN KEY onto (tenant_id,
+    // cross_workspace_policy). There is no default value, no fallback branch
+    // and no ON DELETE SET DEFAULT; absence is refusal, in the database,
+    // for every writer.
+    //
+    // PRIMARY KEY (tenant_id) is what makes the policy SINGULAR: one tenant
+    // cannot hold two policies, so two binding rows of one tenant cannot
+    // disagree about whether workspaces share an alias space. The extra
+    // UNIQUE (tenant_id, cross_workspace_policy) exists solely so the binding
+    // table's composite foreign key has something to point at; it also means
+    // changing a tenant's policy while bindings exist is refused by the
+    // foreign key rather than silently re-scoping every existing alias.
+    id: "030_memory_alias_tenant_policy",
+    sql: `CREATE TABLE IF NOT EXISTS memory_alias_tenant_policy (
+      tenant_id text PRIMARY KEY,
+      cross_workspace_policy text NOT NULL,
+      set_by_actor_id text NOT NULL,
+      policy_version text NOT NULL,
+      set_at timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT memory_alias_tenant_policy_domain
+        CHECK (cross_workspace_policy IN
+               ('workspace_isolated', 'tenant_exclusive')),
+      CONSTRAINT memory_alias_tenant_policy_fk_target
+        UNIQUE (tenant_id, cross_workspace_policy)
+    );
+    CREATE TABLE IF NOT EXISTS memory_alias_protected_domains (
+      id bigserial PRIMARY KEY,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      registrable_domain text NOT NULL,
+      corpus_ref text NOT NULL,
+      added_by_actor_id text NOT NULL,
+      added_at timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT memory_alias_protected_domains_unique
+        UNIQUE (tenant_id, workspace_id, registrable_domain),
+      CONSTRAINT memory_alias_protected_domains_host_form
+        CHECK (registrable_domain ~
+               '^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$')
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_alias_protected_domains_scope
+      ON memory_alias_protected_domains (tenant_id, workspace_id, id DESC)`,
+  },
+  {
+    // THE ALIAS REGISTRY ITSELF.
+    //
+    // GLOBAL UNIQUENESS IS THE WHOLE POINT. The contracts header says it
+    // plainly: a per-record validator sees one value at one instant and can
+    // never speak for the population, so uniqueness "is a UNIQUE constraint in
+    // Core's database". There are TWO here, and they are PARTIAL:
+    //
+    //   memory_alias_bindings_alias_unique     (tenant_id, scope_key,
+    //                                           normalized_alias)
+    //   memory_alias_bindings_skeleton_unique  (tenant_id, scope_key,
+    //                                           skeleton)
+    //
+    // both `WHERE removed_at IS NULL`, so a retired binding neither blocks a
+    // reassignment nor disappears from the audit trail. The skeleton index is
+    // the one that stops two VISUALLY CONFUSABLE aliases from both binding:
+    // NFC does not fold Cyrillic onto Latin and neither does NFKC, so the
+    // normalized-alias index accepts both spellings happily and only a
+    // skeleton can separate them.
+    //
+    // SCOPE_KEY IS DERIVED BY A CHECK, NOT BY THE APPLICATION. Under
+    // `tenant_exclusive` every row of a tenant carries the sentinel '*', so
+    // the indexes above become tenant-wide; under `workspace_isolated` the row
+    // carries its own workspace_id and they are per-workspace. The CHECK makes
+    // a row that lies about its scope_key unrepresentable, and the foreign key
+    // onto memory_alias_tenant_policy makes a row that lies about the policy
+    // unrepresentable too. A writer that has defeated the application still
+    // cannot write a binding that escapes the tenant's declared policy.
+    //
+    // The '*' sentinel cannot collide with a real workspace: MemoryIdSchema
+    // admits only [a-z0-9][a-z0-9._:-]{2,127}, and the CHECK below refuses a
+    // workspace literally named '*' anyway.
+    id: "031_memory_alias_bindings",
+    sql: `CREATE TABLE IF NOT EXISTS memory_alias_bindings (
+      id bigserial PRIMARY KEY,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      principal_id text NOT NULL,
+      user_id text NOT NULL,
+      cross_workspace_policy text NOT NULL,
+      scope_key text NOT NULL,
+      alias_id text NOT NULL,
+      normalized_alias text NOT NULL,
+      skeleton text NOT NULL,
+      skeleton_algorithm text NOT NULL,
+      normalization_profile text NOT NULL,
+      canonical_participant_id text NOT NULL,
+      registrable_domain text NOT NULL,
+      script_code text NOT NULL,
+      restriction_level text NOT NULL,
+      subject_participant_id text NOT NULL,
+      source_evidence_ref text NOT NULL,
+      source_evidence_digest text NOT NULL,
+      observed_at timestamptz NOT NULL,
+      fresh_until timestamptz NOT NULL,
+      authorization_id text NOT NULL,
+      mutation_receipt_id text NOT NULL,
+      bound_at timestamptz NOT NULL,
+      removed_at timestamptz,
+      removed_by_mutation_receipt_id text,
+      removed_authorization_id text,
+      payload jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT memory_alias_bindings_policy_fk
+        FOREIGN KEY (tenant_id, cross_workspace_policy)
+        REFERENCES memory_alias_tenant_policy (tenant_id, cross_workspace_policy),
+      CONSTRAINT memory_alias_bindings_workspace_not_sentinel
+        CHECK (workspace_id <> '*'),
+      CONSTRAINT memory_alias_bindings_scope_key_derivation
+        CHECK (scope_key = CASE
+                 WHEN cross_workspace_policy = 'tenant_exclusive' THEN '*'
+                 ELSE workspace_id END),
+      CONSTRAINT memory_alias_bindings_evidence_digest_form
+        CHECK (source_evidence_digest ~ '^sha256:[a-f0-9]{64}$'),
+      CONSTRAINT memory_alias_bindings_freshness_window
+        CHECK (fresh_until > observed_at),
+      CONSTRAINT memory_alias_bindings_removal_witness
+        CHECK ((removed_at IS NULL) = (removed_by_mutation_receipt_id IS NULL)
+               AND (removed_at IS NULL) = (removed_authorization_id IS NULL)),
+      CONSTRAINT memory_alias_bindings_removal_after_binding
+        CHECK (removed_at IS NULL OR removed_at >= bound_at),
+      -- REDUNDANT BACKSTOP, disclosed as one. PostgreSQL evaluates CHECK
+      -- constraints in NAME order, and every payload-binding CHECK below
+      -- sorts earlier and also fails on a non-object payload (the JSON
+      -- dereference is NULL). This constraint can therefore never be the
+      -- reported violation and no test can name it. It is kept because a
+      -- payload field added later without its own binding CHECK would have
+      -- nothing else standing behind it.
+      CONSTRAINT memory_alias_bindings_payload_object
+        CHECK (jsonb_typeof(payload) = 'object'),
+      CONSTRAINT memory_alias_bindings_tenant_binding
+        CHECK (payload->'scope'->>'tenantId' IS NOT NULL
+               AND payload->'scope'->>'tenantId' = tenant_id),
+      CONSTRAINT memory_alias_bindings_workspace_binding
+        CHECK (payload->'scope'->>'workspaceId' IS NOT NULL
+               AND payload->'scope'->>'workspaceId' = workspace_id),
+      CONSTRAINT memory_alias_bindings_principal_binding
+        CHECK (payload->'scope'->>'principalId' IS NOT NULL
+               AND payload->'scope'->>'principalId' = principal_id),
+      CONSTRAINT memory_alias_bindings_user_binding
+        CHECK (payload->'scope'->>'userId' IS NOT NULL
+               AND payload->'scope'->>'userId' = user_id),
+      CONSTRAINT memory_alias_bindings_alias_id_binding
+        CHECK (payload->>'aliasId' IS NOT NULL
+               AND payload->>'aliasId' = alias_id),
+      CONSTRAINT memory_alias_bindings_normalized_binding
+        CHECK (payload->>'normalizedAlias' IS NOT NULL
+               AND payload->>'normalizedAlias' = normalized_alias),
+      CONSTRAINT memory_alias_bindings_skeleton_binding
+        CHECK (payload->>'skeleton' IS NOT NULL
+               AND payload->>'skeleton' = skeleton),
+      CONSTRAINT memory_alias_bindings_participant_binding
+        CHECK (payload->>'canonicalParticipantId' IS NOT NULL
+               AND payload->>'canonicalParticipantId' = canonical_participant_id),
+      CONSTRAINT memory_alias_bindings_subject_binding
+        CHECK (payload->>'subjectParticipantId' IS NOT NULL
+               AND payload->>'subjectParticipantId' = subject_participant_id),
+      CONSTRAINT memory_alias_bindings_policy_binding
+        CHECK (payload->>'crossWorkspacePolicy' IS NOT NULL
+               AND payload->>'crossWorkspacePolicy' = cross_workspace_policy),
+      CONSTRAINT memory_alias_bindings_scope_key_binding
+        CHECK (payload->>'scopeKey' IS NOT NULL
+               AND payload->>'scopeKey' = scope_key),
+      CONSTRAINT memory_alias_bindings_authorization_binding
+        CHECK (payload->>'authorizationId' IS NOT NULL
+               AND payload->>'authorizationId' = authorization_id),
+      CONSTRAINT memory_alias_bindings_mutation_receipt_binding
+        CHECK (payload->>'mutationReceiptId' IS NOT NULL
+               AND payload->>'mutationReceiptId' = mutation_receipt_id)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS memory_alias_bindings_alias_unique
+      ON memory_alias_bindings (tenant_id, scope_key, normalized_alias)
+      WHERE removed_at IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS memory_alias_bindings_skeleton_unique
+      ON memory_alias_bindings (tenant_id, scope_key, skeleton)
+      WHERE removed_at IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS memory_alias_bindings_alias_id_unique
+      ON memory_alias_bindings (tenant_id, scope_key, alias_id)
+      WHERE removed_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_memory_alias_bindings_participant
+      ON memory_alias_bindings
+      (tenant_id, workspace_id, canonical_participant_id, id DESC);
+    CREATE OR REPLACE FUNCTION aaliyah_alias_binding_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $fn$
+      BEGIN
+        IF TG_OP = 'DELETE' THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: DELETE on % is forbidden; a binding is retired, never erased'
+            , TG_TABLE_NAME
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF OLD.removed_at IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: a retired alias binding is immutable'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.removed_at IS NULL THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: retirement is the only permitted update'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF (to_jsonb(NEW) - 'removed_at' - 'removed_by_mutation_receipt_id'
+              - 'removed_authorization_id')
+           IS DISTINCT FROM
+           (to_jsonb(OLD) - 'removed_at' - 'removed_by_mutation_receipt_id'
+              - 'removed_authorization_id') THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: retirement may not rewrite a binding'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_alias_bindings_retire_only
+      ON memory_alias_bindings;
+    CREATE TRIGGER memory_alias_bindings_retire_only
+      BEFORE UPDATE OR DELETE ON memory_alias_bindings
+      FOR EACH ROW EXECUTE FUNCTION aaliyah_alias_binding_guard();
+    DROP TRIGGER IF EXISTS memory_alias_bindings_exact_numbers
+      ON memory_alias_bindings;
+    CREATE TRIGGER memory_alias_bindings_exact_numbers
+      BEFORE INSERT OR UPDATE ON memory_alias_bindings
+      FOR EACH ROW EXECUTE FUNCTION aaliyah_memory_reject_inexact_numbers()`,
+  },
+  {
+    // PRIVILEGE SEPARATION FOR THE ALIAS PATH, continuing 029.
+    //
+    // The mutator may bind and retire. It may NOT set a tenant's
+    // cross-workspace policy and it may NOT add or drop a protected domain:
+    // both of those change what the gates MEAN, and a role that can weaken its
+    // own gate has no gate. Those two tables are administrative and are held by
+    // the owner. The mutator's UPDATE grant on the binding table is
+    // COLUMN-LEVEL and covers only the three retirement columns, so it
+    // physically cannot rewrite a normalized alias, a skeleton, a participant
+    // or a scope key — and the retire-only trigger refuses the rest for every
+    // writer, including one that has more grants than this.
+    id: "032_memory_alias_privileges",
+    sql: `GRANT SELECT ON
+      memory_alias_bindings,
+      memory_alias_tenant_policy,
+      memory_alias_protected_domains
+      TO aaliyah_memory_mutator, aaliyah_memory_reader,
+         aaliyah_memory_issuer, aaliyah_memory_revoker;
+    GRANT INSERT ON memory_alias_bindings TO aaliyah_memory_mutator;
+    GRANT USAGE, SELECT ON SEQUENCE memory_alias_bindings_id_seq
+      TO aaliyah_memory_mutator;
+    GRANT UPDATE (removed_at, removed_by_mutation_receipt_id,
+                  removed_authorization_id)
+      ON memory_alias_bindings TO aaliyah_memory_mutator`,
+  },
 ];
 
 export async function runMailMigrations(pool: Pool): Promise<void> {

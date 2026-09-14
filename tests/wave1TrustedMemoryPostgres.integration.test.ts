@@ -20,6 +20,10 @@ import {
 import { runMailMigrations } from "../src/persistence/postgres/migrations";
 import { createMailDbPool } from "../src/persistence/postgres/pool";
 import { createPostgresTrustedMemoryStore } from "../src/persistence/postgres/wave1TrustedMemoryStore";
+import {
+  lockSharedMemoryTables,
+  type SharedTableLock,
+} from "./support/sharedMemoryTables";
 
 /**
  * Wave 1.3 trusted memory, against a REAL PostgreSQL 16.
@@ -59,6 +63,9 @@ let readPool: Pool;
 let shadowReadPool: Pool;
 let uncheckedReadPool: Pool;
 let adminPool: Pool;
+// See tests/support/sharedMemoryTables.ts: this file TRUNCATEs tables another
+// suite also TRUNCATEs, and `node --test` runs files in parallel.
+let sharedTableLock: SharedTableLock;
 
 function store(options?: { readBack?: Pool }) {
   return createPostgresTrustedMemoryStore(
@@ -71,6 +78,7 @@ before(async () => {
   adminPool = createMailDbPool({
     AALIYAH_DATABASE_URL: DB_URL,
   } as NodeJS.ProcessEnv);
+  sharedTableLock = await lockSharedMemoryTables(adminPool);
   await runMailMigrations(adminPool);
   writePool = createMailDbPool({
     AALIYAH_DATABASE_URL: DB_URL,
@@ -138,6 +146,7 @@ after(async () => {
   await writePool.end();
   await adminPool.query(`DROP SCHEMA IF EXISTS ${SHADOW_SCHEMA} CASCADE`);
   await adminPool.query(`DROP SCHEMA IF EXISTS ${UNCHECKED_SCHEMA} CASCADE`);
+  await sharedTableLock.release();
   await adminPool.end();
 });
 
