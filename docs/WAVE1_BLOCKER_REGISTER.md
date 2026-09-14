@@ -140,3 +140,45 @@ including a mutant that deleted 71 of 73 lines of runtime verification. Any
 entry above that is later claimed CLOSED must be closed with tests that
 **fail when the control is deleted** — not merely tests that pass while it is
 present. See founder authorization Part G, mandatory mutation targets.
+
+## W1BR-006 — Canonical digest: fractional numeric residual
+
+- **Gate:** W1.3 · **Source:** Mutation + Security, confirmed by orchestrator against live PostgreSQL 16
+- **Location:** `aaliyah-contracts` `src/v1/canonical-digest.ts` @ `8f24129`
+
+PostgreSQL `jsonb` stores numbers as arbitrary-precision `numeric`; Node's
+`JSON.parse` collapses them to IEEE-754 doubles. Two distinct persisted values
+can therefore digest identically.
+
+Commit `8f24129` adopted the enforced-precondition option: accepted numbers must
+satisfy `Number.isSafeInteger(v) || !Number.isInteger(v)`. Executed against the
+shipped module:
+
+| input | result |
+| --- | --- |
+| `9007199254740993` | REJECTED — integer magnitude exceeds exact range |
+| `12345678901234567890` | REJECTED |
+| `0.1` vs `0.1000000000000000000001` | **same digest** |
+| `3` vs `3.0000000000000000001` | **same digest** |
+| `1.5` vs `1.5000000000000000001` | **same digest** |
+
+PostgreSQL returns `0.1000000000000000000001` and `3.0000000000000000001`
+verbatim, so the collapse is on the JS side, before the digest.
+
+**Integer collision class: CLOSED. Fractional collision class: OPEN.**
+
+- **Disposition:** `OPEN` (residual, documented and tested — not a silent gap)
+- **Exploit precondition:** a writer that is not this JS layer — SQL-side
+  arithmetic, a `numeric`→`jsonb` cast, or a non-JS service — must place a
+  high-precision decimal on the receipt path. A JS writer cannot produce one:
+  the value collapses before it is ever written.
+- **Closure path:** digest the database's exact decimal *text* rather than a
+  parsed JS number (the "strict" option). Not adoptable inside
+  `canonical-digest.ts` alone — `MemoryProvenanceReceiptSchema` and
+  `MemoryPromotionReceiptSchema` declare `recordVersion: z.number()`
+  (`wave1-memory.ts:149,188`) and those receipts are exactly what is digested,
+  so strict rejection would fail honest stores closed. Closing this requires a
+  coordinated call-site migration carrying numerics as canonical decimal
+  strings.
+- **Interim control required in Part B:** Core must be the only writer on the
+  receipt path, and that exclusivity must be enforced, not assumed.
