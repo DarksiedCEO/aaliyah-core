@@ -1520,6 +1520,1035 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
     REVOKE UPDATE (consumed_at)
       ON memory_authorization_receipts FROM aaliyah_memory_mutator`,
   },
+  {
+    // W1.3 PART F — LEGAL HOLDS, ENFORCED IN THE DATABASE.
+    //
+    // THE CONFIRMED DEFECT THIS CLOSES. `legalHoldRestricts` existed in
+    // contracts and was NEVER CALLED anywhere in Core: a grep across the
+    // trusted-memory files returned one hit, a prose disclaimer in a header,
+    // and the `legal_hold_active` abort reason was unreachable. A hold was a
+    // shape nobody consulted. Worse, the ORIGINAL design gated DELETION only,
+    // so `correct` could rewrite a held record — and the correction schema
+    // REQUIRES the content to change, which made the supported, audited,
+    // receipt-bearing path a spoliation path.
+    //
+    // THERE IS NO `restrictedActions` COLUMN HERE, DELIBERATELY, for the same
+    // reason the contract has no such member: a list of restricted actions is
+    // a list somebody under-fills. An ACTIVE HOLD RESTRICTS EVERY ACTION. The
+    // only narrowing is an explicit carve-out row that names its court order
+    // and its granting authority, and `memory_legal_hold_carve_outs_never`
+    // makes a carve-out for delete, correct, merge_identity or split_identity
+    // physically unrepresentable — those four destroy or reshape the very
+    // evidence a hold exists to preserve.
+    //
+    // WHY THE ENFORCEMENT IS A TRIGGER AND NOT A CHECK IN `mutate()`. A
+    // property that lives in TypeScript binds only the writes that come
+    // through TypeScript. Migration 034 already established the posture: the
+    // hold is consulted by an AFTER INSERT trigger on
+    // `memory_record_versions`, so a hostile writer holding
+    // `aaliyah_memory_mutator` and issuing a direct INSERT is refused by the
+    // same control as the application. The ACTION is not taken from the
+    // inserting statement — it is read from the CONSUMED NONCE that 034
+    // already requires to witness the row, which is the one table the mutator
+    // can neither insert into nor mint.
+    //
+    // SUBJECT COVERAGE FAILS CLOSED AND OVER-BLOCKS, SAID PLAINLY. A hold
+    // whose coverage is `subjects` names canonical participant ids. A
+    // `memory_record_versions` row carries no participant edge — there is no
+    // record -> participant relation in this schema — so the record-level
+    // guard CANNOT evaluate subject coverage precisely. It therefore treats an
+    // active `subjects` hold as covering the whole (tenant, workspace) scope.
+    // That over-blocks legitimate writes; the alternative is to let a
+    // subject-scoped hold be silently unenforced, which is the defect this
+    // migration exists to kill. The alias path, which DOES carry
+    // `canonical_participant_id`, is matched precisely.
+    //
+    // NOT SOLVED: a superuser drops these triggers or releases a hold
+    // directly. Nothing inside the database defends against its owner.
+    id: "036_memory_legal_holds",
+    sql: `DO $do$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aaliyah_memory_hold_officer') THEN
+          CREATE ROLE aaliyah_memory_hold_officer NOLOGIN;
+        END IF;
+      END
+      $do$;
+    CREATE TABLE IF NOT EXISTS memory_legal_holds (
+      id bigserial PRIMARY KEY,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      principal_id text NOT NULL,
+      user_id text NOT NULL,
+      hold_id text NOT NULL,
+      matter_ref text NOT NULL,
+      issuing_authority_id text NOT NULL,
+      issued_at timestamptz NOT NULL,
+      coverage_kind text NOT NULL,
+      status_state text NOT NULL,
+      released_at timestamptz,
+      releasing_authority_id text,
+      release_order_ref text,
+      payload jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT memory_legal_holds_unique
+        UNIQUE (tenant_id, workspace_id, hold_id),
+      CONSTRAINT memory_legal_holds_fk_target
+        UNIQUE (tenant_id, workspace_id, hold_id, coverage_kind),
+      CONSTRAINT memory_legal_holds_coverage_domain
+        CHECK (coverage_kind IN ('records', 'subjects', 'entire_scope')),
+      CONSTRAINT memory_legal_holds_status_domain
+        CHECK (status_state IN ('active', 'released')),
+      CONSTRAINT memory_legal_holds_release_witness
+        CHECK ((status_state = 'released') = (released_at IS NOT NULL)
+               AND (status_state = 'released') = (releasing_authority_id IS NOT NULL)
+               AND (status_state = 'released') = (release_order_ref IS NOT NULL)),
+      CONSTRAINT memory_legal_holds_release_after_issue
+        CHECK (released_at IS NULL OR released_at > issued_at),
+      CONSTRAINT memory_legal_holds_payload_object
+        CHECK (jsonb_typeof(payload) = 'object'),
+      CONSTRAINT memory_legal_holds_tenant_binding
+        CHECK (payload->'scope'->>'tenantId' IS NOT NULL
+               AND payload->'scope'->>'tenantId' = tenant_id),
+      CONSTRAINT memory_legal_holds_workspace_binding
+        CHECK (payload->'scope'->>'workspaceId' IS NOT NULL
+               AND payload->'scope'->>'workspaceId' = workspace_id),
+      CONSTRAINT memory_legal_holds_principal_binding
+        CHECK (payload->'scope'->>'principalId' IS NOT NULL
+               AND payload->'scope'->>'principalId' = principal_id),
+      CONSTRAINT memory_legal_holds_user_binding
+        CHECK (payload->'scope'->>'userId' IS NOT NULL
+               AND payload->'scope'->>'userId' = user_id),
+      CONSTRAINT memory_legal_holds_hold_binding
+        CHECK (payload->>'holdId' IS NOT NULL
+               AND payload->>'holdId' = hold_id),
+      CONSTRAINT memory_legal_holds_matter_binding
+        CHECK (payload->>'matterRef' IS NOT NULL
+               AND payload->>'matterRef' = matter_ref),
+      CONSTRAINT memory_legal_holds_authority_binding
+        CHECK (payload->>'issuingAuthorityId' IS NOT NULL
+               AND payload->>'issuingAuthorityId' = issuing_authority_id),
+      CONSTRAINT memory_legal_holds_coverage_binding
+        CHECK (payload->'coverage'->>'kind' IS NOT NULL
+               AND payload->'coverage'->>'kind' = coverage_kind),
+      CONSTRAINT memory_legal_holds_status_binding
+        CHECK (payload->'status'->>'state' IS NOT NULL
+               AND payload->'status'->>'state' = status_state)
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_legal_holds_active
+      ON memory_legal_holds (tenant_id, workspace_id, coverage_kind)
+      WHERE status_state = 'active';
+    CREATE TABLE IF NOT EXISTS memory_legal_hold_records (
+      id bigserial PRIMARY KEY,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      hold_id text NOT NULL,
+      coverage_kind text NOT NULL,
+      record_id text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT memory_legal_hold_records_unique
+        UNIQUE (tenant_id, workspace_id, hold_id, record_id),
+      CONSTRAINT memory_legal_hold_records_kind
+        CHECK (coverage_kind = 'records'),
+      CONSTRAINT memory_legal_hold_records_hold_fk
+        FOREIGN KEY (tenant_id, workspace_id, hold_id, coverage_kind)
+        REFERENCES memory_legal_holds (tenant_id, workspace_id, hold_id, coverage_kind)
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_legal_hold_records_lookup
+      ON memory_legal_hold_records (tenant_id, workspace_id, record_id);
+    CREATE TABLE IF NOT EXISTS memory_legal_hold_subjects (
+      id bigserial PRIMARY KEY,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      hold_id text NOT NULL,
+      coverage_kind text NOT NULL,
+      canonical_participant_id text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT memory_legal_hold_subjects_unique
+        UNIQUE (tenant_id, workspace_id, hold_id, canonical_participant_id),
+      CONSTRAINT memory_legal_hold_subjects_kind
+        CHECK (coverage_kind = 'subjects'),
+      CONSTRAINT memory_legal_hold_subjects_hold_fk
+        FOREIGN KEY (tenant_id, workspace_id, hold_id, coverage_kind)
+        REFERENCES memory_legal_holds (tenant_id, workspace_id, hold_id, coverage_kind)
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_legal_hold_subjects_lookup
+      ON memory_legal_hold_subjects (tenant_id, workspace_id, canonical_participant_id);
+    CREATE TABLE IF NOT EXISTS memory_legal_hold_carve_outs (
+      id bigserial PRIMARY KEY,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      hold_id text NOT NULL,
+      action text NOT NULL,
+      order_ref text NOT NULL,
+      granting_authority_id text NOT NULL,
+      granted_at timestamptz NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT memory_legal_hold_carve_outs_unique
+        UNIQUE (tenant_id, workspace_id, hold_id, action),
+      CONSTRAINT memory_legal_hold_carve_outs_action_domain
+        CHECK (action IN ('create', 'correct', 'delete', 'restore', 'promote',
+                          'assign_alias', 'remove_alias', 'merge_identity',
+                          'split_identity')),
+      -- MEMORY_ACTIONS_NEVER_CARVED_OUT, in the database. A carve-out for a
+      -- content-destroying or graph-reshaping action is spoliation with a
+      -- cover letter, and it is not representable here for any writer.
+      CONSTRAINT memory_legal_hold_carve_outs_never
+        CHECK (action NOT IN ('delete', 'correct', 'merge_identity',
+                              'split_identity')),
+      CONSTRAINT memory_legal_hold_carve_outs_hold_fk
+        FOREIGN KEY (tenant_id, workspace_id, hold_id)
+        REFERENCES memory_legal_holds (tenant_id, workspace_id, hold_id)
+    );
+    CREATE TABLE IF NOT EXISTS memory_retention_obligations (
+      id bigserial PRIMARY KEY,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      obligation_id text NOT NULL,
+      record_id text NOT NULL,
+      policy_ref text NOT NULL,
+      retain_until timestamptz NOT NULL,
+      imposing_authority_id text NOT NULL,
+      imposed_at timestamptz NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT memory_retention_obligations_unique
+        UNIQUE (tenant_id, workspace_id, obligation_id),
+      CONSTRAINT memory_retention_obligations_window
+        CHECK (retain_until > imposed_at)
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_retention_obligations_lookup
+      ON memory_retention_obligations
+      (tenant_id, workspace_id, record_id, retain_until DESC);
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_jsonb_strings(doc jsonb)
+      RETURNS SETOF text
+      LANGUAGE sql
+      IMMUTABLE
+      SET search_path = pg_catalog, public
+      AS $fn$
+        WITH RECURSIVE walk(node) AS (
+          SELECT doc
+          UNION ALL
+          SELECT child.value
+          FROM walk
+          CROSS JOIN LATERAL (
+            SELECT value FROM pg_catalog.jsonb_array_elements(
+              CASE WHEN pg_catalog.jsonb_typeof(walk.node) = 'array'
+                   THEN walk.node ELSE '[]'::jsonb END)
+            UNION ALL
+            SELECT value FROM pg_catalog.jsonb_each(
+              CASE WHEN pg_catalog.jsonb_typeof(walk.node) = 'object'
+                   THEN walk.node ELSE '{}'::jsonb END)
+          ) AS child(value)
+        )
+        SELECT node #>> '{}' FROM walk
+         WHERE pg_catalog.jsonb_typeof(node) = 'string';
+      $fn$;
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_jsonb_member_names(doc jsonb)
+      RETURNS SETOF text
+      LANGUAGE sql
+      IMMUTABLE
+      SET search_path = pg_catalog, public
+      AS $fn$
+        WITH RECURSIVE walk(node) AS (
+          SELECT doc
+          UNION ALL
+          SELECT child.value
+          FROM walk
+          CROSS JOIN LATERAL (
+            SELECT value FROM pg_catalog.jsonb_array_elements(
+              CASE WHEN pg_catalog.jsonb_typeof(walk.node) = 'array'
+                   THEN walk.node ELSE '[]'::jsonb END)
+            UNION ALL
+            SELECT value FROM pg_catalog.jsonb_each(
+              CASE WHEN pg_catalog.jsonb_typeof(walk.node) = 'object'
+                   THEN walk.node ELSE '{}'::jsonb END)
+          ) AS child(value)
+        )
+        SELECT k FROM walk
+         CROSS JOIN LATERAL pg_catalog.jsonb_object_keys(
+           CASE WHEN pg_catalog.jsonb_typeof(walk.node) = 'object'
+                THEN walk.node ELSE '{}'::jsonb END) AS k;
+      $fn$;
+    -- THE FREE-TEXT GATE. Every string anywhere in a hold or a tombstone must
+    -- be an identifier, an evidence reference, an enum word, a digest, a
+    -- field name or an ISO instant. "SENSITIVE: CEO divorce settlement terms"
+    -- matches none of those, and neither does any sentence: the identifier
+    -- form admits no spaces and no leading capital. This is the structural
+    -- half of "a tombstone has nowhere to put the payload it destroyed".
+    --
+    -- DISCLOSED LIMIT: a lowercase, space-free, punctuation-limited token is
+    -- indistinguishable from an identifier and would pass. The gate bounds the
+    -- SHAPE of what can survive here; it is not a classifier.
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_first_free_text(doc jsonb)
+      RETURNS text
+      LANGUAGE sql
+      STABLE
+      SET search_path = pg_catalog, public
+      AS $fn$
+        SELECT s FROM public.aaliyah_memory_jsonb_strings(doc) AS t(s)
+         WHERE NOT (
+           s ~ '^[a-z0-9][a-z0-9._:/+_-]{0,253}$'
+           OR s ~ '^[a-z][a-zA-Z0-9_]{0,63}$'
+           OR s ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$'
+         )
+         LIMIT 1;
+      $fn$;
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_legal_hold_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      BEGIN
+        IF TG_OP = 'DELETE' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: DELETE on % is forbidden; a legal hold is released, never erased'
+            , TG_TABLE_NAME
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF TG_OP = 'UPDATE' THEN
+          IF OLD.status_state <> 'active' THEN
+            RAISE EXCEPTION
+              'aaliyah memory: a released legal hold is immutable'
+              USING ERRCODE = 'check_violation';
+          END IF;
+          IF NEW.status_state <> 'released' THEN
+            RAISE EXCEPTION
+              'aaliyah memory: release is the only permitted update to a legal hold'
+              USING ERRCODE = 'check_violation';
+          END IF;
+          IF (pg_catalog.to_jsonb(NEW) - 'status_state' - 'released_at'
+                - 'releasing_authority_id' - 'release_order_ref' - 'payload')
+             IS DISTINCT FROM
+             (pg_catalog.to_jsonb(OLD) - 'status_state' - 'released_at'
+                - 'releasing_authority_id' - 'release_order_ref' - 'payload') THEN
+            RAISE EXCEPTION
+              'aaliyah memory: releasing a hold may not rewrite its coverage'
+              USING ERRCODE = 'check_violation';
+          END IF;
+          IF (NEW.payload - 'status') IS DISTINCT FROM (OLD.payload - 'status') THEN
+            RAISE EXCEPTION
+              'aaliyah memory: releasing a hold may not rewrite its coverage'
+              USING ERRCODE = 'check_violation';
+          END IF;
+        END IF;
+        IF public.aaliyah_memory_first_free_text(NEW.payload) IS NOT NULL THEN
+          -- The VALUE is deliberately absent from this message: migration 033
+          -- closed exactly this leak on the numeric path.
+          RAISE EXCEPTION
+            'aaliyah memory: a legal hold may not carry free-form text'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_legal_holds_release_only ON memory_legal_holds;
+    CREATE TRIGGER memory_legal_holds_release_only
+      BEFORE INSERT OR UPDATE OR DELETE ON memory_legal_holds
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_legal_hold_guard();
+    DROP TRIGGER IF EXISTS memory_legal_hold_records_append_only
+      ON memory_legal_hold_records;
+    CREATE TRIGGER memory_legal_hold_records_append_only
+      BEFORE UPDATE OR DELETE ON memory_legal_hold_records
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_forbid_row_rewrite();
+    DROP TRIGGER IF EXISTS memory_legal_hold_subjects_append_only
+      ON memory_legal_hold_subjects;
+    CREATE TRIGGER memory_legal_hold_subjects_append_only
+      BEFORE UPDATE OR DELETE ON memory_legal_hold_subjects
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_forbid_row_rewrite();
+    DROP TRIGGER IF EXISTS memory_legal_hold_carve_outs_append_only
+      ON memory_legal_hold_carve_outs;
+    CREATE TRIGGER memory_legal_hold_carve_outs_append_only
+      BEFORE UPDATE OR DELETE ON memory_legal_hold_carve_outs
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_forbid_row_rewrite();
+    DROP TRIGGER IF EXISTS memory_retention_obligations_append_only
+      ON memory_retention_obligations;
+    CREATE TRIGGER memory_retention_obligations_append_only
+      BEFORE UPDATE OR DELETE ON memory_retention_obligations
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_forbid_row_rewrite();
+    -- THE LOOKUP EVERY GUARD BELOW SHARES. Answers the hold id that RESTRICTS
+    -- this action on this record, or NULL. A carve-out narrows exactly the one
+    -- action it names and nothing else.
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_restricting_hold(
+      p_tenant text, p_workspace text, p_record text,
+      p_participant text, p_action text)
+      RETURNS text
+      LANGUAGE sql
+      STABLE
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+        SELECT h.hold_id
+          FROM public.memory_legal_holds AS h
+         WHERE h.tenant_id = p_tenant
+           AND h.workspace_id = p_workspace
+           AND h.status_state = 'active'
+           AND (
+             h.coverage_kind = 'entire_scope'
+             OR (h.coverage_kind = 'records' AND EXISTS (
+                   SELECT 1 FROM public.memory_legal_hold_records AS r
+                    WHERE r.tenant_id = h.tenant_id
+                      AND r.workspace_id = h.workspace_id
+                      AND r.hold_id = h.hold_id
+                      AND r.record_id = p_record))
+             OR (h.coverage_kind = 'subjects' AND p_participant IS NULL)
+             OR (h.coverage_kind = 'subjects' AND p_participant IS NOT NULL
+                 AND EXISTS (
+                   SELECT 1 FROM public.memory_legal_hold_subjects AS s
+                    WHERE s.tenant_id = h.tenant_id
+                      AND s.workspace_id = h.workspace_id
+                      AND s.hold_id = h.hold_id
+                      AND s.canonical_participant_id = p_participant))
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM public.memory_legal_hold_carve_outs AS c
+              WHERE c.tenant_id = h.tenant_id
+                AND c.workspace_id = h.workspace_id
+                AND c.hold_id = h.hold_id
+                AND c.action = p_action)
+         ORDER BY h.id ASC
+         LIMIT 1;
+      $fn$;
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_record_version_hold_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        acted text;
+        blocking text;
+      BEGIN
+        -- The action is NOT taken from the inserting statement. It is read
+        -- from the consumed nonce that migration 034 already requires to
+        -- witness this row, which is the one table the mutator can neither
+        -- insert into nor mint.
+        SELECT n.action INTO acted
+          FROM public.memory_authorization_nonces AS n
+         WHERE n.tenant_id = NEW.tenant_id
+           AND n.authorization_id = NEW.authorization_id
+           AND n.target_record_id = NEW.record_id
+           AND n.consumed_at IS NOT NULL
+           AND n.consumed_by_mutation_receipt_id = NEW.mutation_receipt_id
+         LIMIT 1;
+        IF acted IS NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: the action of this append cannot be resolved, so a legal hold cannot be evaluated'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        blocking := public.aaliyah_memory_restricting_hold(
+          NEW.tenant_id, NEW.workspace_id, NEW.record_id, NULL, acted);
+        IF blocking IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: legal hold % restricts % on this record'
+            , blocking, acted
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_record_versions_legal_hold
+      ON memory_record_versions;
+    CREATE TRIGGER memory_record_versions_legal_hold
+      AFTER INSERT ON memory_record_versions
+      FOR EACH ROW
+      EXECUTE FUNCTION public.aaliyah_memory_record_version_hold_guard();
+    CREATE OR REPLACE FUNCTION public.aaliyah_alias_binding_hold_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        acted text;
+        target text;
+        blocking text;
+        auth_id text;
+        receipt_id text;
+      BEGIN
+        IF TG_OP = 'INSERT' THEN
+          auth_id := NEW.authorization_id;
+          receipt_id := NEW.mutation_receipt_id;
+        ELSE
+          auth_id := NEW.removed_authorization_id;
+          receipt_id := NEW.removed_by_mutation_receipt_id;
+        END IF;
+        SELECT n.action, n.target_record_id INTO acted, target
+          FROM public.memory_authorization_nonces AS n
+         WHERE n.tenant_id = NEW.tenant_id
+           AND n.authorization_id = auth_id
+           AND n.consumed_at IS NOT NULL
+           AND n.consumed_by_mutation_receipt_id = receipt_id
+         LIMIT 1;
+        IF acted IS NULL THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: the action of this binding cannot be resolved, so a legal hold cannot be evaluated'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        blocking := public.aaliyah_memory_restricting_hold(
+          NEW.tenant_id, NEW.workspace_id, target,
+          NEW.canonical_participant_id, acted);
+        IF blocking IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: legal hold % restricts % on this participant'
+            , blocking, acted
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_alias_bindings_legal_hold
+      ON memory_alias_bindings;
+    CREATE TRIGGER memory_alias_bindings_legal_hold
+      AFTER INSERT OR UPDATE ON memory_alias_bindings
+      FOR EACH ROW
+      EXECUTE FUNCTION public.aaliyah_alias_binding_hold_guard();
+    -- PRIVILEGES. The hold officer is the ONLY role that may place or release
+    -- a hold or impose a retention obligation. The mutator gets SELECT and
+    -- nothing else: a role that can lift its own hold has no hold, which is
+    -- the same argument migration 032 makes about the alias policy tables.
+    GRANT SELECT ON
+      memory_legal_holds,
+      memory_legal_hold_records,
+      memory_legal_hold_subjects,
+      memory_legal_hold_carve_outs,
+      memory_retention_obligations
+      TO aaliyah_memory_mutator, aaliyah_memory_reader,
+         aaliyah_memory_issuer, aaliyah_memory_revoker,
+         aaliyah_memory_hold_officer;
+    GRANT SELECT ON
+      memory_record_versions,
+      memory_authorization_receipts,
+      memory_authorization_nonces,
+      memory_mutation_receipts
+      TO aaliyah_memory_hold_officer;
+    GRANT INSERT ON
+      memory_legal_holds,
+      memory_legal_hold_records,
+      memory_legal_hold_subjects,
+      memory_legal_hold_carve_outs,
+      memory_retention_obligations
+      TO aaliyah_memory_hold_officer;
+    GRANT USAGE, SELECT ON SEQUENCE
+      memory_legal_holds_id_seq,
+      memory_legal_hold_records_id_seq,
+      memory_legal_hold_subjects_id_seq,
+      memory_legal_hold_carve_outs_id_seq,
+      memory_retention_obligations_id_seq
+      TO aaliyah_memory_hold_officer;
+    GRANT UPDATE (status_state, released_at, releasing_authority_id,
+                  release_order_ref, payload)
+      ON memory_legal_holds TO aaliyah_memory_hold_officer`,
+  },
+  {
+    // W1.3 PART F — DELETION IS ERASURE, AND A TOMBSTONE ACCOUNTS FOR IT.
+    //
+    // THE CONFIRMED DEFECT THIS CLOSES. `delete()` advanced the head to a
+    // `deleted` state and destroyed nothing. "Deleted" was a LABEL. An
+    // independent review of the original candidate found an "erased" record
+    // still holding "SENSITIVE: CEO divorce settlement terms" verbatim at an
+    // earlier version, and the security gate showed the combination with the
+    // takeover defect was worse still: an attacker-driven delete moved the
+    // head to `deleted` while the victim's content stayed fully readable at
+    // version 1.
+    //
+    // ERASURE VERSUS THE APPEND-ONLY CHAIN — THE RESOLUTION, STATED ONCE.
+    //
+    // Migrations 028 and 034 make the version chain append-only: UPDATE and
+    // DELETE are refused, every appended version must be witnessed by a
+    // consumed authorization, contiguous in version, linked by predecessor
+    // digest, with owner continuity. Real erasure must destroy prior content.
+    // Those look contradictory. They are not, once CHAIN METADATA and RECORD
+    // CONTENT are separated:
+    //
+    //   * CHAIN METADATA — version, state, content_digest,
+    //     predecessor_digest, authorization_id, mutation_receipt_id, the four
+    //     scope columns, created_at — stays APPEND-ONLY AND IMMUTABLE. Nothing
+    //     below may touch it. Every integrity property 034 enforces is stated
+    //     purely over these columns, so every one of them still holds after an
+    //     erasure, and the chain is still walkable and verifiable end to end.
+    //
+    //   * RECORD CONTENT — `payload->'content'` alone — is MUTABLE EXACTLY
+    //     ONCE, from its value to JSON `null`, and only under a tombstone that
+    //     already exists and names this record. `content_erased_at` records
+    //     that the transition happened and makes it unrepeatable.
+    //
+    // The content digest is DELIBERATELY RETAINED: it is what keeps the next
+    // version's `predecessor_digest` meaningful, so erasing a record does not
+    // break the successor's linkage. The honest consequence, disclosed: the
+    // digest is unkeyed, so it remains an offline oracle for guessed content
+    // exactly as W1BR-008 already says. Erasure removes the plaintext, not the
+    // oracle.
+    //
+    // "DELETED" CANNOT BE A LABEL AGAIN. `memory_record_versions_deletion_erases`
+    // is a DEFERRED CONSTRAINT TRIGGER: at COMMIT, a record that has just
+    // acquired a `deleted` head and still has ANY unerased prior version is
+    // refused. Marking without erasing is not representable for any writer,
+    // not only for callers of `delete()`.
+    //
+    // A TOMBSTONE HAS NOWHERE TO PUT THE PAYLOAD. Three independent controls:
+    // the top-level key set is CLOSED to the eighteen contract members; no
+    // member anywhere may be named `content`, `payload`, `value`, `body`,
+    // `text`, `note`, `data`, `plaintext` or `secret`; and every string
+    // anywhere must pass `aaliyah_memory_first_free_text`. `legal_hold_state`
+    // is additionally forbidden from being `held`, because destroying under an
+    // active hold is spoliation.
+    //
+    // THE DELETED HEAD CANNOT CARRY THE PAYLOAD EITHER. The content of a
+    // version whose state is `deleted` must be a DELETION ORDER: exactly three
+    // members, a pinned schema version, a reason from the contract's closed
+    // enum, and an evidence reference. A delete therefore cannot smuggle the
+    // record's plaintext forward into the version it is deleting it at.
+    //
+    // NOT SOLVED, SAID PLAINLY. Nulling `payload->'content'` writes a new heap
+    // tuple; the old one survives until VACUUM, and the pre-image is in the
+    // WAL, in any replica, and in any physical backup taken before the
+    // erasure. The tombstone's propagation members exist precisely because
+    // Core cannot claim otherwise, and `unknown` is the honest answer this
+    // implementation records. A superuser can also drop every trigger here.
+    id: "037_memory_erasure_tombstones",
+    sql: `DO $do$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_attribute
+           WHERE attrelid = 'public.memory_record_versions'::regclass
+             AND attname = 'content_erased_at'
+             AND NOT attisdropped
+        ) THEN
+          ALTER TABLE public.memory_record_versions
+            ADD COLUMN content_erased_at timestamptz,
+            ADD COLUMN erasure_tombstone_id text;
+          ALTER TABLE public.memory_record_versions
+            ADD CONSTRAINT memory_record_versions_erasure_witness
+            CHECK ((content_erased_at IS NULL) = (erasure_tombstone_id IS NULL));
+        END IF;
+      END
+      $do$;
+    CREATE TABLE IF NOT EXISTS memory_tombstones (
+      id bigserial PRIMARY KEY,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      principal_id text NOT NULL,
+      user_id text NOT NULL,
+      tombstone_id text NOT NULL,
+      target_record_id text NOT NULL,
+      target_version integer NOT NULL,
+      tombstone_version integer NOT NULL,
+      authorization_id text NOT NULL,
+      mutation_receipt_id text NOT NULL,
+      reason text NOT NULL,
+      effective_at timestamptz NOT NULL,
+      retain_until timestamptz,
+      legal_hold_state text NOT NULL,
+      cache_index_propagation text NOT NULL,
+      restoration_eligibility_kind text NOT NULL,
+      tombstone_digest text NOT NULL,
+      payload jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT memory_tombstones_unique
+        UNIQUE (tenant_id, workspace_id, tombstone_id),
+      CONSTRAINT memory_tombstones_version_unique
+        UNIQUE (tenant_id, workspace_id, target_record_id, tombstone_version),
+      CONSTRAINT memory_tombstones_reason_domain
+        CHECK (reason IN ('subject_erasure_request', 'retention_expiry',
+                          'erroneous_record', 'policy_violation',
+                          'legal_requirement', 'duplicate_record')),
+      CONSTRAINT memory_tombstones_hold_state_domain
+        CHECK (legal_hold_state IN ('none', 'held', 'released')),
+      -- Spoliation, unrepresentable. A tombstone that admits its target was
+      -- under an active hold is a confession, not a record.
+      CONSTRAINT memory_tombstones_not_under_hold
+        CHECK (legal_hold_state <> 'held'),
+      CONSTRAINT memory_tombstones_propagation_domain
+        CHECK (cache_index_propagation IN ('not_started', 'in_progress',
+                                           'complete', 'failed', 'unknown')),
+      -- THERE IS NO ESCROW IN THIS REPOSITORY. Claiming a destroyed
+      -- payload is restorable from an escrow that does not exist is the exact
+      -- class of false assurance this whole path exists to remove.
+      CONSTRAINT memory_tombstones_restoration_domain
+        CHECK (restoration_eligibility_kind = 'ineligible_payload_destroyed'),
+      CONSTRAINT memory_tombstones_versions_ordered
+        CHECK (tombstone_version > target_version AND target_version >= 1),
+      CONSTRAINT memory_tombstones_digest_form
+        CHECK (tombstone_digest ~ '^sha256:[a-f0-9]{64}$'),
+      CONSTRAINT memory_tombstones_payload_object
+        CHECK (jsonb_typeof(payload) = 'object'),
+      CONSTRAINT memory_tombstones_tenant_binding
+        CHECK (payload->'scope'->>'tenantId' IS NOT NULL
+               AND payload->'scope'->>'tenantId' = tenant_id),
+      CONSTRAINT memory_tombstones_workspace_binding
+        CHECK (payload->'scope'->>'workspaceId' IS NOT NULL
+               AND payload->'scope'->>'workspaceId' = workspace_id),
+      CONSTRAINT memory_tombstones_principal_binding
+        CHECK (payload->'scope'->>'principalId' IS NOT NULL
+               AND payload->'scope'->>'principalId' = principal_id),
+      CONSTRAINT memory_tombstones_user_binding
+        CHECK (payload->'scope'->>'userId' IS NOT NULL
+               AND payload->'scope'->>'userId' = user_id),
+      CONSTRAINT memory_tombstones_id_binding
+        CHECK (payload->>'tombstoneId' IS NOT NULL
+               AND payload->>'tombstoneId' = tombstone_id),
+      CONSTRAINT memory_tombstones_target_binding
+        CHECK (payload->>'targetRecordId' IS NOT NULL
+               AND payload->>'targetRecordId' = target_record_id),
+      CONSTRAINT memory_tombstones_target_version_binding
+        CHECK (payload->>'targetVersion' IS NOT NULL
+               AND payload->>'targetVersion' = target_version::text),
+      CONSTRAINT memory_tombstones_tombstone_version_binding
+        CHECK (payload->>'tombstoneVersion' IS NOT NULL
+               AND payload->>'tombstoneVersion' = tombstone_version::text),
+      CONSTRAINT memory_tombstones_authorization_binding
+        CHECK (payload->'deletionAuthority'->>'authorizationId' IS NOT NULL
+               AND payload->'deletionAuthority'->>'authorizationId' = authorization_id),
+      CONSTRAINT memory_tombstones_reason_binding
+        CHECK (payload->>'reason' IS NOT NULL
+               AND payload->>'reason' = reason),
+      CONSTRAINT memory_tombstones_hold_state_binding
+        CHECK (payload->'retention'->'legalHoldState'->>'state' IS NOT NULL
+               AND payload->'retention'->'legalHoldState'->>'state' = legal_hold_state),
+      CONSTRAINT memory_tombstones_propagation_binding
+        CHECK (payload->>'cacheIndexPropagation' IS NOT NULL
+               AND payload->>'cacheIndexPropagation' = cache_index_propagation),
+      CONSTRAINT memory_tombstones_restoration_binding
+        CHECK (payload->'restorationEligibility'->>'kind' IS NOT NULL
+               AND payload->'restorationEligibility'->>'kind' = restoration_eligibility_kind),
+      CONSTRAINT memory_tombstones_digest_binding
+        CHECK (payload->>'tombstoneDigest' IS NOT NULL
+               AND payload->>'tombstoneDigest' = tombstone_digest),
+      CONSTRAINT memory_tombstones_destroyed_not_empty
+        CHECK (jsonb_typeof(payload->'destroyedFieldNames') = 'array'
+               AND jsonb_array_length(payload->'destroyedFieldNames') >= 1)
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_tombstones_target
+      ON memory_tombstones (tenant_id, workspace_id, target_record_id, id DESC);
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_tombstone_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        offending text;
+        blocking text;
+        obligation timestamptz;
+        head_state text;
+      BEGIN
+        IF (SELECT pg_catalog.count(*) FROM pg_catalog.jsonb_object_keys(NEW.payload)) <> 18
+           OR NOT (NEW.payload ?& ARRAY[
+             'schemaVersion','tombstoneId','scope','targetRecordId',
+             'targetVersion','tombstoneVersion','deletionAuthority','reason',
+             'reasonEvidenceRef','effectiveAt','retention','retainedFieldNames',
+             'destroyedFieldNames','derivedData','cacheIndexPropagation',
+             'downstreamPropagation','restorationEligibility','tombstoneDigest'])
+        THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a tombstone must carry exactly the contract member set'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        SELECT k INTO offending
+          FROM public.aaliyah_memory_jsonb_member_names(NEW.payload) AS t(k)
+         WHERE pg_catalog.lower(k) IN ('content','payload','value','body','text',
+                                       'note','data','plaintext','secret')
+         LIMIT 1;
+        IF offending IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a tombstone may not carry a payload-bearing member'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF public.aaliyah_memory_first_free_text(NEW.payload) IS NOT NULL THEN
+          -- The VALUE is deliberately absent: see migration 033, M-4.
+          RAISE EXCEPTION
+            'aaliyah memory: a tombstone may not carry free-form text'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        SELECT v.state INTO head_state
+          FROM public.memory_record_versions AS v
+         WHERE v.tenant_id = NEW.tenant_id
+           AND v.workspace_id = NEW.workspace_id
+           AND v.record_id = NEW.target_record_id
+           AND v.version = NEW.tombstone_version
+         LIMIT 1;
+        IF head_state IS DISTINCT FROM 'deleted' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a tombstone must name a deleted version of its target record'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        blocking := public.aaliyah_memory_restricting_hold(
+          NEW.tenant_id, NEW.workspace_id, NEW.target_record_id, NULL, 'delete');
+        IF blocking IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: legal hold % restricts delete on this record'
+            , blocking
+            USING ERRCODE = 'check_violation';
+        END IF;
+        SELECT pg_catalog.max(o.retain_until) INTO obligation
+          FROM public.memory_retention_obligations AS o
+         WHERE o.tenant_id = NEW.tenant_id
+           AND o.workspace_id = NEW.workspace_id
+           AND o.record_id = NEW.target_record_id
+           AND o.retain_until > pg_catalog.now();
+        IF obligation IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: an unexpired retention obligation forbids destroying this record'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_tombstones_structural ON memory_tombstones;
+    CREATE TRIGGER memory_tombstones_structural
+      BEFORE INSERT OR UPDATE ON memory_tombstones
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_tombstone_guard();
+    DROP TRIGGER IF EXISTS memory_tombstones_append_only ON memory_tombstones;
+    CREATE TRIGGER memory_tombstones_append_only
+      BEFORE UPDATE OR DELETE ON memory_tombstones
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_forbid_row_rewrite();
+    DROP TRIGGER IF EXISTS memory_tombstones_exact_numbers ON memory_tombstones;
+    CREATE TRIGGER memory_tombstones_exact_numbers
+      BEFORE INSERT OR UPDATE ON memory_tombstones
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_reject_inexact_numbers();
+    -- THE ONE PERMITTED REWRITE. Replaces the blanket refusal installed by
+    -- migration 028 on this table, and keeps its message verbatim for every
+    -- case that is not an erasure, because that message is the contract every
+    -- existing caller and test matches on.
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_record_version_rewrite_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        witnessed boolean;
+      BEGIN
+        IF TG_OP = 'DELETE' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: % on % is forbidden; this table is append-only'
+            , TG_OP, TG_TABLE_NAME
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF OLD.content_erased_at IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: an erased record version is immutable'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.content_erased_at IS NULL OR NEW.erasure_tombstone_id IS NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: % on % is forbidden; this table is append-only'
+            , TG_OP, TG_TABLE_NAME
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.payload IS DISTINCT FROM
+           pg_catalog.jsonb_set(OLD.payload, '{content}', 'null'::jsonb) THEN
+          RAISE EXCEPTION
+            'aaliyah memory: erasure may null the content and nothing else'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF (pg_catalog.to_jsonb(NEW) - 'payload' - 'content_erased_at'
+              - 'erasure_tombstone_id')
+           IS DISTINCT FROM
+           (pg_catalog.to_jsonb(OLD) - 'payload' - 'content_erased_at'
+              - 'erasure_tombstone_id') THEN
+          RAISE EXCEPTION
+            'aaliyah memory: erasure may not rewrite the chain metadata'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        SELECT EXISTS (
+          SELECT 1 FROM public.memory_tombstones AS t
+           WHERE t.tenant_id = NEW.tenant_id
+             AND t.workspace_id = NEW.workspace_id
+             AND t.tombstone_id = NEW.erasure_tombstone_id
+             AND t.target_record_id = NEW.record_id
+             AND t.tombstone_version > NEW.version
+        ) INTO witnessed;
+        IF NOT witnessed THEN
+          RAISE EXCEPTION
+            'aaliyah memory: no tombstone authorizes this erasure'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_record_versions_append_only
+      ON memory_record_versions;
+    CREATE TRIGGER memory_record_versions_append_only
+      BEFORE UPDATE OR DELETE ON memory_record_versions
+      FOR EACH ROW
+      EXECUTE FUNCTION public.aaliyah_memory_record_version_rewrite_guard();
+    -- DELETION MUST BE ERASURE. Deferred to COMMIT, because the tombstone and
+    -- the erasing UPDATE necessarily follow the insert of the deleted head
+    -- inside the same transaction.
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_deletion_is_erasure()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        survivor bigint;
+      BEGIN
+        IF NEW.state <> 'deleted' THEN RETURN NULL; END IF;
+        SELECT v.id INTO survivor
+          FROM public.memory_record_versions AS v
+         WHERE v.tenant_id = NEW.tenant_id
+           AND v.workspace_id = NEW.workspace_id
+           AND v.record_id = NEW.record_id
+           AND v.version < NEW.version
+           AND v.content_erased_at IS NULL
+         LIMIT 1;
+        IF survivor IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a deletion must erase every prior version of the record'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_record_versions_deletion_erases
+      ON memory_record_versions;
+    CREATE CONSTRAINT TRIGGER memory_record_versions_deletion_erases
+      AFTER INSERT ON memory_record_versions
+      DEFERRABLE INITIALLY DEFERRED
+      FOR EACH ROW
+      EXECUTE FUNCTION public.aaliyah_memory_deletion_is_erasure();
+    -- THE DELETED HEAD CARRIES A DELETION ORDER, NOT THE RECORD.
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_deletion_order_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        order_doc jsonb;
+      BEGIN
+        IF NEW.state <> 'deleted' THEN RETURN NULL; END IF;
+        order_doc := NEW.payload->'content';
+        IF pg_catalog.jsonb_typeof(order_doc) <> 'object'
+           OR (SELECT pg_catalog.count(*)
+                 FROM pg_catalog.jsonb_object_keys(order_doc)) <> 3
+           OR NOT (order_doc ?& ARRAY['schemaVersion','reason','reasonEvidenceRef'])
+           OR order_doc->>'schemaVersion'
+              <> 'aaliyah.trusted-memory/v1#deletion-order'
+           OR order_doc->>'reason' NOT IN
+              ('subject_erasure_request', 'retention_expiry',
+               'erroneous_record', 'policy_violation',
+               'legal_requirement', 'duplicate_record')
+           OR order_doc->>'reasonEvidenceRef' !~
+              '^[a-z][a-z0-9_-]{1,31}:[a-z0-9][a-z0-9._:/-]{3,223}$'
+        THEN
+          RAISE EXCEPTION
+            'aaliyah memory: the content of a deleted version must be a deletion order'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_record_versions_witnessed_deletion_order
+      ON memory_record_versions;
+    CREATE TRIGGER memory_record_versions_witnessed_deletion_order
+      AFTER INSERT ON memory_record_versions
+      FOR EACH ROW
+      EXECUTE FUNCTION public.aaliyah_memory_deletion_order_guard();
+    -- AN AUTHORIZATION FOR ONE ACTION CANNOT PERFORM ANOTHER, IN THE DATABASE.
+    --
+    -- The contract already binds the action into the nonce, so a relabelled
+    -- receipt no longer matches its own token, and the store compares the
+    -- stored action against the call site. Neither of those binds a writer
+    -- that never comes through the store. This does: the action is read from
+    -- the consumed nonce, and a delete authorization can then only produce a
+    -- deleted version while a restore authorization can only produce an active
+    -- one from a deleted head. A delete authorization is therefore
+    -- structurally incapable of restoring, and a restore authorization of
+    -- deleting, for every writer.
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_action_state_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        acted text;
+        prior_state text;
+      BEGIN
+        SELECT n.action INTO acted
+          FROM public.memory_authorization_nonces AS n
+         WHERE n.tenant_id = NEW.tenant_id
+           AND n.authorization_id = NEW.authorization_id
+           AND n.target_record_id = NEW.record_id
+           AND n.consumed_at IS NOT NULL
+           AND n.consumed_by_mutation_receipt_id = NEW.mutation_receipt_id
+         LIMIT 1;
+        IF acted IS NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: the action of this append cannot be resolved, so its state transition cannot be checked'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF acted = 'delete' AND NEW.state <> 'deleted' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a delete authorization may only produce a deleted version'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF acted <> 'delete' AND NEW.state <> 'active' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: only a delete authorization may produce a deleted version'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        SELECT v.state INTO prior_state
+          FROM public.memory_record_versions AS v
+         WHERE v.tenant_id = NEW.tenant_id
+           AND v.workspace_id = NEW.workspace_id
+           AND v.record_id = NEW.record_id
+           AND v.id <> NEW.id
+         ORDER BY v.version DESC
+         LIMIT 1;
+        IF acted = 'restore' AND prior_state IS DISTINCT FROM 'deleted' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: restore may only follow a deleted head'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF acted <> 'restore' AND prior_state = 'deleted' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a deleted record may only be restored, and only under a restore authorization'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_record_versions_witnessed_action_state
+      ON memory_record_versions;
+    CREATE TRIGGER memory_record_versions_witnessed_action_state
+      AFTER INSERT ON memory_record_versions
+      FOR EACH ROW
+      EXECUTE FUNCTION public.aaliyah_memory_action_state_guard();
+    -- ORDINARY RETRIEVAL, IN THE DATABASE. A deleted or erased record is not
+    -- returned by this relation, so "excluded from retrieval" is a property of
+    -- the store, not a filter a caller can forget to apply.
+    CREATE OR REPLACE VIEW memory_records_retrievable AS
+      SELECT v.tenant_id, v.workspace_id, v.principal_id, v.user_id,
+             v.record_id, v.version, v.state, v.content_digest,
+             v.predecessor_digest, v.authorization_id, v.mutation_receipt_id,
+             v.payload
+        FROM memory_record_versions AS v
+       WHERE v.state = 'active'
+         AND v.content_erased_at IS NULL
+         AND v.id = (SELECT pg_catalog.max(w.id)
+                       FROM memory_record_versions AS w
+                      WHERE w.tenant_id = v.tenant_id
+                        AND w.workspace_id = v.workspace_id
+                        AND w.record_id = v.record_id);
+    GRANT SELECT ON memory_tombstones
+      TO aaliyah_memory_mutator, aaliyah_memory_reader,
+         aaliyah_memory_issuer, aaliyah_memory_revoker,
+         aaliyah_memory_hold_officer;
+    GRANT INSERT ON memory_tombstones TO aaliyah_memory_mutator;
+    GRANT USAGE, SELECT ON SEQUENCE memory_tombstones_id_seq
+      TO aaliyah_memory_mutator;
+    GRANT SELECT ON memory_records_retrievable
+      TO aaliyah_memory_mutator, aaliyah_memory_reader;
+    -- COLUMN-LEVEL, and the rewrite guard above is what makes it safe: the
+    -- mutator may touch exactly these three columns, and the trigger refuses
+    -- every value of them that is not the single erasure transition.
+    GRANT UPDATE (payload, content_erased_at, erasure_tombstone_id)
+      ON memory_record_versions TO aaliyah_memory_mutator`,
+  },
 ];
 
 export async function runMailMigrations(pool: Pool): Promise<void> {

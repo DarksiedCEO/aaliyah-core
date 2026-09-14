@@ -5,8 +5,12 @@ import {
   MemoryScopeSchema,
   WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION,
   canonicalDigest,
+  type MemoryDerivativeDisposition,
+  type MemoryDownstreamPropagation,
   type MemoryMutationReceipt,
+  type MemoryPropagationState,
   type MemoryScope,
+  type MemoryTombstone,
 } from "@aaliyah/contracts/v1";
 import { z } from "zod";
 
@@ -104,6 +108,26 @@ export const TRUSTED_MEMORY_REJECTIONS = [
   "storage_rejected",
   "read_back_diverged",
   "unknown_outcome",
+  /**
+   * An active legal hold restricts this action on this record. The ONLY
+   * rejection on this path that maps to the contract's `legal_hold_active`
+   * abort reason, which was unreachable before Wave 1.3 Part F.
+   */
+  "legal_hold_active",
+  /** An unexpired retention obligation forbids destroying this record. */
+  "retention_obligation_active",
+  /** A delete whose authorized content is not a `MemoryDeletionOrder`. */
+  "deletion_order_malformed",
+  /** A restore whose head is not in the `deleted` state. */
+  "restore_head_not_deleted",
+  /** A mutation on a record whose head is deleted, other than a restore. */
+  "record_deleted",
+  /**
+   * The deletion committed no tombstone, or did not erase every prior
+   * version. Reported rather than swallowed: a partial erasure is not a
+   * deletion, and the transaction is unwound.
+   */
+  "erasure_incomplete",
 ] as const;
 export type TrustedMemoryRejection = (typeof TRUSTED_MEMORY_REJECTIONS)[number];
 
@@ -142,17 +166,89 @@ export type TrustedMemoryHead = {
   scope: MemoryScope;
 };
 
+/**
+ * A DELETION, WITH ITS ACCOUNTING.
+ *
+ * The three propagation members are OPTIONAL and they are not conveniences:
+ * they exist so a caller that genuinely reconciled a derivative, a cache or a
+ * downstream system can say so, and so that a caller that did not says
+ * `unknown` by omission rather than by claiming `not_applicable`. The default
+ * is the honest one.
+ *
+ * `reason` is deliberately ABSENT. It travels inside `proposedContent` as a
+ * `MemoryDeletionOrder`, which means the approver's authorization digest binds
+ * it. A reason the CALLER supplies is a reason nobody approved. See
+ * `wave1MemoryErasure.ts`.
+ */
+export type TrustedMemoryDeleteRequest = TrustedMemoryMutationRequest & {
+  /** Identity of the tombstone. Defaults to the mutation receipt id. */
+  tombstoneId?: string;
+  derivedData?: readonly MemoryDerivativeDisposition[];
+  cacheIndexPropagation?: MemoryPropagationState;
+  downstreamPropagation?: readonly MemoryDownstreamPropagation[];
+};
+
+export type TrustedMemoryDeleteResult = TrustedMemoryMutationResult & {
+  /**
+   * The tombstone that was written, or null. NEVER null on a verified
+   * deletion: a deletion with no tombstone is exactly the "deleted is a label"
+   * defect, and the store unwinds rather than returning one.
+   */
+  tombstone: MemoryTombstone | null;
+};
+
+/** A record as ORDINARY RETRIEVAL sees it. Deleted and erased records are not. */
+export type TrustedMemoryRecord = {
+  recordId: string;
+  version: number;
+  contentDigest: string;
+  content: unknown;
+  scope: MemoryScope;
+};
+
 export interface TrustedMemoryStore {
   correct(
     request: TrustedMemoryMutationRequest,
   ): Promise<TrustedMemoryMutationResult>;
-  delete(
+  /**
+   * DESTROY the record's prior content and emit a tombstone.
+   *
+   * Not a state flag. Refused under an active legal hold or an unexpired
+   * retention obligation, and refused by the database if it would leave any
+   * prior version unerased.
+   */
+  delete(request: TrustedMemoryDeleteRequest): Promise<TrustedMemoryDeleteResult>;
+  /**
+   * Return a deleted record to an active state under a SEPARATE `restore`
+   * authorization. It does NOT return the destroyed payload — that is gone,
+   * which is what the tombstone's `ineligible_payload_destroyed` says.
+   */
+  restore(
     request: TrustedMemoryMutationRequest,
   ): Promise<TrustedMemoryMutationResult>;
+  /** Advance a record under a `promote` authorization. */
+  promote(
+    request: TrustedMemoryMutationRequest,
+  ): Promise<TrustedMemoryMutationResult>;
+  /**
+   * The chain head, whatever its state. This is the value a compare-and-swap
+   * is performed against, so it MUST keep answering for a deleted record;
+   * `retrieve` is the ordinary-retrieval path and that one does not.
+   */
   readHead(
     actor: TrustedMemoryActor,
     recordId: string,
   ): Promise<TrustedMemoryHead | null>;
+  /** ORDINARY RETRIEVAL. Answers null for a deleted or erased record. */
+  retrieve(
+    actor: TrustedMemoryActor,
+    recordId: string,
+  ): Promise<TrustedMemoryRecord | null>;
+  /** Read a tombstone back on the independent pool. */
+  readTombstone(
+    actor: TrustedMemoryActor,
+    tombstoneId: string,
+  ): Promise<MemoryTombstone | null>;
 }
 
 /**

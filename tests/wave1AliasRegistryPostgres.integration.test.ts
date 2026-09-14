@@ -231,7 +231,13 @@ beforeEach(async () => {
               memory_record_versions,
               memory_authorization_receipts,
               memory_authorization_nonces,
-              memory_mutation_receipts
+              memory_mutation_receipts,
+              memory_tombstones,
+              memory_legal_hold_carve_outs,
+              memory_legal_hold_records,
+              memory_legal_hold_subjects,
+              memory_legal_holds,
+              memory_retention_obligations
      RESTART IDENTITY`,
   );
   for (const tenantId of [TENANT, TENANT_EXCLUSIVE, TENANT_OTHER]) {

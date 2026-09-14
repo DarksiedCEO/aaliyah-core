@@ -12,6 +12,7 @@ import {
   type MemoryScope,
 } from "@aaliyah/contracts/v1";
 
+import { MEMORY_DELETION_ORDER_SCHEMA_VERSION } from "../src/application/memory/wave1MemoryErasure";
 import {
   MEMORY_RECORD_VERSION_SCHEMA_VERSION,
   memoryContentDigest,
@@ -155,7 +156,13 @@ beforeEach(async () => {
     `TRUNCATE memory_record_versions,
               memory_authorization_receipts,
               memory_authorization_nonces,
-              memory_mutation_receipts
+              memory_mutation_receipts,
+              memory_tombstones,
+              memory_legal_hold_carve_outs,
+              memory_legal_hold_records,
+              memory_legal_hold_subjects,
+              memory_legal_holds,
+              memory_retention_obligations
      RESTART IDENTITY`,
   );
   await adminPool.query(
@@ -534,14 +541,27 @@ test("a correction commits, reads back on an independent session, and only then 
   assert.notEqual(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
 });
 
-test("a delete advances the head to a deleted state without destroying the prior version", async () => {
+// UPDATED IN W1.3 PART F, AND THE UPDATE IS THE POINT.
+//
+// This test previously asserted that a delete "advances the head to a deleted
+// state WITHOUT destroying the prior version", and it passed — because that
+// was the defect. `deleted` was a label over intact content. The four
+// assertions below are unchanged and still hold; what changed is the
+// authorized content, which is now a `MemoryDeletionOrder`, and the name,
+// which no longer describes erasure as a state transition. The erasure itself
+// is proven in tests/wave1MemoryHoldErasurePostgres.integration.test.ts.
+test("a delete advances the head to a deleted state and destroys the prior version", async () => {
   const genesis = await seedGenesis({ note: "original" });
-  const tombstoneResidue = { note: "redacted" };
+  const deletionOrder = {
+    schemaVersion: MEMORY_DELETION_ORDER_SCHEMA_VERSION,
+    reason: "subject_erasure_request" as const,
+    reasonEvidenceRef: "matter:erasure-request/0001",
+  };
   const receipt = await issue(
     authorization({
       action: "delete",
       expectedHead: headOf(1, genesis),
-      proposedContent: tombstoneResidue,
+      proposedContent: deletionOrder,
     }),
   );
 
@@ -549,16 +569,17 @@ test("a delete advances the head to a deleted state without destroying the prior
     actor: SCOPE,
     authorizationId: receipt.authorizationId,
     recordId: RECORD_ID,
-    proposedContent: tombstoneResidue,
+    proposedContent: deletionOrder,
     mutationReceiptId: "mutation.delete.001",
   });
 
+  assert.equal(result.rejection, null);
   assert.equal(result.verified, true);
   const head = await store().readHead(SCOPE, RECORD_ID);
   assert.equal(head?.state, "deleted");
   assert.equal(head?.version, 2);
-  // Stated honestly: this is a state transition, not erasure. Version 1 is
-  // still on disk and no tombstone exists yet.
+  // The chain is intact — the metadata is append-only — and version 1 now
+  // holds no content.
   assert.equal(await countVersions(), 2);
 });
 

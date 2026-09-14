@@ -3,6 +3,7 @@ import {
   MemoryAuthorizationReceiptSchema,
   MemoryIdSchema,
   MemoryMutationReceiptSchema,
+  MemoryTombstoneSchema,
   type MemoryAbortReason,
   type MemoryAction,
   type MemoryAuthorizationReceipt,
@@ -10,18 +11,28 @@ import {
   type MemoryMutationPhase,
   type MemoryMutationReceipt,
   type MemoryScope,
+  type MemoryTombstone,
 } from "@aaliyah/contracts/v1";
 import type { Pool, PoolClient } from "pg";
 
+import {
+  buildTombstone,
+  destroyedContentFieldNames,
+  parseDeletionOrder,
+  unknownDerivativeDispositions,
+} from "../../application/memory/wave1MemoryErasure";
 import {
   MEMORY_RECORD_VERSION_SCHEMA_VERSION,
   MemoryRecordVersionSchema,
   memoryContentDigest,
   type MemoryRecordVersion,
   type TrustedMemoryActor,
+  type TrustedMemoryDeleteRequest,
+  type TrustedMemoryDeleteResult,
   type TrustedMemoryHead,
   type TrustedMemoryMutationRequest,
   type TrustedMemoryMutationResult,
+  type TrustedMemoryRecord,
   type TrustedMemoryRejection,
   type TrustedMemoryStore,
 } from "../../application/memory/wave1TrustedMemory";
@@ -94,17 +105,60 @@ import {
  * claims it. The same unkeyed digest makes a head digest an offline ORACLE for
  * guessed content: see W1BR-008 in docs/WAVE1_BLOCKER_REGISTER.md.
  *
- * ALSO NOT HERE, ON PURPOSE: tombstones, the alias registry and legal-hold
- * ENFORCEMENT are later assignments. `delete()` advances the head to a
- * `deleted` state with the content the approver authorized; it destroys no
- * prior version, emits no `MemoryTombstone`, and must not be read as erasure.
- * `legalHoldRestricts` is never consulted, so the `legal_hold_active` abort
- * reason is currently unreachable — a gap, disclosed, not a claim.
+ * WAVE 1.3 PART F CLOSED TWO OF THE GAPS THIS HEADER USED TO DISCLOSE.
+ *
+ * LEGAL HOLDS ARE CONSULTED AND ENFORCED. `restrictingHoldOn()` below runs
+ * inside the mutation transaction, BEFORE the nonce is consumed, for EVERY
+ * action this store performs — correct, delete, restore and promote — not only
+ * for delete. That ordering matters twice: a held record refuses without
+ * burning the approver's authorization, and the caller receives an
+ * `ABORTED_NO_MUTATION` receipt carrying the contract's `legal_hold_active`
+ * reason, which no code path could reach before. The ENFORCEMENT POINT is
+ * still not this file: migration 036 puts the same lookup in an AFTER INSERT
+ * trigger on `memory_record_versions` that reads the action from the consumed
+ * nonce, so a hostile writer holding `aaliyah_memory_mutator` and issuing a
+ * direct INSERT is refused by the database. Deleting the check here changes
+ * the error a caller sees; it does not make the write possible.
+ *
+ * `delete()` IS ERASURE. It no longer advances the head to a `deleted` label
+ * over intact content. Inside one transaction it appends the deletion version,
+ * writes a `MemoryTombstone` accounting for exactly which field names were
+ * destroyed and which chain metadata was retained, and NULLS
+ * `payload->'content'` on every prior version of the record. The deferred
+ * constraint trigger `memory_record_versions_deletion_erases` refuses at COMMIT
+ * any deleted head that still has an unerased predecessor, for every writer.
+ *
+ * ERASURE VERSUS APPEND-ONLY, RESOLVED. Chain METADATA — version, state,
+ * digests, authorization linkage, the four scope columns — remains immutable
+ * and append-only; only `payload->'content'` is mutable, exactly once, under a
+ * tombstone. Every integrity property migration 034 enforces is stated over the
+ * metadata, so all of them still hold after an erasure and the chain stays
+ * walkable. The full argument is in the header of migration 037.
+ *
+ * WHAT ERASURE STILL DOES NOT DO, SAID PLAINLY. Nulling a jsonb member writes a
+ * new heap tuple; the pre-image survives in the old tuple until VACUUM, in the
+ * WAL, in every replica, and in any physical backup taken beforehand. This
+ * store cannot speak for those and does not: the tombstone records
+ * `unknown` propagation rather than a reassurance. The retained
+ * `content_digest` also remains an unkeyed oracle for guessed content
+ * (W1BR-008). Erasure removes the plaintext from the live row. That is the
+ * claim, and it is the whole claim.
  */
 
 const RECORD_COLUMNS = `id, tenant_id, workspace_id, principal_id, user_id,
   record_id, version, state, content_digest, predecessor_digest,
   authorization_id, mutation_receipt_id, payload`;
+
+/** The same members, minus the surrogate key the view does not expose. */
+const RETRIEVABLE_COLUMNS = `tenant_id, workspace_id, principal_id, user_id,
+  record_id, version, state, content_digest, predecessor_digest,
+  authorization_id, mutation_receipt_id, payload`;
+
+const TOMBSTONE_COLUMNS = `tenant_id, workspace_id, principal_id, user_id,
+  tombstone_id, target_record_id, target_version, tombstone_version,
+  authorization_id, mutation_receipt_id, reason, effective_at, retain_until,
+  legal_hold_state, cache_index_propagation, restoration_eligibility_kind,
+  tombstone_digest, payload`;
 
 const AUTHORIZATION_COLUMNS = `tenant_id, workspace_id, principal_id, user_id,
   authorization_id, action, target_record_id, binding_digest,
@@ -198,6 +252,16 @@ const ABORT_REASON: Record<string, MemoryAbortReason> = {
   proposed_content_digest_mismatch: "policy_rejected",
   head_mismatch: "head_mismatch",
   storage_rejected: "storage_rejected",
+  // THE REASON THAT WAS UNREACHABLE. `legal_hold_active` existed in the
+  // contract's abort enum and nothing in Core could ever emit it, because
+  // nothing in Core consulted a hold. This is the one mapping that makes it
+  // reachable, and the tests that exercise it are the evidence.
+  legal_hold_active: "legal_hold_active",
+  retention_obligation_active: "policy_rejected",
+  deletion_order_malformed: "policy_rejected",
+  restore_head_not_deleted: "policy_rejected",
+  record_deleted: "policy_rejected",
+  erasure_incomplete: "storage_rejected",
 };
 
 /**
@@ -550,9 +614,37 @@ export function createPostgresTrustedMemoryStore(
     return { verified: false, rejection, receipt };
   }
 
+  /**
+   * WHICH HOLD RESTRICTS THIS ACTION ON THIS RECORD, OR NULL.
+   *
+   * Deliberately the SAME SQL FUNCTION the AFTER INSERT trigger calls, rather
+   * than a second implementation of the same rule in TypeScript. Two
+   * implementations of one policy is two policies, and the one that drifts is
+   * always the one nobody is testing. This call is the caller's ANSWER; the
+   * trigger is the ENFORCEMENT, and the trigger is what binds a writer that
+   * never comes through this function.
+   */
+  async function restrictingHoldOn(
+    client: PoolClient,
+    scope: MemoryScope,
+    recordId: string,
+    action: MemoryAction,
+  ): Promise<string | null> {
+    const result = await client.query(
+      `SELECT public.aaliyah_memory_restricting_hold($1, $2, $3, NULL, $4)
+                AS hold_id`,
+      [scope.tenantId, scope.workspaceId, recordId, action],
+    );
+    return (result.rows[0]?.hold_id as string | null) ?? null;
+  }
+
   async function mutate(
-    action: Extract<MemoryAction, "correct" | "delete">,
+    action: Extract<
+      MemoryAction,
+      "correct" | "delete" | "restore" | "promote"
+    >,
     request: TrustedMemoryMutationRequest,
+    deletion: TrustedMemoryDeleteRequest | null = null,
   ): Promise<TrustedMemoryMutationResult> {
     if (
       !MemoryIdSchema.safeParse(request.recordId).success ||
@@ -578,6 +670,7 @@ export function createPostgresTrustedMemoryStore(
     let nextVersion = 0;
     let proposedDigest = "";
     let predecessorDigest = "";
+    let deletionOrder: ReturnType<typeof parseDeletionOrder> = null;
 
     const lockKey = [
       request.actor.tenantId,
@@ -698,6 +791,44 @@ export function createPostgresTrustedMemoryStore(
         throw new MutationAborted("authorization_expired");
       }
 
+      // ---- THE LEGAL HOLD, BEFORE ANYTHING IS SPENT ---------------------
+      // EVERY action, not only delete. The confirmed defect was a hold that
+      // gated deletion alone, which left `correct` — a schema that REQUIRES
+      // the content to change — as a supported, audited path to rewriting
+      // held evidence. Checked BEFORE the consumption UPDATE below so a held
+      // record refuses without burning the approver's authorization.
+      if (
+        (await restrictingHoldOn(
+          client,
+          stored.scope,
+          stored.targetRecordId,
+          action,
+        )) !== null
+      ) {
+        throw new MutationAborted("legal_hold_active");
+      }
+
+      if (action === "delete") {
+        // ---- THE RETENTION CLOCK ----------------------------------------
+        // A separate obligation from a hold, refused separately, so each has
+        // its own killing test. `now()` is the transaction's clock, not the
+        // application's.
+        const obligation = await client.query(
+          `SELECT max(retain_until) AS retain_until
+             FROM memory_retention_obligations
+            WHERE tenant_id = $1 AND workspace_id = $2 AND record_id = $3
+              AND retain_until > now()`,
+          [
+            stored.scope.tenantId,
+            stored.scope.workspaceId,
+            stored.targetRecordId,
+          ],
+        );
+        if ((obligation.rows[0]?.retain_until as Date | null) !== null) {
+          throw new MutationAborted("retention_obligation_active");
+        }
+      }
+
       // ---- THE SUCCESSOR IS BOUND TO THE AUTHORIZATION ------------------
       // The caller hands over content, never a digest. If the content does
       // not hash to exactly what was authorized, this is a different
@@ -789,6 +920,37 @@ export function createPostgresTrustedMemoryStore(
         throw new MutationAborted("head_mismatch");
       }
 
+      // ---- RESTORATION IS A SEPARATE AUTHORITY --------------------------
+      // The contract binds the ACTION into the nonce, so a `delete` receipt
+      // relabelled as `restore` no longer matches its own token, and
+      // `stored.action !== action` above refuses a receipt handed to the
+      // wrong call site. These two statements are the STATE half: a restore
+      // only ever lifts a deleted head, and nothing but a restore may append
+      // onto one. Migration 037 pins exactly the same pair in the database,
+      // reading the action from the consumed nonce, for writers that never
+      // come through here.
+      if (action === "restore" && head.state !== "deleted") {
+        throw new MutationAborted("restore_head_not_deleted");
+      }
+      if (action !== "restore" && head.state === "deleted") {
+        throw new MutationAborted("record_deleted");
+      }
+
+      if (action === "delete") {
+        // The reason and the order reference are the APPROVER's, carried
+        // inside the content the authorization's digest binds. A caller
+        // cannot name a reason nobody approved.
+        //
+        // Checked HERE, after ownership and the compare-and-swap, so that an
+        // attacker aiming a delete at somebody else's record is still told
+        // `record_owner_mismatch`: the more specific refusal must not be
+        // masked by a shape complaint about the attacker's own payload.
+        deletionOrder = parseDeletionOrder(request.proposedContent);
+        if (deletionOrder === null) {
+          throw new MutationAborted("deletion_order_malformed");
+        }
+      }
+
       // ---- 6. WRITE THE NEW VERSION -------------------------------------
       nextVersion = head.version + 1;
       predecessorDigest = head.contentDigest;
@@ -827,6 +989,171 @@ export function createPostgresTrustedMemoryStore(
           JSON.stringify(version),
         ],
       );
+
+      // ---- 6b. ERASURE, INSIDE THE SAME TRANSACTION ---------------------
+      //
+      // Everything below happens before COMMIT, so a deletion is all of it or
+      // none of it. The database refuses the half-done state independently:
+      // `memory_record_versions_deletion_erases` is a DEFERRED constraint
+      // trigger that fires at COMMIT and rejects a deleted head that still
+      // has an unerased predecessor, no matter who wrote it.
+      if (action === "delete" && deletionOrder !== null) {
+        // The field names are computed from the content that was ACTUALLY
+        // stored, never from a caller's description of it.
+        const priorResult = await client.query(
+          `SELECT version, payload
+             FROM memory_record_versions
+            WHERE tenant_id = $1 AND workspace_id = $2 AND record_id = $3
+              AND version <= $4
+              AND content_erased_at IS NULL
+            ORDER BY version ASC`,
+          [
+            stored.scope.tenantId,
+            stored.scope.workspaceId,
+            stored.targetRecordId,
+            head.version,
+          ],
+        );
+        const destroyedFieldNames = destroyedContentFieldNames(
+          priorResult.rows.map(
+            (row: { payload: unknown }) =>
+              MemoryRecordVersionSchema.parse(row.payload).content,
+          ),
+        );
+
+        // A hold that was RELEASED is recorded, because "there was a hold and
+        // it was lifted" and "there was never a hold" are different facts
+        // about a destruction. An ACTIVE hold cannot be here: the check above
+        // already aborted, and the tombstone's own CHECK refuses `held`.
+        const releasedHold = await client.query(
+          `SELECT h.hold_id, h.released_at
+             FROM memory_legal_holds AS h
+            WHERE h.tenant_id = $1 AND h.workspace_id = $2
+              AND h.status_state = 'released'
+              AND (h.coverage_kind = 'entire_scope'
+                   OR h.coverage_kind = 'subjects'
+                   OR EXISTS (SELECT 1 FROM memory_legal_hold_records AS r
+                               WHERE r.tenant_id = h.tenant_id
+                                 AND r.workspace_id = h.workspace_id
+                                 AND r.hold_id = h.hold_id
+                                 AND r.record_id = $3))
+            ORDER BY h.released_at DESC
+            LIMIT 1`,
+          [
+            stored.scope.tenantId,
+            stored.scope.workspaceId,
+            stored.targetRecordId,
+          ],
+        );
+        const heldRow = releasedHold.rows[0] as
+          | { hold_id: string; released_at: Date }
+          | undefined;
+
+        // Every obligation over this record has expired — the live ones
+        // aborted above — so this is the latest one that ever bound it.
+        const retention = await client.query(
+          `SELECT max(retain_until) AS retain_until
+             FROM memory_retention_obligations
+            WHERE tenant_id = $1 AND workspace_id = $2 AND record_id = $3`,
+          [
+            stored.scope.tenantId,
+            stored.scope.workspaceId,
+            stored.targetRecordId,
+          ],
+        );
+        const retainUntil =
+          (retention.rows[0]?.retain_until as Date | null) ?? null;
+
+        const tombstone = buildTombstone({
+          tombstoneId: deletion?.tombstoneId ?? request.mutationReceiptId,
+          scope: stored.scope,
+          targetRecordId: stored.targetRecordId,
+          targetVersion: head.version,
+          tombstoneVersion: nextVersion,
+          deletionAuthority: {
+            authorizationId: stored.authorizationId,
+            authorityId: stored.approverAuthorityId,
+            approverActorId: stored.approverActorId,
+            executingActorId: request.actor.userId,
+          },
+          order: deletionOrder,
+          effectiveAt: committedAt,
+          retainUntil: retainUntil === null ? null : retainUntil.toISOString(),
+          legalHoldState: heldRow
+            ? {
+                state: "released",
+                holdId: heldRow.hold_id,
+                releasedAt: heldRow.released_at.toISOString(),
+              }
+            : { state: "none" },
+          destroyedFieldNames,
+          derivedData:
+            deletion?.derivedData ?? unknownDerivativeDispositions(),
+          cacheIndexPropagation: deletion?.cacheIndexPropagation ?? "unknown",
+          downstreamPropagation: deletion?.downstreamPropagation ?? [],
+        });
+
+        await client.query(
+          `INSERT INTO memory_tombstones (${TOMBSTONE_COLUMNS})
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+          [
+            tombstone.scope.tenantId,
+            tombstone.scope.workspaceId,
+            tombstone.scope.principalId,
+            tombstone.scope.userId,
+            tombstone.tombstoneId,
+            tombstone.targetRecordId,
+            tombstone.targetVersion,
+            tombstone.tombstoneVersion,
+            tombstone.deletionAuthority.authorizationId,
+            request.mutationReceiptId,
+            tombstone.reason,
+            tombstone.effectiveAt,
+            tombstone.retention.retainUntil,
+            tombstone.retention.legalHoldState.state,
+            tombstone.cacheIndexPropagation,
+            tombstone.restorationEligibility.kind,
+            tombstone.tombstoneDigest,
+            JSON.stringify(tombstone),
+          ],
+        );
+
+        // THE DESTRUCTION ITSELF. `payload->'content'` becomes JSON null on
+        // every version that still held content. Nothing else on the row is
+        // touched, which is what keeps migration 034's chain properties true
+        // after an erasure, and the rewrite guard refuses any other shape of
+        // update for every writer including the owner.
+        const erased = await client.query(
+          `UPDATE memory_record_versions
+              SET payload = jsonb_set(payload, '{content}', 'null'::jsonb),
+                  content_erased_at = now(),
+                  erasure_tombstone_id = $5
+            WHERE tenant_id = $1 AND workspace_id = $2 AND record_id = $3
+              AND version <= $4
+              AND content_erased_at IS NULL`,
+          [
+            stored.scope.tenantId,
+            stored.scope.workspaceId,
+            stored.targetRecordId,
+            head.version,
+            tombstone.tombstoneId,
+          ],
+        );
+        if (erased.rowCount !== priorResult.rowCount) {
+          // A partial erasure is not a deletion. Unwind rather than report a
+          // destruction that did not happen.
+          //
+          // DISCLOSED REDUNDANT BACKSTOP. No test in this repository can kill
+          // this branch: both counts come from the same predicate inside one
+          // transaction holding the record's advisory lock, so they cannot
+          // diverge in process. It is kept because the property it states is
+          // the one the reviewed defect violated, and the DATABASE carries it
+          // independently — dropping
+          // `memory_record_versions_deletion_erases` fails the suite. Reported
+          // as a surviving mutant, not claimed as a tested control.
+          throw new MutationAborted("erasure_incomplete");
+        }
+      }
 
       // ---- 7. PENDING RECEIPT, INSIDE THE TRANSACTION -------------------
       await persistReceipt(
@@ -1064,9 +1391,144 @@ export function createPostgresTrustedMemoryStore(
     return { verified: true, rejection: null, receipt };
   }
 
+  /**
+   * READ A TOMBSTONE BACK, ON THE INDEPENDENT POOL.
+   *
+   * All four scope dimensions are predicates, for the same reason `readHead`
+   * uses four: filtering on tenant and workspace alone lets another principal
+   * in the same workspace read an accounting of somebody else's destruction,
+   * including the authority that ordered it.
+   */
+  async function readTombstone(
+    actor: TrustedMemoryActor,
+    tombstoneId: string,
+  ): Promise<MemoryTombstone | null> {
+    if (!MemoryIdSchema.safeParse(tombstoneId).success) return null;
+    const client = await readBackPool.connect();
+    try {
+      await client.query("BEGIN");
+      await enterRole(client, readBackRole);
+      const result = await client.query(
+        `SELECT payload FROM memory_tombstones
+          WHERE tenant_id = $1 AND workspace_id = $2 AND tombstone_id = $3
+            AND principal_id = $4 AND user_id = $5
+          LIMIT 1`,
+        [
+          actor.tenantId,
+          actor.workspaceId,
+          tombstoneId,
+          actor.principalId,
+          actor.userId,
+        ],
+      );
+      await client.query("COMMIT");
+      const row = result.rows[0] as { payload: unknown } | undefined;
+      if (!row) return null;
+      const parsed = MemoryTombstoneSchema.safeParse(row.payload);
+      // A stored value that does not parse is not a tombstone. Answering
+      // null is the fail-closed reading: "no accounting was read back", never
+      // "here is an accounting we could not validate".
+      return parsed.success ? parsed.data : null;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * ORDINARY RETRIEVAL.
+   *
+   * Reads `memory_records_retrievable`, which is a VIEW in migration 037 that
+   * excludes any record whose head is `deleted` and any version whose content
+   * has been erased. The exclusion is therefore a property of the relation,
+   * not a WHERE clause a future caller can forget. `readHead` deliberately
+   * still answers for a deleted record, because a compare-and-swap has to be
+   * able to see the head it is swapping against — a restore would otherwise be
+   * impossible.
+   */
+  async function retrieve(
+    actor: TrustedMemoryActor,
+    recordId: string,
+  ): Promise<TrustedMemoryRecord | null> {
+    if (!MemoryIdSchema.safeParse(recordId).success) return null;
+    const client = await readBackPool.connect();
+    try {
+      await client.query("BEGIN");
+      await enterRole(client, readBackRole);
+      const result = await client.query(
+        `SELECT ${RETRIEVABLE_COLUMNS}
+           FROM memory_records_retrievable
+          WHERE tenant_id = $1 AND workspace_id = $2 AND record_id = $3
+            AND principal_id = $4 AND user_id = $5
+          LIMIT 1`,
+        [
+          actor.tenantId,
+          actor.workspaceId,
+          recordId,
+          actor.principalId,
+          actor.userId,
+        ],
+      );
+      await client.query("COMMIT");
+      const row = result.rows[0] as RecordRow | undefined;
+      if (!row) return null;
+      const parsed = MemoryRecordVersionSchema.parse(row.payload);
+      const head = headFromRow(row);
+      return {
+        recordId: head.recordId,
+        version: head.version,
+        contentDigest: head.contentDigest,
+        content: parsed.content,
+        scope: head.scope,
+      };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * DELETE, WHICH IS ERASURE, AND THEN AN INDEPENDENT READ-BACK OF THE
+   * ACCOUNTING.
+   *
+   * The tombstone is NOT returned from the writing transaction. It is read
+   * back on the read-back pool, on a different connection under the SELECT-only
+   * role, exactly as the head is — because a tombstone the writer hands back
+   * to itself proves only that the writer built one. A verified deletion whose
+   * accounting cannot be read back is reported as `erasure_incomplete` and
+   * never as success.
+   */
+  async function deleteRecord(
+    request: TrustedMemoryDeleteRequest,
+  ): Promise<TrustedMemoryDeleteResult> {
+    const result = await mutate("delete", request, request);
+    if (!result.verified) return { ...result, tombstone: null };
+    const tombstone = await readTombstone(
+      request.actor,
+      request.tombstoneId ?? request.mutationReceiptId,
+    ).catch(() => null);
+    if (tombstone === null) {
+      return {
+        verified: false,
+        rejection: "erasure_incomplete",
+        receipt: result.receipt,
+        tombstone: null,
+      };
+    }
+    return { ...result, tombstone };
+  }
+
   return {
     correct: (request) => mutate("correct", request),
-    delete: (request) => mutate("delete", request),
+    delete: deleteRecord,
+    restore: (request) => mutate("restore", request),
+    promote: (request) => mutate("promote", request),
     readHead,
+    retrieve,
+    readTombstone,
   };
 }
