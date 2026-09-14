@@ -3119,3 +3119,335 @@ test("L-1 a malformed authorization id is refused before it reaches the database
   assert.equal(result.receipt, null);
   assert.deepEqual(await receiptStatuses("mutation.enumerate.2"), []);
 });
+
+// ---------------------------------------------------------------------------
+// W1.3 Part B3 — ONE CONSUMED AUTHORIZATION, ONE MUTATION.
+//
+// The re-opened H-1. Migration 034 required a version to be WITNESSED by a
+// consumed nonce and nothing bounded how many versions one nonce could
+// witness, because `memory_record_versions` carried no uniqueness on
+// `mutation_receipt_id`. Executed as `aaliyah_memory_mutator` against
+// 68421e5: one consumed nonce, three appended versions, one of them a
+// deletion, and then a forged terminal COMMITTED_AND_READ_BACK over the
+// result. Every test below was that exploit first.
+// ---------------------------------------------------------------------------
+
+/**
+ * Mint a nonce with an EXPLICIT validity window and spend it, issuer then
+ * mutator, exactly as `witnessAppend` does. The windows here are SQL
+ * intervals relative to the transaction clock, because the property under
+ * test is the relationship between `consumed_at` and the window — not a
+ * value any application chose.
+ */
+async function witnessAppendInWindow(input: {
+  authorizationId: string;
+  mutationReceiptId: string;
+  issuedAt: string;
+  expiresAt: string;
+  recordId?: string;
+  action?: string;
+  consumedAt?: string;
+}): Promise<string> {
+  const bindingDigest = memoryContentDigest(input.authorizationId);
+  await runAs(
+    "aaliyah_memory_issuer",
+    `INSERT INTO memory_authorization_nonces
+       (tenant_id, workspace_id, binding_digest, authorization_id, action,
+        target_record_id, issued_at, expires_at)
+     VALUES ($1,$2,$3,$4,$5,$6, ${input.issuedAt}, ${input.expiresAt})`,
+    [
+      SCOPE.tenantId,
+      SCOPE.workspaceId,
+      bindingDigest,
+      input.authorizationId,
+      input.action ?? "correct",
+      input.recordId ?? RECORD_ID,
+    ],
+  );
+  await runAs(
+    "aaliyah_memory_mutator",
+    `UPDATE memory_authorization_nonces
+        SET consumed_at = ${input.consumedAt ?? "now()"},
+            consumed_by_mutation_receipt_id = $2
+      WHERE binding_digest = $1 AND consumed_at IS NULL`,
+    [bindingDigest, input.mutationReceiptId],
+  );
+  return bindingDigest;
+}
+
+/** Append a version directly as the mutator, with whatever witness exists. */
+async function appendAsMutator(input: {
+  version: number;
+  predecessorDigest: string | null;
+  contentDigest: string;
+  authorizationId: string;
+  mutationReceiptId: string;
+}): Promise<void> {
+  await asMutator(FORGED_VERSION_SQL, [
+    SCOPE.tenantId,
+    SCOPE.workspaceId,
+    SCOPE.principalId,
+    SCOPE.userId,
+    RECORD_ID,
+    input.version,
+    "active",
+    input.contentDigest,
+    input.predecessorDigest,
+    input.authorizationId,
+    input.mutationReceiptId,
+    versionPayload({
+      recordId: RECORD_ID,
+      version: input.version,
+      contentDigest: input.contentDigest,
+      predecessorDigest: input.predecessorDigest,
+      authorizationId: input.authorizationId,
+      mutationReceiptId: input.mutationReceiptId,
+    }),
+  ]);
+}
+
+test("B3 H-1 one consumed authorization witnesses exactly ONE record version", async () => {
+  // EXECUTED against 68421e5 as `aaliyah_memory_mutator`: this produced
+  //   version | state  | authorization_id | mutation_receipt_id
+  //         1 | active | A1               | MR1
+  //         2 | active | A1               | MR1
+  // with consumed_nonces = 1. "Witnessed" was satisfied by ONE reused nonce
+  // and one-authorization-per-version was not enforced anywhere.
+  const genesis = await seedGenesis({ note: "original" });
+  await witnessAppend({
+    authorizationId: "reused-0000000000000000000001",
+    mutationReceiptId: "mutation.reused",
+    recordId: RECORD_ID,
+  });
+  const second = `sha256:${"a".repeat(64)}`;
+  // The FIRST append under this approval is legitimate and must succeed, or
+  // the constraint below would be indistinguishable from a blanket refusal.
+  await appendAsMutator({
+    version: 2,
+    predecessorDigest: genesis,
+    contentDigest: second,
+    authorizationId: "reused-0000000000000000000001",
+    mutationReceiptId: "mutation.reused",
+  });
+  assert.equal(await countVersions(), 2);
+
+  // The SECOND is the forgery, and the database is what refuses it.
+  await assert.rejects(
+    () =>
+      appendAsMutator({
+        version: 3,
+        predecessorDigest: second,
+        contentDigest: `sha256:${"b".repeat(64)}`,
+        authorizationId: "reused-0000000000000000000001",
+        mutationReceiptId: "mutation.reused",
+      }),
+    /duplicate key value violates unique constraint "memory_record_versions_receipt_unique"/,
+  );
+  assert.equal(await countVersions(), 2);
+  // And the approval really was spent exactly once, which is the whole point:
+  // one consumption, one version.
+  const spent = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_authorization_nonces
+      WHERE consumed_by_mutation_receipt_id = 'mutation.reused'`,
+  );
+  assert.equal(spent.rows[0].n, 1);
+});
+
+test("B3 H-1 a nonce consumed AFTER it lapsed witnesses nothing", async () => {
+  // The second half of the same finding: the 034 witness tested only
+  // `consumed_at IS NOT NULL` and never looked at the nonce's window, so an
+  // approval that lapsed hours ago still witnessed an append made today.
+  const genesis = await seedGenesis({ note: "original" });
+  await witnessAppendInWindow({
+    authorizationId: "lapsed-0000000000000000000001",
+    mutationReceiptId: "mutation.lapsed",
+    issuedAt: "now() - interval '2 hours'",
+    expiresAt: "now() - interval '1 hour'",
+  });
+  // Burning a lapsed approval is PERMITTED and disclosed — it is a denial of
+  // service against one approval, not a forgery. What it may not do is
+  // witness.
+  const consumed = await adminPool.query(
+    `SELECT consumed_at IS NOT NULL AS spent FROM memory_authorization_nonces
+      WHERE authorization_id = 'lapsed-0000000000000000000001'`,
+  );
+  assert.equal(consumed.rows[0].spent, true);
+
+  await assert.rejects(
+    () =>
+      appendAsMutator({
+        version: 2,
+        predecessorDigest: genesis,
+        contentDigest: `sha256:${"c".repeat(64)}`,
+        authorizationId: "lapsed-0000000000000000000001",
+        mutationReceiptId: "mutation.lapsed",
+      }),
+    /no consumed authorization witnesses this record version/,
+  );
+  assert.equal(await countVersions(), 1);
+});
+
+test("B3 H-1 a nonce consumed BEFORE it was issued witnesses nothing", async () => {
+  // The mirror of the lapsed case, and a separate predicate: a future-dated
+  // approval spent today is not an approval of today's mutation either.
+  const genesis = await seedGenesis({ note: "original" });
+  await witnessAppendInWindow({
+    authorizationId: "future-0000000000000000000002",
+    mutationReceiptId: "mutation.premature",
+    issuedAt: "now() + interval '1 hour'",
+    expiresAt: "now() + interval '2 hours'",
+  });
+  await assert.rejects(
+    () =>
+      appendAsMutator({
+        version: 2,
+        predecessorDigest: genesis,
+        contentDigest: `sha256:${"d".repeat(64)}`,
+        authorizationId: "future-0000000000000000000002",
+        mutationReceiptId: "mutation.premature",
+      }),
+    /no consumed authorization witnesses this record version/,
+  );
+  assert.equal(await countVersions(), 1);
+});
+
+test("B3 H-1 a nonce consumed INSIDE its window still witnesses, so the window test is not a blanket refusal", async () => {
+  const genesis = await seedGenesis({ note: "original" });
+  await witnessAppendInWindow({
+    authorizationId: "inwindow-000000000000000000001",
+    mutationReceiptId: "mutation.inwindow",
+    issuedAt: "now() - interval '1 minute'",
+    expiresAt: "now() + interval '1 hour'",
+  });
+  await appendAsMutator({
+    version: 2,
+    predecessorDigest: genesis,
+    contentDigest: `sha256:${"e".repeat(64)}`,
+    authorizationId: "inwindow-000000000000000000001",
+    mutationReceiptId: "mutation.inwindow",
+  });
+  assert.equal(await countVersions(), 2);
+});
+
+test("B3 H-1 consumption cannot be backdated into a lapsed approval's window", async () => {
+  // WITHOUT THIS the window test above is a check on a number the attacker
+  // chooses: `aaliyah_memory_mutator` holds UPDATE on `consumed_at`, so the
+  // role that benefits from a backdated consumption is the role that writes
+  // the timestamp. A lapsed nonce stamped an hour and a half ago sits neatly
+  // inside its own window.
+  await seedGenesis({ note: "original" });
+  await runAs(
+    "aaliyah_memory_issuer",
+    `INSERT INTO memory_authorization_nonces
+       (tenant_id, workspace_id, binding_digest, authorization_id, action,
+        target_record_id, issued_at, expires_at)
+     VALUES ($1,$2,$3,'backdated-00000000000000001','correct',$4,
+             now() - interval '2 hours', now() - interval '1 hour')`,
+    [
+      SCOPE.tenantId,
+      SCOPE.workspaceId,
+      memoryContentDigest("backdated-00000000000000001"),
+      RECORD_ID,
+    ],
+  );
+  await assert.rejects(
+    () =>
+      asMutator(
+        `UPDATE memory_authorization_nonces
+            SET consumed_at = now() - interval '90 minutes',
+                consumed_by_mutation_receipt_id = 'mutation.backdated'
+          WHERE binding_digest = $1 AND consumed_at IS NULL`,
+        [memoryContentDigest("backdated-00000000000000001")],
+      ),
+    /consumption must be stamped with the transaction clock/,
+  );
+  assert.equal(
+    await nonceConsumedAt(memoryContentDigest("backdated-00000000000000001")),
+    null,
+  );
+});
+
+test("B3 H-1 a terminal COMMITTED outcome requires the pending receipt it concludes", async () => {
+  // EXECUTED against 68421e5: the mutator minted
+  // phase='terminal' / outcome_status='COMMITTED_AND_READ_BACK' for a receipt
+  // id that had never announced itself. "Success is never the residue of a
+  // crash" was a property of the STORE and of nothing else.
+  const genesis = await seedGenesis({ note: "original" });
+  await witnessAppend({
+    authorizationId: "nopending-00000000000000000001",
+    mutationReceiptId: "mutation.nopending",
+    recordId: RECORD_ID,
+  });
+  const digest = `sha256:${"f".repeat(64)}`;
+  await appendAsMutator({
+    version: 2,
+    predecessorDigest: genesis,
+    contentDigest: digest,
+    authorizationId: "nopending-00000000000000000001",
+    mutationReceiptId: "mutation.nopending",
+  });
+  const nonceDigest = memoryContentDigest("nopending-00000000000000000001");
+  const terminal = {
+    schemaVersion: WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION,
+    mutationReceiptId: "mutation.nopending",
+    authorizationId: "nopending-00000000000000000001",
+    consumedNonceDigest: nonceDigest,
+    action: "correct",
+    scope: SCOPE,
+    targetRecordId: RECORD_ID,
+    outcome: { status: "COMMITTED_AND_READ_BACK" },
+  };
+  const TERMINAL_SQL = `INSERT INTO memory_mutation_receipts
+       (tenant_id, workspace_id, principal_id, user_id, mutation_receipt_id,
+        phase, authorization_id, consumed_nonce_digest, action,
+        target_record_id, outcome_status, emitted_at, payload)
+     VALUES ($1,$2,$3,$4,'mutation.nopending','terminal',$5,$6,'correct',$7,
+             'COMMITTED_AND_READ_BACK', now(), $8)`;
+  const params = [
+    SCOPE.tenantId,
+    SCOPE.workspaceId,
+    SCOPE.principalId,
+    SCOPE.userId,
+    terminal.authorizationId,
+    nonceDigest,
+    RECORD_ID,
+    JSON.stringify(terminal),
+  ];
+  await assert.rejects(
+    () => asMutator(TERMINAL_SQL, params),
+    /a committed outcome requires the pending receipt it concludes/,
+  );
+  assert.deepEqual(await receiptStatuses("mutation.nopending"), []);
+
+  // POSITIVE CONTROL. With the pending row present — which is what the store
+  // writes inside the mutation transaction — the same terminal row is
+  // accepted, so this is an ordering requirement and not a refusal of
+  // success.
+  const pending = {
+    ...terminal,
+    outcome: { status: "UNKNOWN_PENDING_RECONCILIATION" },
+  };
+  await asMutator(
+    `INSERT INTO memory_mutation_receipts
+       (tenant_id, workspace_id, principal_id, user_id, mutation_receipt_id,
+        phase, authorization_id, consumed_nonce_digest, action,
+        target_record_id, outcome_status, emitted_at, payload)
+     VALUES ($1,$2,$3,$4,'mutation.nopending','pending',$5,$6,'correct',$7,
+             'UNKNOWN_PENDING_RECONCILIATION', now(), $8)`,
+    [
+      SCOPE.tenantId,
+      SCOPE.workspaceId,
+      SCOPE.principalId,
+      SCOPE.userId,
+      terminal.authorizationId,
+      nonceDigest,
+      RECORD_ID,
+      JSON.stringify(pending),
+    ],
+  );
+  await asMutator(TERMINAL_SQL, params);
+  assert.deepEqual(await receiptStatuses("mutation.nopending"), [
+    { phase: "pending", status: "UNKNOWN_PENDING_RECONCILIATION" },
+    { phase: "terminal", status: "COMMITTED_AND_READ_BACK" },
+  ]);
+});

@@ -3437,3 +3437,239 @@ test("Part D the retirement guard still reports the more specific violation firs
     /retirement may not rewrite a binding/,
   );
 });
+
+// ---------------------------------------------------------------------------
+// W1.3 Part B3 — ONE CONSUMED AUTHORIZATION, ONE BINDING MUTATION.
+//
+// Part D gave a binding and a retirement a WITNESS. It did not bound how many
+// of either one consumed nonce could witness, because this table carried no
+// uniqueness on `mutation_receipt_id` OR on `removed_by_mutation_receipt_id`.
+// One approval therefore bound an unbounded number of aliases, retired an
+// unbounded number of bindings, and — because the spend can be claimed from
+// two different columns — did one of each.
+// ---------------------------------------------------------------------------
+
+/** Bind a raw alias under an explicit approval, with everything else honest. */
+async function rawBindUnder(input: {
+  aliasId: string;
+  alias: string;
+  authorizationId: string;
+  mutationReceiptId: string;
+}): Promise<void> {
+  await insertRawBinding(
+    {
+      alias_id: input.aliasId,
+      normalized_alias: input.alias,
+      skeleton: input.alias,
+      authorization_id: input.authorizationId,
+      mutation_receipt_id: input.mutationReceiptId,
+    },
+    {
+      normalizedAlias: input.alias,
+      skeleton: input.alias,
+      authorizationId: input.authorizationId,
+      mutationReceiptId: input.mutationReceiptId,
+    },
+  );
+}
+
+/** Retire a binding directly, naming the approval it claims to have spent. */
+async function rawRetire(input: {
+  aliasId: string;
+  authorizationId: string;
+  mutationReceiptId: string;
+}): Promise<void> {
+  await adminPool.query(
+    `UPDATE memory_alias_bindings
+        SET removed_at = now(),
+            removed_by_mutation_receipt_id = $2,
+            removed_authorization_id = $3
+      WHERE alias_id = $1 AND removed_at IS NULL`,
+    [input.aliasId, input.mutationReceiptId, input.authorizationId],
+  );
+}
+
+test("B3 one consumed authorization binds exactly ONE alias", async () => {
+  await witnessAppend({
+    authorizationId: "b3-bind-00000000000000000001",
+    mutationReceiptId: "mutation.b3.bind",
+    targetRecordId: VICTIM,
+  });
+  // The FIRST binding under this approval is legitimate and must land, or the
+  // refusal below would be indistinguishable from a blanket one.
+  await rawBindUnder({
+    aliasId: "alias-b3-one",
+    alias: "ceo@example.com",
+    authorizationId: "b3-bind-00000000000000000001",
+    mutationReceiptId: "mutation.b3.bind",
+  });
+  assert.equal(await activeBindings(), 1);
+  // A SECOND alias — different alias id, different normalized form, different
+  // skeleton, so none of the 031 exclusions can be what refuses it — charged
+  // to the same single approval.
+  await assert.rejects(
+    () =>
+      rawBindUnder({
+        aliasId: "alias-b3-two",
+        alias: "chair@example.com",
+        authorizationId: "b3-bind-00000000000000000001",
+        mutationReceiptId: "mutation.b3.bind",
+      }),
+    /duplicate key value violates unique constraint "memory_alias_bindings_receipt_unique"/,
+  );
+  assert.equal(await activeBindings(), 1);
+});
+
+test("B3 one consumed authorization retires exactly ONE binding", async () => {
+  for (const [index, alias] of ["ceo@example.com", "chair@example.com"].entries()) {
+    await witnessAppend({
+      authorizationId: `b3-retire-bind-${index}`.padEnd(28, "0"),
+      mutationReceiptId: `mutation.b3.retire.bind.${index}`,
+      targetRecordId: VICTIM,
+    });
+    await rawBindUnder({
+      aliasId: `alias-b3-retire-${index}`,
+      alias,
+      authorizationId: `b3-retire-bind-${index}`.padEnd(28, "0"),
+      mutationReceiptId: `mutation.b3.retire.bind.${index}`,
+    });
+  }
+  assert.equal(await activeBindings(), 2);
+  await witnessAppend({
+    authorizationId: "b3-retire-0000000000000000001",
+    mutationReceiptId: "mutation.b3.retire",
+    targetRecordId: VICTIM,
+    action: "remove_alias",
+  });
+  await rawRetire({
+    aliasId: "alias-b3-retire-0",
+    authorizationId: "b3-retire-0000000000000000001",
+    mutationReceiptId: "mutation.b3.retire",
+  });
+  assert.equal(await activeBindings(), 1);
+  await assert.rejects(
+    () =>
+      rawRetire({
+        aliasId: "alias-b3-retire-1",
+        authorizationId: "b3-retire-0000000000000000001",
+        mutationReceiptId: "mutation.b3.retire",
+      }),
+    /duplicate key value violates unique constraint "memory_alias_bindings_removal_receipt_unique"/,
+  );
+  assert.equal(await activeBindings(), 1);
+});
+
+test("B3 one consumed authorization cannot both bind one alias and retire another", async () => {
+  // THE CASE NO B-TREE INDEX CAN EXPRESS. The spend is claimed from TWO
+  // different columns of two different rows, so the two unique indexes above
+  // never collide and the exclusion has to be stated in the guards.
+  await witnessAppend({
+    authorizationId: "b3-cross-existing-000000000001",
+    mutationReceiptId: "mutation.b3.cross.existing",
+    targetRecordId: VICTIM,
+  });
+  await rawBindUnder({
+    aliasId: "alias-b3-cross-existing",
+    alias: "chair@example.com",
+    authorizationId: "b3-cross-existing-000000000001",
+    mutationReceiptId: "mutation.b3.cross.existing",
+  });
+  await witnessAppend({
+    authorizationId: "b3-cross-0000000000000000001",
+    mutationReceiptId: "mutation.b3.cross",
+    targetRecordId: VICTIM,
+  });
+  await rawBindUnder({
+    aliasId: "alias-b3-cross-bound",
+    alias: "ceo@example.com",
+    authorizationId: "b3-cross-0000000000000000001",
+    mutationReceiptId: "mutation.b3.cross",
+  });
+  assert.equal(await activeBindings(), 2);
+  // The same approval, already spent on a bind, reaching for a retirement.
+  await assert.rejects(
+    () =>
+      rawRetire({
+        aliasId: "alias-b3-cross-existing",
+        authorizationId: "b3-cross-0000000000000000001",
+        mutationReceiptId: "mutation.b3.cross",
+      }),
+    /this authorization has already been spent on another binding/,
+  );
+  assert.equal(await activeBindings(), 2);
+});
+
+test("B3 one consumed authorization cannot both retire one alias and bind another", async () => {
+  // The mirror of the case above, and a SEPARATE control: the insert guard has
+  // to look at the retirement column just as the retirement guard looks at the
+  // bind column. Deleting either one leaves the other direction open.
+  await witnessAppend({
+    authorizationId: "b3-mirror-bound-00000000001",
+    mutationReceiptId: "mutation.b3.mirror.bound",
+    targetRecordId: VICTIM,
+  });
+  await rawBindUnder({
+    aliasId: "alias-b3-mirror-bound",
+    alias: "chair@example.com",
+    authorizationId: "b3-mirror-bound-00000000001",
+    mutationReceiptId: "mutation.b3.mirror.bound",
+  });
+  await witnessAppend({
+    authorizationId: "b3-mirror-000000000000000001",
+    mutationReceiptId: "mutation.b3.mirror",
+    targetRecordId: VICTIM,
+    action: "remove_alias",
+  });
+  await rawRetire({
+    aliasId: "alias-b3-mirror-bound",
+    authorizationId: "b3-mirror-000000000000000001",
+    mutationReceiptId: "mutation.b3.mirror",
+  });
+  assert.equal(await activeBindings(), 0);
+  await assert.rejects(
+    () =>
+      rawBindUnder({
+        aliasId: "alias-b3-mirror-new",
+        alias: "ceo@example.com",
+        authorizationId: "b3-mirror-000000000000000001",
+        mutationReceiptId: "mutation.b3.mirror",
+      }),
+    /this authorization has already been spent on another binding/,
+  );
+  assert.equal(await activeBindings(), 0);
+});
+
+test("B3 a binding witnessed by a nonce consumed after it lapsed is refused", async () => {
+  // The window half of the finding, on the alias path. The approval is real,
+  // it names this tenant, and it was spent — hours after it stopped being
+  // valid.
+  const authorizationId = "b3-alias-lapsed-000000000001";
+  const bindingDigest = memoryContentDigest(authorizationId);
+  await runAs(
+    "aaliyah_memory_issuer",
+    `INSERT INTO memory_authorization_nonces
+       (tenant_id, workspace_id, binding_digest, authorization_id, action,
+        target_record_id, issued_at, expires_at)
+     VALUES ($1,$2,$3,$4,'assign_alias',$5,
+             now() - interval '2 hours', now() - interval '1 hour')`,
+    [TENANT, SCOPE.workspaceId, bindingDigest, authorizationId, VICTIM],
+  );
+  await runAs(
+    "aaliyah_memory_mutator",
+    `UPDATE memory_authorization_nonces
+        SET consumed_at = now(), consumed_by_mutation_receipt_id = $2
+      WHERE binding_digest = $1 AND consumed_at IS NULL`,
+    [bindingDigest, "mutation.b3.alias.lapsed"],
+  );
+  await assert.rejects(
+    () =>
+      rawBindUnder({
+        aliasId: "alias-b3-lapsed",
+        alias: "ceo@example.com",
+        authorizationId,
+        mutationReceiptId: "mutation.b3.alias.lapsed",
+      }),
+    /no consumed authorization witnesses this binding/,
+  );
+  assert.equal(await activeBindings(), 0);
+});

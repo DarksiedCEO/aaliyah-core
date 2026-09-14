@@ -2549,6 +2549,505 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
     GRANT UPDATE (payload, content_erased_at, erasure_tombstone_id)
       ON memory_record_versions TO aaliyah_memory_mutator`,
   },
+  {
+    // W1.3 PART B3, H-1 — ONE CONSUMED AUTHORIZATION WITNESSES EXACTLY ONE
+    // MUTATION, AND A LAPSED CONSUMPTION WITNESSES NOTHING.
+    //
+    // THE CONFIRMED DEFECT THIS CLOSES, EXECUTED AS THE LEAST-PRIVILEGE
+    // `aaliyah_memory_mutator` ROLE AGAINST A LIVE DATABASE.
+    //
+    // Migration 034 witnesses an appended record version by matching a
+    // CONSUMED NONCE on tenant / authorization_id / target_record_id /
+    // consumed_at IS NOT NULL / consumed_by_mutation_receipt_id. Nothing
+    // anywhere bounded HOW MANY rows a single such nonce could witness:
+    // `memory_record_versions` carried uniqueness only on `id` and on
+    // (tenant_id, workspace_id, record_id, version). One nonce, obtained from
+    // one legitimate mutation, therefore witnessed an UNBOUNDED number of
+    // appended versions that all reused its `mutation_receipt_id`:
+    //
+    //     version | state  | digest       | authorization_id | mutation_receipt_id
+    //           1 | active | sha256:aaaa. | A1               | MR1
+    //           2 | active | sha256:bbbb. | A1               | MR1
+    //     consumed_nonces = 1
+    //
+    // "Witnessed" was satisfied by one reused nonce; ONE-AUTHORIZATION-PER-
+    // VERSION was not enforced. `memory_alias_bindings` had the same shape on
+    // both of its witness columns, and `memory_tombstones` — added by
+    // migration 037 — carried `authorization_id` and `mutation_receipt_id`
+    // that NOTHING checked at all, so a tombstone's attribution was
+    // decoration.
+    //
+    // SECOND HALF OF THE SAME FINDING: every witness predicate tested only
+    // `consumed_at IS NOT NULL` and never looked at the nonce's validity
+    // window, so a nonce consumed long after it lapsed still witnessed.
+    //
+    // THE FIX, AND WHY THIS SHAPE.
+    //
+    // 1. UNIQUENESS, NOT A TRIGGER, WHEREVER ONE COLUMN CAN CARRY IT. The
+    //    falsifier offered two routes: a UNIQUE constraint on
+    //    `mutation_receipt_id`, or a per-version freshness test inside the 034
+    //    guard. A trigger predicate of the form "no other row already names
+    //    this receipt" is defeated by two concurrent transactions, because an
+    //    AFTER INSERT trigger under READ COMMITTED cannot see a sibling's
+    //    uncommitted row. A UNIQUE INDEX is enforced by the storage engine at
+    //    every isolation level, for every writer, with no argument about
+    //    serialization required. It is therefore strictly the stronger of the
+    //    two and is what is used here. Combined with the nonce's own
+    //    single-use consumption (025's `memory_authorization_nonces_unique`
+    //    plus 035's monotonicity), the chain is: one nonce -> one
+    //    `consumed_by_mutation_receipt_id` -> AT MOST ONE witnessed row per
+    //    witnessing table. That is one-authorization-per-version, enforced.
+    //
+    //    SCOPE OF THE UNIQUENESS IS PER TABLE, DELIBERATELY. One legitimate
+    //    mutation writes to SEVERAL of these tables under one receipt id: an
+    //    `assign_alias` appends a record version AND inserts an alias binding;
+    //    a `delete` appends a record version AND writes a tombstone. A single
+    //    global spend ledger would refuse the legitimate path. The invariant
+    //    that is actually true is "one receipt id, at most one row in each
+    //    witnessing table", and that is what is written.
+    //
+    // 2. THE ONE CASE AN INDEX CANNOT EXPRESS. `memory_alias_bindings` claims
+    //    a spend from TWO different columns — `mutation_receipt_id` when a
+    //    binding is created and `removed_by_mutation_receipt_id` when one is
+    //    retired — and a b-tree index over a single table cannot make one
+    //    receipt id collide across two columns of two different rows. Both
+    //    columns get their own unique index, and the CROSS case (one receipt
+    //    id binds one alias and retires another) is refused by a predicate in
+    //    the two guards. That predicate IS race-safe here, and the argument is
+    //    written out rather than assumed: both writes must be witnessed by the
+    //    SAME nonce row, and a nonce can only be consumed once — the consuming
+    //    UPDATE takes a row lock and 035 makes the transition irreversible —
+    //    so the second write either happens in the same transaction as the
+    //    first (statements are sequential and see each other) or in a later
+    //    one (the first has committed). Two genuinely concurrent claimants
+    //    cannot both see the consumption they both need.
+    //
+    // 3. THE VALIDITY WINDOW, STATED SO IT DOES NOT DECAY.
+    //    `aaliyah_memory_spent_nonce` is now the ONLY place any guard resolves
+    //    a spent nonce, and it requires the consumption to have happened
+    //    INSIDE the nonce's window: `consumed_at >= issued_at` and
+    //    `consumed_at < expires_at`. It deliberately does NOT test
+    //    `expires_at > now()`. A predicate against the wall clock would be
+    //    TRUE at insert time and FALSE an hour later, which would mean a
+    //    terminal receipt appended after a read-back, or any re-evaluation,
+    //    could no longer confirm a mutation that really was authorized. The
+    //    window test above is a statement about a fact that already happened
+    //    and never changes its answer.
+    //
+    // 4. WHAT MAKES THAT WINDOW TEST UNFORGEABLE. `consumed_at` is written by
+    //    `aaliyah_memory_mutator`, which holds UPDATE on exactly that column,
+    //    so the role that benefits from a backdated consumption is the role
+    //    that writes the timestamp. `aaliyah_memory_consumption_stamped`
+    //    refuses any consumption transition whose `consumed_at` is not the
+    //    transaction clock, for every writer including the owner. Without it
+    //    the window test would be a check on a number the attacker chooses.
+    //
+    //    CONSUMING A LAPSED NONCE IS STILL PERMITTED, ON PURPOSE. The nonce is
+    //    burnt and can never witness anything, which is a denial of service
+    //    against one approval — the same class 035 already discloses — not a
+    //    forgery. Refusing the consumption instead would make the window test
+    //    in the witness unreachable and therefore unkillable by any test, and
+    //    an unkillable control is not evidence.
+    //
+    // 5. THE TOMBSTONE IS WITNESSED AT LAST. `memory_tombstones` now needs a
+    //    consumed nonce naming its target record with action `delete`, exactly
+    //    like the version it accounts for. The check is the LAST one in the
+    //    guard so that every structural, hold and retention violation above it
+    //    still reports its own message.
+    //
+    // 6. A COMMITTED OUTCOME NEEDS THE PENDING ROW IT CONCLUDES. The second
+    //    supplied reproducer minted a `terminal` /
+    //    `COMMITTED_AND_READ_BACK` receipt with no `pending` row anywhere:
+    //    "success is never the residue of a crash" was a property of the
+    //    STORE and of nothing else. It is now a property of the table.
+    //
+    // TABLES EXAMINED AND FOUND NOT TO CARRY THIS DEFECT, recorded so the next
+    // reader does not have to re-derive it: `memory_mutation_receipts` is
+    // already bounded to two rows per receipt id by
+    // UNIQUE (tenant_id, workspace_id, mutation_receipt_id, phase), which is
+    // the pending/terminal pair by design; the five legal-hold and retention
+    // tables carry no `mutation_receipt_id` at all and are written by
+    // `aaliyah_memory_hold_officer` under a different authority entirely; and
+    // the erasure witness on `memory_record_versions` is a TOMBSTONE, bounded
+    // by 037's guard to versions of the tombstone's own target record below
+    // its own version — one tombstone erasing every prior version of one
+    // record is the requirement, not a defect.
+    //
+    // NOT SOLVED, SAID PLAINLY. A superuser can drop every index and trigger
+    // named here. Nothing inside the database defends against its owner.
+    id: "038_memory_one_authorization_one_mutation",
+    sql: `CREATE UNIQUE INDEX IF NOT EXISTS memory_record_versions_receipt_unique
+      ON memory_record_versions (tenant_id, workspace_id, mutation_receipt_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS memory_tombstones_receipt_unique
+      ON memory_tombstones (tenant_id, workspace_id, mutation_receipt_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS memory_alias_bindings_receipt_unique
+      ON memory_alias_bindings (tenant_id, workspace_id, mutation_receipt_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS memory_alias_bindings_removal_receipt_unique
+      ON memory_alias_bindings
+      (tenant_id, workspace_id, removed_by_mutation_receipt_id)
+      WHERE removed_by_mutation_receipt_id IS NOT NULL;
+    -- THE SINGLE RESOLUTION EVERY WITNESS NOW SHARES. Returning SETOF lets
+    -- each guard add the dimension only it knows about — the record id, the
+    -- binding digest, the action — without any of them restating the window.
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_spent_nonce(
+      p_tenant text, p_authorization text, p_receipt text)
+      RETURNS SETOF public.memory_authorization_nonces
+      LANGUAGE sql
+      STABLE
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+        SELECT n.*
+          FROM public.memory_authorization_nonces AS n
+         WHERE n.tenant_id = p_tenant
+           AND n.authorization_id = p_authorization
+           AND n.consumed_at IS NOT NULL
+           AND n.consumed_by_mutation_receipt_id = p_receipt
+           AND n.consumed_at >= n.issued_at
+           AND n.consumed_at < n.expires_at;
+      $fn$;
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_consumption_stamped()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SET search_path = pg_catalog, public
+      AS $fn$
+      BEGIN
+        IF OLD.consumed_at IS NULL AND NEW.consumed_at IS NOT NULL
+           AND NEW.consumed_at <> pg_catalog.now() THEN
+          RAISE EXCEPTION
+            'aaliyah memory: consumption must be stamped with the transaction clock'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_authorization_nonces_consumption_stamped
+      ON memory_authorization_nonces;
+    CREATE TRIGGER memory_authorization_nonces_consumption_stamped
+      BEFORE UPDATE ON memory_authorization_nonces
+      FOR EACH ROW
+      EXECUTE FUNCTION public.aaliyah_memory_consumption_stamped();
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_record_version_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        witnessed boolean;
+        prior public.memory_record_versions%ROWTYPE;
+      BEGIN
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.aaliyah_memory_spent_nonce(
+                   NEW.tenant_id, NEW.authorization_id,
+                   NEW.mutation_receipt_id) AS n
+           WHERE n.target_record_id = NEW.record_id
+        ) INTO witnessed;
+        IF NOT witnessed THEN
+          RAISE EXCEPTION
+            'aaliyah memory: no consumed authorization witnesses this record version'
+            USING ERRCODE = 'check_violation';
+        END IF;
+
+        SELECT * INTO prior
+          FROM public.memory_record_versions AS v
+         WHERE v.tenant_id = NEW.tenant_id
+           AND v.workspace_id = NEW.workspace_id
+           AND v.record_id = NEW.record_id
+           AND v.id <> NEW.id
+         ORDER BY v.version DESC
+         LIMIT 1;
+
+        IF NOT FOUND THEN
+          IF NEW.version <> 1 THEN
+            RAISE EXCEPTION
+              'aaliyah memory: a record chain must begin at version 1'
+              USING ERRCODE = 'check_violation';
+          END IF;
+          RETURN NULL;
+        END IF;
+
+        IF NEW.version <> prior.version + 1 THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a record version must be exactly one past the head'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.predecessor_digest IS DISTINCT FROM prior.content_digest THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a record version must link to the head content digest'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.principal_id <> prior.principal_id
+           OR NEW.user_id <> prior.user_id THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a record chain may not change principal or user'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_outcome_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        witnessed boolean;
+        committed boolean;
+        attempted boolean;
+      BEGIN
+        -- ABORTED_NO_MUTATION and UNKNOWN_PENDING_RECONCILIATION are what an
+        -- attempt that consumed nothing is REQUIRED to be able to record, so
+        -- they are deliberately not gated. The two statuses below are the
+        -- only ones that CLAIM a commit.
+        IF NEW.outcome_status NOT IN
+             ('COMMITTED_AND_READ_BACK', 'COMMITTED_READ_BACK_DIVERGED') THEN
+          RETURN NULL;
+        END IF;
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.aaliyah_memory_spent_nonce(
+                   NEW.tenant_id, NEW.authorization_id,
+                   NEW.mutation_receipt_id) AS n
+           WHERE n.binding_digest = NEW.consumed_nonce_digest
+        ) INTO witnessed;
+        IF NOT witnessed THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a committed outcome requires a consumed authorization'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.memory_record_versions AS v
+           WHERE v.tenant_id = NEW.tenant_id
+             AND v.workspace_id = NEW.workspace_id
+             AND v.record_id = NEW.target_record_id
+             AND v.mutation_receipt_id = NEW.mutation_receipt_id
+        ) INTO committed;
+        IF NOT committed THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a committed outcome requires the record version it claims'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        -- THE PENDING ROW THE TERMINAL ROW CONCLUDES. The pending receipt is
+        -- written INSIDE the mutation transaction and always carries UNKNOWN;
+        -- a terminal success with no pending predecessor describes a mutation
+        -- that never announced itself, which is the shape the H-1 reproducer
+        -- minted directly.
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.memory_mutation_receipts AS r
+           WHERE r.tenant_id = NEW.tenant_id
+             AND r.workspace_id = NEW.workspace_id
+             AND r.mutation_receipt_id = NEW.mutation_receipt_id
+             AND r.phase = 'pending'
+        ) INTO attempted;
+        IF NOT attempted THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a committed outcome requires the pending receipt it concludes'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    CREATE OR REPLACE FUNCTION public.aaliyah_alias_binding_insert_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        witnessed boolean;
+        crossed boolean;
+      BEGIN
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.aaliyah_memory_spent_nonce(
+                   NEW.tenant_id, NEW.authorization_id,
+                   NEW.mutation_receipt_id) AS n
+        ) INTO witnessed;
+        IF NOT witnessed THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: no consumed authorization witnesses this binding'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        -- The cross-column half of one-authorization-one-mutation. The two
+        -- unique indexes stop N bindings or N retirements under one receipt
+        -- id; this stops one receipt id from binding here and retiring there.
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.memory_alias_bindings AS b
+           WHERE b.tenant_id = NEW.tenant_id
+             AND b.workspace_id = NEW.workspace_id
+             AND b.removed_by_mutation_receipt_id = NEW.mutation_receipt_id
+        ) INTO crossed;
+        IF crossed THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: this authorization has already been spent on another binding'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    CREATE OR REPLACE FUNCTION public.aaliyah_alias_binding_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        witnessed boolean;
+        crossed boolean;
+      BEGIN
+        IF TG_OP = 'DELETE' THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: DELETE on % is forbidden; a binding is retired, never erased'
+            , TG_TABLE_NAME
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF OLD.removed_at IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: a retired alias binding is immutable'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.removed_at IS NULL THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: retirement is the only permitted update'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF (pg_catalog.to_jsonb(NEW) - 'removed_at' - 'removed_by_mutation_receipt_id'
+              - 'removed_authorization_id')
+           IS DISTINCT FROM
+           (pg_catalog.to_jsonb(OLD) - 'removed_at' - 'removed_by_mutation_receipt_id'
+              - 'removed_authorization_id') THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: retirement may not rewrite a binding'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        -- LAST, so every check above still reports its own violation.
+        -- Retirement is a mutation and needs an authorization it has spent,
+        -- exactly as binding does.
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.aaliyah_memory_spent_nonce(
+                   NEW.tenant_id, NEW.removed_authorization_id,
+                   NEW.removed_by_mutation_receipt_id) AS n
+        ) INTO witnessed;
+        IF NOT witnessed THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: no consumed authorization witnesses this retirement'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.memory_alias_bindings AS b
+           WHERE b.tenant_id = NEW.tenant_id
+             AND b.workspace_id = NEW.workspace_id
+             AND b.mutation_receipt_id = NEW.removed_by_mutation_receipt_id
+        ) INTO crossed;
+        IF crossed THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: this authorization has already been spent on another binding'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$;
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_tombstone_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        offending text;
+        blocking text;
+        obligation timestamptz;
+        head_state text;
+        witnessed boolean;
+      BEGIN
+        IF (SELECT pg_catalog.count(*) FROM pg_catalog.jsonb_object_keys(NEW.payload)) <> 18
+           OR NOT (NEW.payload ?& ARRAY[
+             'schemaVersion','tombstoneId','scope','targetRecordId',
+             'targetVersion','tombstoneVersion','deletionAuthority','reason',
+             'reasonEvidenceRef','effectiveAt','retention','retainedFieldNames',
+             'destroyedFieldNames','derivedData','cacheIndexPropagation',
+             'downstreamPropagation','restorationEligibility','tombstoneDigest'])
+        THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a tombstone must carry exactly the contract member set'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        SELECT k INTO offending
+          FROM public.aaliyah_memory_jsonb_member_names(NEW.payload) AS t(k)
+         WHERE pg_catalog.lower(k) IN ('content','payload','value','body','text',
+                                       'note','data','plaintext','secret')
+         LIMIT 1;
+        IF offending IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a tombstone may not carry a payload-bearing member'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF public.aaliyah_memory_first_free_text(NEW.payload) IS NOT NULL THEN
+          -- The VALUE is deliberately absent: see migration 033, M-4.
+          RAISE EXCEPTION
+            'aaliyah memory: a tombstone may not carry free-form text'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        SELECT v.state INTO head_state
+          FROM public.memory_record_versions AS v
+         WHERE v.tenant_id = NEW.tenant_id
+           AND v.workspace_id = NEW.workspace_id
+           AND v.record_id = NEW.target_record_id
+           AND v.version = NEW.tombstone_version
+         LIMIT 1;
+        IF head_state IS DISTINCT FROM 'deleted' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a tombstone must name a deleted version of its target record'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        blocking := public.aaliyah_memory_restricting_hold(
+          NEW.tenant_id, NEW.workspace_id, NEW.target_record_id, NULL, 'delete');
+        IF blocking IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: legal hold % restricts delete on this record'
+            , blocking
+            USING ERRCODE = 'check_violation';
+        END IF;
+        SELECT pg_catalog.max(o.retain_until) INTO obligation
+          FROM public.memory_retention_obligations AS o
+         WHERE o.tenant_id = NEW.tenant_id
+           AND o.workspace_id = NEW.workspace_id
+           AND o.record_id = NEW.target_record_id
+           AND o.retain_until > pg_catalog.now();
+        IF obligation IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: an unexpired retention obligation forbids destroying this record'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        -- LAST, so every violation above still reports its own message. The
+        -- tombstone's authorization columns were pure decoration until here:
+        -- nothing checked that the destruction it accounts for was ever
+        -- approved, or approved as a DELETE.
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.aaliyah_memory_spent_nonce(
+                   NEW.tenant_id, NEW.authorization_id,
+                   NEW.mutation_receipt_id) AS n
+           WHERE n.target_record_id = NEW.target_record_id
+             AND n.action = 'delete'
+        ) INTO witnessed;
+        IF NOT witnessed THEN
+          RAISE EXCEPTION
+            'aaliyah memory: no consumed delete authorization witnesses this tombstone'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$`,
+  },
 ];
 
 export async function runMailMigrations(pool: Pool): Promise<void> {

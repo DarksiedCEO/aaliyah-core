@@ -2830,3 +2830,389 @@ test("a SUBJECTS hold blocks record-level mutation in its scope, because the rec
   assert.equal(result.rejection, "legal_hold_active");
   assert.equal((await rawVersions()).length, 1);
 });
+
+// ---------------------------------------------------------------------------
+// W1.3 Part B3 — THE WITNESS-BEARING TABLES 037 ADDED.
+//
+// `memory_tombstones` carries `authorization_id` and `mutation_receipt_id`
+// and, until migration 038, NOTHING checked either of them: a tombstone's
+// attribution was decoration, and one receipt id could account for any number
+// of destructions. And Part F's action-to-state binding, which was reviewed by
+// READING, gets the branch it was missing a killing test for.
+// ---------------------------------------------------------------------------
+
+/** A structurally perfect tombstone row, written directly as the mutator. */
+async function insertTombstoneAs(input: {
+  tombstoneId: string;
+  authorizationId: string;
+  mutationReceiptId: string;
+  payload: Record<string, unknown>;
+  digest: string;
+  targetVersion?: number;
+  tombstoneVersion?: number;
+}): Promise<void> {
+  await runAs(
+    "aaliyah_memory_mutator",
+    `INSERT INTO memory_tombstones
+       (tenant_id, workspace_id, principal_id, user_id, tombstone_id,
+        target_record_id, target_version, tombstone_version, authorization_id,
+        mutation_receipt_id, reason, effective_at, retain_until,
+        legal_hold_state, cache_index_propagation,
+        restoration_eligibility_kind, tombstone_digest, payload)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+             'subject_erasure_request', now(), NULL, 'none', 'unknown',
+             'ineligible_payload_destroyed', $11, $12)`,
+    [
+      SCOPE.tenantId,
+      SCOPE.workspaceId,
+      SCOPE.principalId,
+      SCOPE.userId,
+      input.tombstoneId,
+      RECORD_ID,
+      input.targetVersion ?? 1,
+      input.tombstoneVersion ?? 2,
+      input.authorizationId,
+      input.mutationReceiptId,
+      input.digest,
+      JSON.stringify(input.payload),
+    ],
+  );
+}
+
+/** Delete for real through the store, and hand back the tombstone it wrote. */
+async function honestDeletion(input: {
+  mutationReceiptId: string;
+  tombstoneId: string;
+}) {
+  const genesis = await seedGenesis({ note: SENSITIVE });
+  const order = deletionOrder();
+  const receipt = await issue(
+    authorization({
+      action: "delete",
+      expectedHead: headOf(1, genesis),
+      proposedContent: order,
+    }),
+  );
+  const result = await store().delete({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: order,
+    mutationReceiptId: input.mutationReceiptId,
+    tombstoneId: input.tombstoneId,
+  });
+  assert.equal(result.verified, true, "the honest deletion must succeed first");
+  const tombstone = result.tombstone;
+  assert.ok(tombstone);
+  return { tombstone, receipt };
+}
+
+test("B3 a tombstone with no consumed delete authorization behind it is refused", async () => {
+  // Migration 037 checked the tombstone's SHAPE, its target's state, the holds
+  // and the retention clock. It never checked that the destruction it accounts
+  // for was APPROVED, so the mutator could file an account of a deletion
+  // naming an authorization that was never spent — or never existed.
+  const { tombstone } = await honestDeletion({
+    mutationReceiptId: "mutation.b3.tombstone.seed",
+    tombstoneId: "tombstone-b3-seed",
+  });
+  const unwitnessed = {
+    ...tombstone,
+    tombstoneId: "tombstone-b3-unwitnessed",
+  } as Record<string, unknown>;
+  await assert.rejects(
+    () =>
+      insertTombstoneAs({
+        tombstoneId: "tombstone-b3-unwitnessed",
+        authorizationId: "never-spent-0000000000000001",
+        mutationReceiptId: "mutation.b3.never",
+        payload: unwitnessed,
+        digest: tombstone.tombstoneDigest,
+      }),
+    /no consumed delete authorization witnesses this tombstone/,
+  );
+  const stored = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_tombstones`,
+  );
+  assert.equal(stored.rows[0].n, 1);
+});
+
+test("B3 a tombstone witnessed by a CORRECT authorization is refused; destruction needs a delete", async () => {
+  // The sharper case: the approval is real, it was spent, and it names this
+  // record — but it approved a correction. A destruction accounted for by an
+  // approval to edit is not accounted for.
+  const { tombstone } = await honestDeletion({
+    mutationReceiptId: "mutation.b3.wrongaction.seed",
+    tombstoneId: "tombstone-b3-wrongaction-seed",
+  });
+  await witnessAppend({
+    authorizationId: "correct-b3-00000000000000001",
+    mutationReceiptId: "mutation.b3.correct",
+    recordId: RECORD_ID,
+    action: "correct",
+  });
+  const mislabelled = {
+    ...tombstone,
+    tombstoneId: "tombstone-b3-wrongaction",
+  } as Record<string, unknown>;
+  await assert.rejects(
+    () =>
+      insertTombstoneAs({
+        tombstoneId: "tombstone-b3-wrongaction",
+        authorizationId: "correct-b3-00000000000000001",
+        mutationReceiptId: "mutation.b3.correct",
+        payload: mislabelled,
+        digest: tombstone.tombstoneDigest,
+      }),
+    /no consumed delete authorization witnesses this tombstone/,
+  );
+});
+
+/** Several statements, ONE transaction, under one least-privilege role. */
+async function runAsTransaction(
+  role: string,
+  steps: ReadonlyArray<{ sql: string; params?: unknown[] }>,
+): Promise<void> {
+  const client = await adminPool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`SET LOCAL ROLE "${role}"`);
+    for (const step of steps) {
+      await client.query(step.sql, step.params ?? []);
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+test("B3 one consumed authorization accounts for exactly ONE tombstone", async () => {
+  // THE H-1 SHAPE ON THE TABLE 037 ADDED, and the construction is the honest
+  // one rather than the convenient one. `memory_tombstones_version_unique`
+  // already bounds tombstones per (record, version), so the only way to charge
+  // TWO destructions to ONE mutation receipt id is a record that is deleted,
+  // restored and deleted again: the second destruction is appended under its
+  // own fresh approval — it has to be, `memory_record_versions_receipt_unique`
+  // sees to that — and then its TOMBSTONE is filed under the FIRST
+  // deletion's receipt id. The witness passes, because the first deletion's
+  // nonce really does name this record and really was spent on a delete. What
+  // is wrong is the accounting: one receipt id, two destructions, and anyone
+  // reconciling receipts against tombstones is told a number that is false.
+  const { tombstone: first, receipt: firstAuth } = await honestDeletion({
+    mutationReceiptId: "mutation.b3.onetomb",
+    tombstoneId: "tombstone-b3-onetomb",
+  });
+  assert.equal(first.tombstoneVersion, 2);
+
+  // Restore, so the record has a live head to destroy a second time.
+  const restoreContent = { note: "reinstated" };
+  const restoreAuth = await issue(
+    authorization({
+      action: "restore",
+      expectedHead: headOf(2, memoryContentDigest(deletionOrder())),
+      proposedContent: restoreContent,
+    }),
+  );
+  const restored = await store().restore({
+    actor: SCOPE,
+    authorizationId: restoreAuth.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: restoreContent,
+    mutationReceiptId: "mutation.b3.onetomb.restore",
+  });
+  assert.equal(restored.verified, true);
+
+  // The second destruction, written directly so the filer chooses the receipt
+  // id the tombstone is charged to. Its VERSION append carries its own fresh
+  // approval; only the tombstone reaches back to the first one.
+  await witnessAppend({
+    authorizationId: "seconddelete-0000000000000001",
+    mutationReceiptId: "mutation.b3.seconddelete",
+    recordId: RECORD_ID,
+    action: "delete",
+  });
+  const order = deletionOrder();
+  const orderDigest = memoryContentDigest(order);
+  const secondDeleted = {
+    schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
+    recordId: RECORD_ID,
+    version: 4,
+    state: "deleted",
+    scope: SCOPE,
+    content: order,
+    contentDigest: orderDigest,
+    predecessorDigest: memoryContentDigest(restoreContent),
+    authorizationId: "seconddelete-0000000000000001",
+    mutationReceiptId: "mutation.b3.seconddelete",
+    createdAt: isoOffset(0),
+  };
+  const secondTombstone = (authorizationId: string) => ({
+    ...first,
+    tombstoneId: "tombstone-b3-onetomb-again",
+    targetVersion: 3,
+    tombstoneVersion: 4,
+    deletionAuthority: { ...first.deletionAuthority, authorizationId },
+  });
+  const steps = (authorizationId: string, receiptId: string) => [
+    {
+      sql: `INSERT INTO memory_record_versions
+              (tenant_id, workspace_id, principal_id, user_id, record_id,
+               version, state, content_digest, predecessor_digest,
+               authorization_id, mutation_receipt_id, payload)
+            VALUES ($1,$2,$3,$4,$5,4,'deleted',$6,$7,$8,$9,$10)`,
+      params: [
+        SCOPE.tenantId,
+        SCOPE.workspaceId,
+        SCOPE.principalId,
+        SCOPE.userId,
+        RECORD_ID,
+        orderDigest,
+        memoryContentDigest(restoreContent),
+        "seconddelete-0000000000000001",
+        "mutation.b3.seconddelete",
+        JSON.stringify(secondDeleted),
+      ],
+    },
+    {
+      sql: `INSERT INTO memory_tombstones
+              (tenant_id, workspace_id, principal_id, user_id, tombstone_id,
+               target_record_id, target_version, tombstone_version,
+               authorization_id, mutation_receipt_id, reason, effective_at,
+               retain_until, legal_hold_state, cache_index_propagation,
+               restoration_eligibility_kind, tombstone_digest, payload)
+            VALUES ($1,$2,$3,$4,'tombstone-b3-onetomb-again',$5,3,4,$6,$7,
+                    'subject_erasure_request', now(), NULL, 'none', 'unknown',
+                    'ineligible_payload_destroyed',$8,$9)`,
+      params: [
+        SCOPE.tenantId,
+        SCOPE.workspaceId,
+        SCOPE.principalId,
+        SCOPE.userId,
+        RECORD_ID,
+        authorizationId,
+        receiptId,
+        first.tombstoneDigest,
+        JSON.stringify(secondTombstone(authorizationId)),
+      ],
+    },
+    {
+      sql: `UPDATE memory_record_versions
+               SET payload = jsonb_set(payload, '{content}', 'null'::jsonb),
+                   content_erased_at = now(),
+                   erasure_tombstone_id = 'tombstone-b3-onetomb-again'
+             WHERE tenant_id = $1 AND workspace_id = $2 AND record_id = $3
+               AND version <= 3 AND content_erased_at IS NULL`,
+      params: [SCOPE.tenantId, SCOPE.workspaceId, RECORD_ID],
+    },
+  ];
+
+  await assert.rejects(
+    () =>
+      runAsTransaction(
+        "aaliyah_memory_mutator",
+        steps(firstAuth.authorizationId, "mutation.b3.onetomb"),
+      ),
+    /duplicate key value violates unique constraint "memory_tombstones_receipt_unique"/,
+  );
+  assert.equal((await rawVersions()).length, 3);
+
+  // POSITIVE CONTROL: the SAME transaction, with the tombstone charged to the
+  // approval that actually authorized THIS destruction, is accepted. The index
+  // refuses the reuse and nothing else.
+  await runAsTransaction(
+    "aaliyah_memory_mutator",
+    steps("seconddelete-0000000000000001", "mutation.b3.seconddelete"),
+  );
+  const stored = await adminPool.query(
+    `SELECT tombstone_id, mutation_receipt_id FROM memory_tombstones
+      ORDER BY tombstone_version`,
+  );
+  assert.deepEqual(stored.rows, [
+    {
+      tombstone_id: "tombstone-b3-onetomb",
+      mutation_receipt_id: "mutation.b3.onetomb",
+    },
+    {
+      tombstone_id: "tombstone-b3-onetomb-again",
+      mutation_receipt_id: "mutation.b3.seconddelete",
+    },
+  ]);
+});
+
+test("B3 Part F's action-state guard refuses a RESTORE onto a head that was never deleted", async () => {
+  // THE BRANCH THAT HAD NO KILLING TEST. Part F's
+  // `aaliyah_memory_action_state_guard` pins four bindings and three of them
+  // were already exercised against a direct writer. "restore may only follow a
+  // deleted head" was only ever proven through the STORE, where it is a
+  // TypeScript comparison — so the DATABASE half of it was a control nobody
+  // had tried to kill.
+  const genesis = await seedGenesis({ note: "never deleted" });
+  await assert.rejects(
+    () =>
+      hostileAppend({
+        action: "restore",
+        state: "active",
+        version: 2,
+        predecessorDigest: genesis,
+        content: { note: "restoring what was never deleted" },
+        label: "restorelive",
+      }),
+    /restore may only follow a deleted head/,
+  );
+  assert.equal((await rawVersions()).length, 1);
+});
+
+test("B3 Part F's action-state guard still ALLOWS the four bindings it exists to permit", async () => {
+  // A guard that refused everything would pass every negative above. This is
+  // the positive control for all four branches, one statement each, all
+  // written by a direct writer that never calls the store.
+  const genesis = await seedGenesis({ note: "original" });
+  // 1. non-delete -> active.
+  await hostileAppend({
+    action: "correct",
+    state: "active",
+    version: 2,
+    predecessorDigest: genesis,
+    content: { note: "corrected" },
+    label: "allowcorrect",
+  });
+  const corrected = memoryContentDigest({ note: "corrected" });
+  // 2. delete -> deleted, over an erased predecessor set. The deferred
+  //    `deletion_erases` trigger means this has to carry its own erasure, so
+  //    it is done through the store, which is the only writer that does the
+  //    whole transaction.
+  const order = deletionOrder();
+  const deleteAuth = await issue(
+    authorization({
+      action: "delete",
+      expectedHead: headOf(2, corrected),
+      proposedContent: order,
+    }),
+  );
+  const deleted = await store().delete({
+    actor: SCOPE,
+    authorizationId: deleteAuth.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: order,
+    mutationReceiptId: "mutation.b3.allow.delete",
+    tombstoneId: "tombstone-b3-allow",
+  });
+  assert.equal(deleted.verified, true);
+  // 3. restore -> active, after a deleted head.
+  await hostileAppend({
+    action: "restore",
+    state: "active",
+    version: 4,
+    predecessorDigest: memoryContentDigest(order),
+    content: { note: "reinstated" },
+    label: "allowrestore",
+  });
+  const rows = await rawVersions();
+  assert.deepEqual(
+    rows.map((row) => row.state),
+    ["active", "active", "deleted", "active"],
+  );
+});
