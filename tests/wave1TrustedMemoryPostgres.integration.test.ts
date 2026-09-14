@@ -164,6 +164,7 @@ beforeEach(async () => {
   await adminPool.query(
     `TRUNCATE ${UNCHECKED_SCHEMA}.memory_record_versions RESTART IDENTITY`,
   );
+  genesisCounter = 0;
 });
 
 let authorizationCounter = 0;
@@ -311,6 +312,92 @@ async function issue(
   return receipt;
 }
 
+/** Run one statement under a named least-privilege role, in its own transaction. */
+async function runAs(
+  role: string,
+  sql: string,
+  params: unknown[] = [],
+): Promise<void> {
+  const client = await adminPool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`SET LOCAL ROLE "${role}"`);
+    await client.query(sql, params);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Mint an authorization nonce and SPEND it, so a row appended outside the
+ * store still carries the witness migration 034 requires of every writer.
+ *
+ * Written with the ISSUER role and spent with the MUTATOR role, because a
+ * fixture that used the owner for both would not notice if the privilege split
+ * it depends on stopped existing. A test that wants to prove the guard REFUSES
+ * an unwitnessed append simply does not call this.
+ */
+async function witnessAppend(input: {
+  authorizationId: string;
+  mutationReceiptId: string;
+  recordId?: string;
+  scope?: MemoryScope;
+  action?: string;
+}): Promise<void> {
+  const scope = input.scope ?? SCOPE;
+  const bindingDigest = memoryContentDigest(input.authorizationId);
+  await runAs(
+    "aaliyah_memory_issuer",
+    `INSERT INTO memory_authorization_nonces
+       (tenant_id, workspace_id, binding_digest, authorization_id, action,
+        target_record_id, issued_at, expires_at)
+     VALUES ($1,$2,$3,$4,$5,$6, now() - interval '1 minute',
+             now() + interval '1 hour')`,
+    [
+      scope.tenantId,
+      scope.workspaceId,
+      bindingDigest,
+      input.authorizationId,
+      input.action ?? "correct",
+      input.recordId ?? RECORD_ID,
+    ],
+  );
+  await runAs(
+    "aaliyah_memory_mutator",
+    `UPDATE memory_authorization_nonces
+        SET consumed_at = now(), consumed_by_mutation_receipt_id = $2
+      WHERE binding_digest = $1 AND consumed_at IS NULL`,
+    [bindingDigest, input.mutationReceiptId],
+  );
+}
+
+/**
+ * Drop a named trigger for the duration of one block and put it back, ALWAYS.
+ *
+ * Three sites used to disable the append-only trigger with a bare pair of
+ * statements: a failure between them left the trigger OFF for every test that
+ * ran afterwards in the same database, so the append-only control would have
+ * been silently unenforced and the suite still green.
+ */
+async function withTriggerDisabled<T>(
+  table: string,
+  trigger: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  await adminPool.query(`ALTER TABLE ${table} DISABLE TRIGGER ${trigger}`);
+  try {
+    return await run();
+  } finally {
+    await adminPool.query(`ALTER TABLE ${table} ENABLE TRIGGER ${trigger}`);
+  }
+}
+
+let genesisCounter = 0;
+
 /** Seed version 1 of a record. `create` is a later assignment. */
 async function seedGenesis(
   content: unknown,
@@ -319,6 +406,18 @@ async function seedGenesis(
   const scope = options.scope ?? SCOPE;
   const recordId = options.recordId ?? RECORD_ID;
   const digest = memoryContentDigest(content);
+  genesisCounter += 1;
+  // Distinct per call: a nonce is globally unique on its authorization id, and
+  // every genesis now spends one.
+  const authorizationId = `genesis-${String(genesisCounter).padStart(21, "0")}`;
+  const mutationReceiptId = `mutation.genesis.${genesisCounter}`;
+  await witnessAppend({
+    authorizationId,
+    mutationReceiptId,
+    recordId,
+    scope,
+    action: "create",
+  });
   const payload = {
     schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
     recordId,
@@ -328,8 +427,8 @@ async function seedGenesis(
     content,
     contentDigest: digest,
     predecessorDigest: null,
-    authorizationId: "genesis-000000000000000000000",
-    mutationReceiptId: "mutation.genesis",
+    authorizationId,
+    mutationReceiptId,
     createdAt: isoOffset(-120_000),
   };
   await adminPool.query(
@@ -585,15 +684,11 @@ test("replaying a consumed authorization is refused the second time", async () =
 
   // Put the record back on the head the authorization expects, so the ONLY
   // thing standing between the replay and a second mutation is consumption.
-  await adminPool.query(
-    `DELETE FROM memory_record_versions WHERE version = 2`,
-  ).catch(() => undefined);
-  await adminPool.query(
-    `ALTER TABLE memory_record_versions DISABLE TRIGGER memory_record_versions_append_only`,
-  );
-  await adminPool.query(`DELETE FROM memory_record_versions WHERE version = 2`);
-  await adminPool.query(
-    `ALTER TABLE memory_record_versions ENABLE TRIGGER memory_record_versions_append_only`,
+  await withTriggerDisabled(
+    "memory_record_versions",
+    "memory_record_versions_append_only",
+    () =>
+      adminPool.query(`DELETE FROM memory_record_versions WHERE version = 2`),
   );
   assert.equal(await countVersions(), 1);
 
@@ -635,17 +730,33 @@ test("a spent nonce still refuses the mutation when the receipt row is forged ba
     true,
   );
 
-  await adminPool.query(
-    `ALTER TABLE memory_record_versions DISABLE TRIGGER memory_record_versions_append_only`,
+  await withTriggerDisabled(
+    "memory_record_versions",
+    "memory_record_versions_append_only",
+    () =>
+      adminPool.query(`DELETE FROM memory_record_versions WHERE version = 2`),
   );
-  await adminPool.query(`DELETE FROM memory_record_versions WHERE version = 2`);
-  await adminPool.query(
-    `ALTER TABLE memory_record_versions ENABLE TRIGGER memory_record_versions_append_only`,
+  // Migration 035 makes consumption irreversible for EVERY writer, the owner
+  // included, so the forgery this test depends on has to be staged with the
+  // control switched off — which is itself the negative control for it.
+  await assert.rejects(
+    () =>
+      adminPool.query(
+        `UPDATE memory_authorization_receipts SET consumed_at = NULL
+          WHERE authorization_id = $1`,
+        [receipt.authorizationId],
+      ),
+    /consumption is irreversible on memory_authorization_receipts/,
   );
-  await adminPool.query(
-    `UPDATE memory_authorization_receipts SET consumed_at = NULL
-      WHERE authorization_id = $1`,
-    [receipt.authorizationId],
+  await withTriggerDisabled(
+    "memory_authorization_receipts",
+    "memory_authorization_receipts_consumption_monotonic",
+    () =>
+      adminPool.query(
+        `UPDATE memory_authorization_receipts SET consumed_at = NULL
+          WHERE authorization_id = $1`,
+        [receipt.authorizationId],
+      ),
   );
 
   const replay = await store().correct({
@@ -1335,6 +1446,15 @@ test("the database refuses inexact jsonb numbers from ANY writer, not just from 
   // precisely W1BR-006, and it is why the guard has to live in the database
   // rather than in a Node-side validator.
   const digest = `sha256:${"f".repeat(64)}`;
+  // Migration 034 requires a spent authorization behind every appended row.
+  // The numeric domain is what THIS test is about, so the append is made
+  // legitimate in every other respect and the only thing left to refuse it is
+  // the numeric trigger.
+  await witnessAppend({
+    authorizationId: "direct-0000000000000000000001",
+    mutationReceiptId: "mutation.direct",
+    recordId: "record-direct-001",
+  });
   const payload = (contentJson: string) =>
     [
       `{"schemaVersion":"${MEMORY_RECORD_VERSION_SCHEMA_VERSION}"`,
@@ -1406,6 +1526,11 @@ test("the database refuses a row whose jsonb payload disagrees with its columns"
   // a row belongs to.
   const content = { note: "original" };
   const digest = memoryContentDigest(content);
+  await witnessAppend({
+    authorizationId: "binding-0000000000000000000001",
+    mutationReceiptId: "mutation.binding",
+    recordId: "record-binding-001",
+  });
   const row = (payloadOverrides: Record<string, unknown>) =>
     adminPool.query(
       `INSERT INTO memory_record_versions
@@ -1714,18 +1839,34 @@ test("a receipt row marked consumed refuses the mutation even when its nonce is 
     true,
   );
 
-  await adminPool.query(
-    `ALTER TABLE memory_record_versions DISABLE TRIGGER memory_record_versions_append_only`,
+  await withTriggerDisabled(
+    "memory_record_versions",
+    "memory_record_versions_append_only",
+    () =>
+      adminPool.query(`DELETE FROM memory_record_versions WHERE version = 2`),
   );
-  await adminPool.query(`DELETE FROM memory_record_versions WHERE version = 2`);
-  await adminPool.query(
-    `ALTER TABLE memory_record_versions ENABLE TRIGGER memory_record_versions_append_only`,
+  // Same as above: resurrecting a spent nonce is refused by the database now,
+  // so the state this control is tested against has to be staged deliberately.
+  await assert.rejects(
+    () =>
+      adminPool.query(
+        `UPDATE memory_authorization_nonces
+            SET consumed_at = NULL, consumed_by_mutation_receipt_id = NULL
+          WHERE binding_digest = $1`,
+        [receipt.nonce.bindingDigest],
+      ),
+    /consumption is irreversible on memory_authorization_nonces/,
   );
-  await adminPool.query(
-    `UPDATE memory_authorization_nonces
-        SET consumed_at = NULL, consumed_by_mutation_receipt_id = NULL
-      WHERE binding_digest = $1`,
-    [receipt.nonce.bindingDigest],
+  await withTriggerDisabled(
+    "memory_authorization_nonces",
+    "memory_authorization_nonces_consumption_monotonic",
+    () =>
+      adminPool.query(
+        `UPDATE memory_authorization_nonces
+            SET consumed_at = NULL, consumed_by_mutation_receipt_id = NULL
+          WHERE binding_digest = $1`,
+        [receipt.nonce.bindingDigest],
+      ),
   );
   assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
 
@@ -1893,4 +2034,1067 @@ test("a role option that is not a plain identifier is refused at construction", 
       }),
     /readBackRole is not a valid role identifier/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// W1.3 Part B2 — WHAT MAY BE APPENDED.
+//
+// Migration 029 constrains WHO may write. Everything below is about WHAT, and
+// every one of these was EXECUTED as an exploit against 34ac77f before it was
+// a test: the least-privilege mutator forged a record chain and a terminal
+// success receipt, an authorization for one principal took over another
+// principal's record, a spent approval was resurrected, a healthy write was
+// filed as a storage divergence, record content reached the server log, and an
+// unknown authorization id left no trace at all.
+// ---------------------------------------------------------------------------
+
+/** Run a statement as the least-privilege mutation role and return the error. */
+async function asMutator(sql: string, params: unknown[] = []): Promise<void> {
+  await runAs("aaliyah_memory_mutator", sql, params);
+}
+
+const FORGED_VERSION_SQL = `INSERT INTO memory_record_versions
+   (tenant_id, workspace_id, principal_id, user_id, record_id, version,
+    state, content_digest, predecessor_digest, authorization_id,
+    mutation_receipt_id, payload)
+ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`;
+
+function versionPayload(input: {
+  recordId: string;
+  version: number;
+  contentDigest: string;
+  predecessorDigest: string | null;
+  authorizationId: string;
+  mutationReceiptId: string;
+  scope?: MemoryScope;
+  content?: unknown;
+  state?: string;
+}): string {
+  return JSON.stringify({
+    schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
+    recordId: input.recordId,
+    version: input.version,
+    state: input.state ?? "active",
+    scope: input.scope ?? SCOPE,
+    content: input.content ?? { note: "appended" },
+    contentDigest: input.contentDigest,
+    predecessorDigest: input.predecessorDigest,
+    authorizationId: input.authorizationId,
+    mutationReceiptId: input.mutationReceiptId,
+    createdAt: isoOffset(0),
+  });
+}
+
+test("H-1 the mutation role cannot append a version behind an authorization that was never consumed", async () => {
+  // EXECUTED against 34ac77f: this INSERT was ACCEPTED. There was no foreign
+  // key on memory_record_versions (pg_constraint contype='f' returned zero
+  // rows) and nothing tied a version to a consumed nonce, so the contained
+  // role could write history for an authorization that does not exist.
+  const genesis = await seedGenesis({ note: "original" });
+  const digest = `sha256:${"2".repeat(64)}`;
+  await assert.rejects(
+    () =>
+      asMutator(FORGED_VERSION_SQL, [
+        SCOPE.tenantId,
+        SCOPE.workspaceId,
+        SCOPE.principalId,
+        SCOPE.userId,
+        RECORD_ID,
+        2,
+        "active",
+        digest,
+        genesis,
+        "auth-does-not-exist-00000000",
+        "mutation.forged",
+        versionPayload({
+          recordId: RECORD_ID,
+          version: 2,
+          contentDigest: digest,
+          predecessorDigest: genesis,
+          authorizationId: "auth-does-not-exist-00000000",
+          mutationReceiptId: "mutation.forged",
+        }),
+      ]),
+    /no consumed authorization witnesses this record version/,
+  );
+  assert.equal(await countVersions(), 1);
+});
+
+test("H-1 an authorization that exists but was never SPENT is not a witness either", async () => {
+  // The sharper case: the authorization is real and live. What the guard
+  // requires is CONSUMPTION, because minting is the issuer's privilege and
+  // spending is the mutator's — an unspent approval is not evidence that this
+  // particular append was the one it approved.
+  const genesis = await seedGenesis({ note: "original" });
+  const next = { note: "corrected" };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, genesis),
+      proposedContent: next,
+    }),
+  );
+  const digest = memoryContentDigest(next);
+  await assert.rejects(
+    () =>
+      asMutator(FORGED_VERSION_SQL, [
+        SCOPE.tenantId,
+        SCOPE.workspaceId,
+        SCOPE.principalId,
+        SCOPE.userId,
+        RECORD_ID,
+        2,
+        "active",
+        digest,
+        genesis,
+        receipt.authorizationId,
+        "mutation.unspent",
+        versionPayload({
+          recordId: RECORD_ID,
+          version: 2,
+          contentDigest: digest,
+          predecessorDigest: genesis,
+          authorizationId: receipt.authorizationId,
+          mutationReceiptId: "mutation.unspent",
+          content: next,
+        }),
+      ]),
+    /no consumed authorization witnesses this record version/,
+  );
+  assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
+  assert.equal(await countVersions(), 1);
+});
+
+test("H-1 a consumed authorization witnesses ONE mutation receipt, not any append", async () => {
+  // Negative control for the control: the nonce IS consumed, by a different
+  // mutation receipt id. Without this the guard could be satisfied by any
+  // spent approval in the tenant.
+  const genesis = await seedGenesis({ note: "original" });
+  await witnessAppend({
+    authorizationId: "spent-00000000000000000000001",
+    mutationReceiptId: "mutation.something.else",
+    recordId: RECORD_ID,
+  });
+  const digest = `sha256:${"3".repeat(64)}`;
+  await assert.rejects(
+    () =>
+      asMutator(FORGED_VERSION_SQL, [
+        SCOPE.tenantId,
+        SCOPE.workspaceId,
+        SCOPE.principalId,
+        SCOPE.userId,
+        RECORD_ID,
+        2,
+        "active",
+        digest,
+        genesis,
+        "spent-00000000000000000000001",
+        "mutation.not.the.witnessed.one",
+        versionPayload({
+          recordId: RECORD_ID,
+          version: 2,
+          contentDigest: digest,
+          predecessorDigest: genesis,
+          authorizationId: "spent-00000000000000000000001",
+          mutationReceiptId: "mutation.not.the.witnessed.one",
+        }),
+      ]),
+    /no consumed authorization witnesses this record version/,
+  );
+  assert.equal(await countVersions(), 1);
+});
+
+test("H-1 the mutation role cannot mint a terminal COMMITTED_AND_READ_BACK", async () => {
+  // EXECUTED against 34ac77f: ACCEPTED, for an authorization that did not
+  // exist. `COMMITTED_AND_READ_BACK` is the system's ONLY success signal and
+  // the contained role could write it at will.
+  await seedGenesis({ note: "original" });
+  const forged = {
+    schemaVersion: WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION,
+    mutationReceiptId: "mutation.forged.receipt",
+    authorizationId: "auth-does-not-exist-00000000",
+    consumedNonceDigest: `sha256:${"3".repeat(64)}`,
+    action: "correct",
+    scope: SCOPE,
+    targetRecordId: RECORD_ID,
+    outcome: { status: "COMMITTED_AND_READ_BACK" },
+  };
+  await assert.rejects(
+    () =>
+      asMutator(
+        `INSERT INTO memory_mutation_receipts
+           (tenant_id, workspace_id, principal_id, user_id, mutation_receipt_id,
+            phase, authorization_id, consumed_nonce_digest, action,
+            target_record_id, outcome_status, emitted_at, payload)
+         VALUES ($1,$2,$3,$4,$5,'terminal',$6,$7,'correct',$8,
+                 'COMMITTED_AND_READ_BACK', now(), $9)`,
+        [
+          SCOPE.tenantId,
+          SCOPE.workspaceId,
+          SCOPE.principalId,
+          SCOPE.userId,
+          forged.mutationReceiptId,
+          forged.authorizationId,
+          forged.consumedNonceDigest,
+          RECORD_ID,
+          JSON.stringify(forged),
+        ],
+      ),
+    /a committed outcome requires a consumed authorization/,
+  );
+  assert.deepEqual(await receiptStatuses("mutation.forged.receipt"), []);
+});
+
+test("H-1 a committed outcome cannot be claimed without the record version it claims", async () => {
+  // The residual half of the forgery: the mutator CAN burn a live approval
+  // (that is a denial of service, disclosed) — so a consumed nonce alone must
+  // not be enough to mint a success. The record version has to be there too.
+  await seedGenesis({ note: "original" });
+  await witnessAppend({
+    authorizationId: "burned-0000000000000000000001",
+    mutationReceiptId: "mutation.burned",
+    recordId: RECORD_ID,
+  });
+  const nonceDigest = memoryContentDigest("burned-0000000000000000000001");
+  const forged = {
+    schemaVersion: WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION,
+    mutationReceiptId: "mutation.burned",
+    authorizationId: "burned-0000000000000000000001",
+    consumedNonceDigest: nonceDigest,
+    action: "correct",
+    scope: SCOPE,
+    targetRecordId: RECORD_ID,
+    outcome: { status: "COMMITTED_AND_READ_BACK" },
+  };
+  await assert.rejects(
+    () =>
+      asMutator(
+        `INSERT INTO memory_mutation_receipts
+           (tenant_id, workspace_id, principal_id, user_id, mutation_receipt_id,
+            phase, authorization_id, consumed_nonce_digest, action,
+            target_record_id, outcome_status, emitted_at, payload)
+         VALUES ($1,$2,$3,$4,$5,'terminal',$6,$7,'correct',$8,
+                 'COMMITTED_AND_READ_BACK', now(), $9)`,
+        [
+          SCOPE.tenantId,
+          SCOPE.workspaceId,
+          SCOPE.principalId,
+          SCOPE.userId,
+          forged.mutationReceiptId,
+          forged.authorizationId,
+          nonceDigest,
+          RECORD_ID,
+          JSON.stringify(forged),
+        ],
+      ),
+    /a committed outcome requires the record version it claims/,
+  );
+});
+
+test("H-1 an ABORTED attempt is still recordable, so the guard is not a blanket refusal", async () => {
+  // If the outcome guard refused every receipt it would pass the tests above
+  // while destroying the abort trail. ABORTED_NO_MUTATION is exactly the row a
+  // party that consumed nothing MUST be able to write.
+  await seedGenesis({ note: "original" });
+  const aborted = {
+    schemaVersion: WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION,
+    mutationReceiptId: "mutation.abort.direct",
+    authorizationId: "auth-does-not-exist-00000000",
+    consumedNonceDigest: `sha256:${"4".repeat(64)}`,
+    action: "correct",
+    scope: SCOPE,
+    targetRecordId: RECORD_ID,
+    outcome: { status: "ABORTED_NO_MUTATION" },
+  };
+  await asMutator(
+    `INSERT INTO memory_mutation_receipts
+       (tenant_id, workspace_id, principal_id, user_id, mutation_receipt_id,
+        phase, authorization_id, consumed_nonce_digest, action,
+        target_record_id, outcome_status, emitted_at, payload)
+     VALUES ($1,$2,$3,$4,$5,'terminal',$6,$7,'correct',$8,
+             'ABORTED_NO_MUTATION', now(), $9)`,
+    [
+      SCOPE.tenantId,
+      SCOPE.workspaceId,
+      SCOPE.principalId,
+      SCOPE.userId,
+      aborted.mutationReceiptId,
+      aborted.authorizationId,
+      aborted.consumedNonceDigest,
+      RECORD_ID,
+      JSON.stringify(aborted),
+    ],
+  );
+  assert.deepEqual(await receiptStatuses("mutation.abort.direct"), [
+    { phase: "terminal", status: "ABORTED_NO_MUTATION" },
+  ]);
+});
+
+test("H-1 a version that does not succeed the head is refused, even with a real witness", async () => {
+  // EXECUTED against 34ac77f: with the chain at v4 the mutator inserted v99
+  // and then v5, both ACCEPTED, and because the head query orders by surrogate
+  // id the head became v5 carrying the GENESIS predecessor digest. Nothing
+  // checked contiguity and nothing checked linkage.
+  const genesis = await seedGenesis({ note: "original" });
+  await witnessAppend({
+    authorizationId: "future-0000000000000000000001",
+    mutationReceiptId: "mutation.future",
+    recordId: RECORD_ID,
+  });
+  const digest = `sha256:${"5".repeat(64)}`;
+  await assert.rejects(
+    () =>
+      asMutator(FORGED_VERSION_SQL, [
+        SCOPE.tenantId,
+        SCOPE.workspaceId,
+        SCOPE.principalId,
+        SCOPE.userId,
+        RECORD_ID,
+        99,
+        "active",
+        digest,
+        genesis,
+        "future-0000000000000000000001",
+        "mutation.future",
+        versionPayload({
+          recordId: RECORD_ID,
+          version: 99,
+          contentDigest: digest,
+          predecessorDigest: genesis,
+          authorizationId: "future-0000000000000000000001",
+          mutationReceiptId: "mutation.future",
+        }),
+      ]),
+    /a record version must be exactly one past the head/,
+  );
+  assert.equal(await countVersions(), 1);
+});
+
+test("H-1 a successor that does not link to the head content digest is refused", async () => {
+  const genesis = await seedGenesis({ note: "original" });
+  assert.notEqual(genesis, `sha256:${"6".repeat(64)}`);
+  await witnessAppend({
+    authorizationId: "unlinked-000000000000000000001",
+    mutationReceiptId: "mutation.unlinked",
+    recordId: RECORD_ID,
+  });
+  const digest = `sha256:${"7".repeat(64)}`;
+  await assert.rejects(
+    () =>
+      asMutator(FORGED_VERSION_SQL, [
+        SCOPE.tenantId,
+        SCOPE.workspaceId,
+        SCOPE.principalId,
+        SCOPE.userId,
+        RECORD_ID,
+        2,
+        "active",
+        digest,
+        `sha256:${"6".repeat(64)}`,
+        "unlinked-000000000000000000001",
+        "mutation.unlinked",
+        versionPayload({
+          recordId: RECORD_ID,
+          version: 2,
+          contentDigest: digest,
+          predecessorDigest: `sha256:${"6".repeat(64)}`,
+          authorizationId: "unlinked-000000000000000000001",
+          mutationReceiptId: "mutation.unlinked",
+        }),
+      ]),
+    /a record version must link to the head content digest/,
+  );
+  assert.equal(await countVersions(), 1);
+});
+
+test("H-1 a chain cannot be started anywhere but version 1", async () => {
+  await witnessAppend({
+    authorizationId: "nogenesis-00000000000000000001",
+    mutationReceiptId: "mutation.nogenesis",
+    recordId: "record-nogenesis-001",
+  });
+  const digest = `sha256:${"8".repeat(64)}`;
+  await assert.rejects(
+    () =>
+      asMutator(FORGED_VERSION_SQL, [
+        SCOPE.tenantId,
+        SCOPE.workspaceId,
+        SCOPE.principalId,
+        SCOPE.userId,
+        "record-nogenesis-001",
+        4,
+        "active",
+        digest,
+        `sha256:${"9".repeat(64)}`,
+        "nogenesis-00000000000000000001",
+        "mutation.nogenesis",
+        versionPayload({
+          recordId: "record-nogenesis-001",
+          version: 4,
+          contentDigest: digest,
+          predecessorDigest: `sha256:${"9".repeat(64)}`,
+          authorizationId: "nogenesis-00000000000000000001",
+          mutationReceiptId: "mutation.nogenesis",
+        }),
+      ]),
+    /a record chain must begin at version 1/,
+  );
+  assert.equal(await countVersions("record-nogenesis-001"), 0);
+});
+
+// ---------------------------------------------------------------------------
+// H-2 — cross-principal / cross-user record takeover.
+// ---------------------------------------------------------------------------
+
+const VICTIM_SCOPE: MemoryScope = {
+  ...SCOPE,
+  principalId: "principal-victim",
+  userId: "user-victim",
+};
+const ATTACKER_SCOPE: MemoryScope = {
+  ...SCOPE,
+  principalId: "principal-attacker",
+  userId: "user-attacker",
+};
+const TAKEOVER_RECORD = "record-victim-001";
+
+test("H-2 an authorization for another principal cannot take over a record", async () => {
+  // EXECUTED against 34ac77f: `verified: true`. The four scope comparisons are
+  // actor <-> AUTHORIZATION and were never actor <-> TARGET RECORD, the CAS
+  // filtered on tenant/workspace/record only, and the read-back compared the
+  // observed scope against the AUTHORIZATION — so it CONFIRMED the takeover.
+  const genesis = await seedGenesis(
+    { secret: "victim data" },
+    { scope: VICTIM_SCOPE, recordId: TAKEOVER_RECORD },
+  );
+  const next = { secret: "overwritten by attacker" };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      scope: ATTACKER_SCOPE,
+      targetRecordId: TAKEOVER_RECORD,
+      expectedHead: headOf(1, genesis),
+      proposedContent: next,
+    }),
+  );
+  const result = await store().correct({
+    actor: ATTACKER_SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: TAKEOVER_RECORD,
+    proposedContent: next,
+    mutationReceiptId: "mutation.takeover.1",
+  });
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "record_owner_mismatch");
+  assert.equal(await countVersions(TAKEOVER_RECORD), 1);
+  assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
+});
+
+test("H-2 the same authorization cannot DELETE another principal's record either", async () => {
+  const genesis = await seedGenesis(
+    { secret: "victim data" },
+    { scope: VICTIM_SCOPE, recordId: TAKEOVER_RECORD },
+  );
+  const next = { secret: "victim data" };
+  const receipt = await issue(
+    authorization({
+      action: "delete",
+      scope: ATTACKER_SCOPE,
+      targetRecordId: TAKEOVER_RECORD,
+      expectedHead: headOf(1, genesis),
+      proposedContent: next,
+    }),
+  );
+  const result = await store().delete({
+    actor: ATTACKER_SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: TAKEOVER_RECORD,
+    proposedContent: next,
+    mutationReceiptId: "mutation.takeover.2",
+  });
+  assert.equal(result.rejection, "record_owner_mismatch");
+  assert.equal(await countVersions(TAKEOVER_RECORD), 1);
+});
+
+for (const dimension of ["principalId", "userId"] as const) {
+  test(`H-2 a record whose ${dimension} is not the actor's is refused on that dimension alone`, async () => {
+    // The owner and the actor agree on every dimension EXCEPT this one, so
+    // exactly one of the two ownership comparisons can refuse it. Without a
+    // test per dimension, deleting one of them is free.
+    const owner: MemoryScope = { ...SCOPE, [dimension]: `${SCOPE[dimension]}-owner` };
+    const actor: MemoryScope = { ...SCOPE, [dimension]: `${SCOPE[dimension]}-actor` };
+    const recordId = `record-owner-${dimension.toLowerCase()}`;
+    const genesis = await seedGenesis(
+      { secret: "owned" },
+      { scope: owner, recordId },
+    );
+    const next = { secret: "taken" };
+    const receipt = await issue(
+      authorization({
+        action: "correct",
+        scope: actor,
+        targetRecordId: recordId,
+        expectedHead: headOf(1, genesis),
+        proposedContent: next,
+      }),
+    );
+    const result = await store().correct({
+      actor,
+      authorizationId: receipt.authorizationId,
+      recordId,
+      proposedContent: next,
+      mutationReceiptId: `mutation.owner.${dimension.toLowerCase()}`,
+    });
+    assert.equal(result.verified, false);
+    assert.equal(result.rejection, "record_owner_mismatch");
+    assert.equal(await countVersions(recordId), 1);
+  });
+}
+
+test("H-2 the OWNER is still allowed, so the check is ownership and not a blanket refusal", async () => {
+  const genesis = await seedGenesis(
+    { secret: "victim data" },
+    { scope: VICTIM_SCOPE, recordId: TAKEOVER_RECORD },
+  );
+  const next = { secret: "corrected by the owner" };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      scope: VICTIM_SCOPE,
+      targetRecordId: TAKEOVER_RECORD,
+      expectedHead: headOf(1, genesis),
+      proposedContent: next,
+    }),
+  );
+  const result = await store().correct({
+    actor: VICTIM_SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: TAKEOVER_RECORD,
+    proposedContent: next,
+    mutationReceiptId: "mutation.takeover.3",
+  });
+  assert.equal(result.verified, true);
+  assert.equal(result.rejection, null);
+  assert.equal(await countVersions(TAKEOVER_RECORD), 2);
+});
+
+test("H-2 the database refuses a chain that changes principal or user mid-way", async () => {
+  // The application half above is in wave1TrustedMemoryStore.mutate(). This is
+  // the half that binds a writer which never goes through it.
+  const genesis = await seedGenesis(
+    { secret: "victim data" },
+    { scope: VICTIM_SCOPE, recordId: TAKEOVER_RECORD },
+  );
+  await witnessAppend({
+    authorizationId: "takeover-000000000000000000001",
+    mutationReceiptId: "mutation.takeover.db",
+    recordId: TAKEOVER_RECORD,
+    scope: ATTACKER_SCOPE,
+  });
+  const digest = `sha256:${"a".repeat(64)}`;
+  await assert.rejects(
+    () =>
+      asMutator(FORGED_VERSION_SQL, [
+        ATTACKER_SCOPE.tenantId,
+        ATTACKER_SCOPE.workspaceId,
+        ATTACKER_SCOPE.principalId,
+        ATTACKER_SCOPE.userId,
+        TAKEOVER_RECORD,
+        2,
+        "active",
+        digest,
+        genesis,
+        "takeover-000000000000000000001",
+        "mutation.takeover.db",
+        versionPayload({
+          recordId: TAKEOVER_RECORD,
+          version: 2,
+          contentDigest: digest,
+          predecessorDigest: genesis,
+          authorizationId: "takeover-000000000000000000001",
+          mutationReceiptId: "mutation.takeover.db",
+          scope: ATTACKER_SCOPE,
+        }),
+      ]),
+    /a record chain may not change principal or user/,
+  );
+  assert.equal(await countVersions(TAKEOVER_RECORD), 1);
+});
+
+// ---------------------------------------------------------------------------
+// M-5 — readHead is scoped to the actor, all four dimensions.
+// ---------------------------------------------------------------------------
+
+test("M-5 readHead does not return another principal's head", async () => {
+  // EXECUTED against 34ac77f: an actor from another principal in the same
+  // workspace read the record's head INCLUDING the owner's identity.
+  await seedGenesis(
+    { secret: "victim data" },
+    { scope: VICTIM_SCOPE, recordId: TAKEOVER_RECORD },
+  );
+  assert.equal(await store().readHead(ATTACKER_SCOPE, TAKEOVER_RECORD), null);
+  // One assertion per dimension. Dropping EITHER predicate has to fail a
+  // named assertion, or one of the two is untested and free to delete.
+  assert.equal(
+    await store().readHead(
+      { ...VICTIM_SCOPE, principalId: "principal-somebody-else" },
+      TAKEOVER_RECORD,
+    ),
+    null,
+    "the principal predicate",
+  );
+  assert.equal(
+    await store().readHead(
+      { ...VICTIM_SCOPE, userId: "user-somebody-else" },
+      TAKEOVER_RECORD,
+    ),
+    null,
+    "the user predicate",
+  );
+  const owned = await store().readHead(VICTIM_SCOPE, TAKEOVER_RECORD);
+  assert.equal(owned?.version, 1);
+  assert.equal(owned?.scope.principalId, VICTIM_SCOPE.principalId);
+});
+
+// ---------------------------------------------------------------------------
+// M-2 — consumption is irreversible and the two sources are really separate.
+// ---------------------------------------------------------------------------
+
+test("M-2 a spent nonce cannot be un-spent, by anyone, including the owner", async () => {
+  // EXECUTED against 34ac77f as the MUTATOR: consume, un-consume (both columns
+  // back to NULL, which satisfies the consumption_witness CHECK), re-consume.
+  const genesis = await seedGenesis({ note: "original" });
+  const next = { note: "corrected" };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, genesis),
+      proposedContent: next,
+    }),
+  );
+  assert.equal(
+    (
+      await store().correct({
+        actor: SCOPE,
+        authorizationId: receipt.authorizationId,
+        recordId: RECORD_ID,
+        proposedContent: next,
+        mutationReceiptId: "mutation.monotonic.1",
+      })
+    ).verified,
+    true,
+  );
+  await assert.rejects(
+    () =>
+      asMutator(
+        `UPDATE memory_authorization_nonces
+            SET consumed_at = NULL, consumed_by_mutation_receipt_id = NULL
+          WHERE binding_digest = $1`,
+        [receipt.nonce.bindingDigest],
+      ),
+    /consumption is irreversible on memory_authorization_nonces/,
+  );
+  await assert.rejects(
+    () =>
+      adminPool.query(
+        `UPDATE memory_authorization_nonces SET consumed_at = now()
+          WHERE binding_digest = $1`,
+        [receipt.nonce.bindingDigest],
+      ),
+    /consumption is irreversible on memory_authorization_nonces/,
+  );
+  await assert.rejects(
+    () =>
+      asMutator(
+        `UPDATE memory_authorization_nonces
+            SET consumed_by_mutation_receipt_id = 'mutation.somebody.else'
+          WHERE binding_digest = $1`,
+        [receipt.nonce.bindingDigest],
+      ),
+    /a consumption witness is irreversible on memory_authorization_nonces/,
+  );
+  assert.notEqual(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
+});
+
+test("M-2 the mutation role no longer holds the receipt's consumption column", async () => {
+  // 029 granted UPDATE(consumed_at) on BOTH the nonce and the receipt to one
+  // role, which is why "the sources are under different privileges" was false.
+  const genesis = await seedGenesis({ note: "original" });
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, genesis),
+      proposedContent: { note: "corrected" },
+    }),
+  );
+  await assert.rejects(
+    () =>
+      asMutator(
+        `UPDATE memory_authorization_receipts SET consumed_at = now()
+          WHERE authorization_id = $1`,
+        [receipt.authorizationId],
+      ),
+    /permission denied for table memory_authorization_receipts/,
+  );
+});
+
+test("M-2 the database mirrors consumption onto the receipt, so the two sources agree", async () => {
+  const genesis = await seedGenesis({ note: "original" });
+  const next = { note: "corrected" };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, genesis),
+      proposedContent: next,
+    }),
+  );
+  assert.equal(
+    (
+      await store().correct({
+        actor: SCOPE,
+        authorizationId: receipt.authorizationId,
+        recordId: RECORD_ID,
+        proposedContent: next,
+        mutationReceiptId: "mutation.mirror.1",
+      })
+    ).verified,
+    true,
+  );
+  const stored = await adminPool.query(
+    `SELECT consumed_at FROM memory_authorization_receipts
+      WHERE authorization_id = $1`,
+    [receipt.authorizationId],
+  );
+  assert.notEqual(stored.rows[0].consumed_at, null);
+  assert.equal(
+    (stored.rows[0].consumed_at as Date).getTime(),
+    (await nonceConsumedAt(receipt.nonce.bindingDigest))?.getTime(),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// M-1 — the numeric-domain trigger resolves its own helper.
+// ---------------------------------------------------------------------------
+
+test("M-1 shadowing the helper in the caller's search_path does not defeat the numeric domain", async () => {
+  // EXECUTED against 34ac77f: a non-superuser with CREATE on a schema of its
+  // own declared a stub named `aaliyah_memory_jsonb_numbers`, put that schema
+  // first on its search_path, and stored 0.1000000000000000000001 — the exact
+  // W1BR-006 value. The trigger function called the helper UNQUALIFIED, was
+  // not SECURITY DEFINER and pinned no search_path.
+  const role = "atk_shadow_role";
+  const schema = "atk_shadow_schema";
+  // Roles are CLUSTER objects, so this has to be idempotent in both
+  // directions: `DROP ROLE` fails while any grant still names the role, and a
+  // run that died between the grant and the drop would otherwise poison every
+  // later run in this database. `DROP OWNED BY` removes the owned objects AND
+  // the privileges in one statement.
+  const dropRole = async () => {
+    await adminPool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await adminPool.query(
+      `DO $do$
+       BEGIN
+         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${role}') THEN
+           DROP OWNED BY ${role};
+           DROP ROLE ${role};
+         END IF;
+       END
+       $do$`,
+    );
+  };
+  await dropRole();
+  await adminPool.query(`CREATE ROLE ${role} NOLOGIN`);
+  try {
+    await adminPool.query(`CREATE SCHEMA ${schema} AUTHORIZATION ${role}`);
+    await adminPool.query(
+      `GRANT INSERT, SELECT ON memory_record_versions TO ${role}`,
+    );
+    await adminPool.query(
+      `GRANT USAGE, SELECT ON SEQUENCE memory_record_versions_id_seq TO ${role}`,
+    );
+    const client = await adminPool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`SET LOCAL ROLE "${role}"`);
+      await client.query(
+        `CREATE FUNCTION ${schema}.aaliyah_memory_jsonb_numbers(doc jsonb)
+           RETURNS SETOF text LANGUAGE sql IMMUTABLE
+           AS $fn$ SELECT NULL::text WHERE false $fn$`,
+      );
+      await client.query(`SET LOCAL search_path = ${schema}, public`);
+      const digest = `sha256:${"b".repeat(64)}`;
+      const payload = [
+        `{"schemaVersion":"${MEMORY_RECORD_VERSION_SCHEMA_VERSION}"`,
+        `"recordId":"record-shadow-001"`,
+        `"version":1`,
+        `"state":"active"`,
+        `"scope":${JSON.stringify(SCOPE)}`,
+        `"content":{"balance":0.1000000000000000000001}`,
+        `"contentDigest":"${digest}"`,
+        `"predecessorDigest":null`,
+        `"authorizationId":"shadow-0000000000000000000001"`,
+        `"mutationReceiptId":"mutation.shadow"`,
+        `"createdAt":"${isoOffset(0)}"}`,
+      ].join(",");
+      await assert.rejects(
+        () =>
+          client.query(
+            `INSERT INTO memory_record_versions
+               (tenant_id, workspace_id, principal_id, user_id, record_id,
+                version, state, content_digest, predecessor_digest,
+                authorization_id, mutation_receipt_id, payload)
+             VALUES ($1,$2,$3,$4,'record-shadow-001',1,'active',$5,NULL,
+                     'shadow-0000000000000000000001','mutation.shadow',
+                     $6::jsonb)`,
+            [
+              SCOPE.tenantId,
+              SCOPE.workspaceId,
+              SCOPE.principalId,
+              SCOPE.userId,
+              digest,
+              payload,
+            ],
+          ),
+        /outside the exact numeric domain/,
+      );
+    } finally {
+      // ROLLBACK in a finally, or a failed assertion hands a connection back
+      // to the pool with a transaction still open on it.
+      await client.query("ROLLBACK").catch(() => undefined);
+      client.release();
+    }
+    assert.equal(await countVersions("record-shadow-001"), 0);
+  } finally {
+    await dropRole();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// M-4 — a rejection may name the class and never the record.
+// ---------------------------------------------------------------------------
+
+test("M-4 the numeric rejection does not carry the offending value", async () => {
+  // EXECUTED against 34ac77f through the store's own production path with
+  // {patientSsnLastFour: 6789, coPayAmount: 4211.37}: the PostgreSQL server log
+  // recorded "jsonb number 4211.37 is outside the exact numeric domain". 731
+  // such lines already existed in that container's log.
+  const genesis = await seedGenesis({ note: "original" });
+  const secret = { patientSsnLastFour: 6789, coPayAmount: 4211.37 };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, genesis),
+      proposedContent: secret,
+    }),
+  );
+  const result = await store().correct({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: secret,
+    mutationReceiptId: "mutation.leak.1",
+  });
+  assert.equal(result.rejection, "storage_rejected");
+
+  // And directly, so the MESSAGE itself is the thing under assertion.
+  await witnessAppend({
+    authorizationId: "leak-000000000000000000000001",
+    mutationReceiptId: "mutation.leak.direct",
+    recordId: "record-leak-001",
+  });
+  const digest = `sha256:${"c".repeat(64)}`;
+  await assert.rejects(
+    () =>
+      adminPool.query(
+        `INSERT INTO memory_record_versions
+           (tenant_id, workspace_id, principal_id, user_id, record_id, version,
+            state, content_digest, predecessor_digest, authorization_id,
+            mutation_receipt_id, payload)
+         VALUES ($1,$2,$3,$4,'record-leak-001',1,'active',$5,NULL,
+                 'leak-000000000000000000000001','mutation.leak.direct',
+                 $6::jsonb)`,
+        [
+          SCOPE.tenantId,
+          SCOPE.workspaceId,
+          SCOPE.principalId,
+          SCOPE.userId,
+          digest,
+          [
+            `{"schemaVersion":"${MEMORY_RECORD_VERSION_SCHEMA_VERSION}"`,
+            `"recordId":"record-leak-001"`,
+            `"version":1`,
+            `"state":"active"`,
+            `"scope":${JSON.stringify(SCOPE)}`,
+            `"content":{"coPayAmount":4211.37}`,
+            `"contentDigest":"${digest}"`,
+            `"predecessorDigest":null`,
+            `"authorizationId":"leak-000000000000000000000001"`,
+            `"mutationReceiptId":"mutation.leak.direct"`,
+            `"createdAt":"${isoOffset(0)}"}`,
+          ].join(","),
+        ],
+      ),
+    (error: unknown) => {
+      const message = (error as Error).message;
+      assert.match(message, /outside the exact numeric domain/);
+      assert.doesNotMatch(
+        message,
+        /4211\.37/,
+        "the rejection must name the class, never the record",
+      );
+      return true;
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// M-3 — a concurrent append is not a storage divergence.
+// ---------------------------------------------------------------------------
+
+test("M-3 an append landing between COMMIT and read-back is not reported as divergence", async () => {
+  // EXECUTED against 34ac77f, deterministically: `pg_advisory_xact_lock`
+  // releases at COMMIT, the read-back runs afterwards on another pool taking
+  // ORDER BY id DESC LIMIT 1, and the digest comparison came BEFORE the
+  // post-state comparison — so a correct, committed mutation was durably
+  // recorded as COMMITTED_READ_BACK_DIVERGED, the strongest alarm in the
+  // system, for a healthy write.
+  const genesis = await seedGenesis({ n: 0 });
+  const next = { n: 1 };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, genesis),
+      proposedContent: next,
+    }),
+  );
+  // One connection, occupied, so the read-back is forced to queue behind the
+  // concurrent append instead of racing it.
+  const singleReadBack = new Pool({ connectionString: DB_URL, max: 1 });
+  const held = await singleReadBack.connect();
+  try {
+    const pending = createPostgresTrustedMemoryStore(
+      writePool,
+      singleReadBack,
+    ).correct({
+      actor: SCOPE,
+      authorizationId: receipt.authorizationId,
+      recordId: RECORD_ID,
+      proposedContent: next,
+      mutationReceiptId: "mutation.concurrent.1",
+    });
+    for (let attempt = 0; attempt < 2000; attempt += 1) {
+      if ((await countVersions()) >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    assert.equal(await countVersions(), 2);
+    const head2 = await adminPool.query(
+      `SELECT content_digest FROM memory_record_versions
+        WHERE record_id = $1 AND version = 2`,
+      [RECORD_ID],
+    );
+    // A LEGITIMATE third version, witnessed like any other append.
+    await witnessAppend({
+      authorizationId: "concurrent-00000000000000000001",
+      mutationReceiptId: "mutation.concurrent.interleaved",
+      recordId: RECORD_ID,
+    });
+    const thirdDigest = memoryContentDigest({ n: 2 });
+    await adminPool.query(
+      `INSERT INTO memory_record_versions
+         (tenant_id, workspace_id, principal_id, user_id, record_id, version,
+          state, content_digest, predecessor_digest, authorization_id,
+          mutation_receipt_id, payload)
+       VALUES ($1,$2,$3,$4,$5,3,'active',$6,$7,$8,$9,$10)`,
+      [
+        SCOPE.tenantId,
+        SCOPE.workspaceId,
+        SCOPE.principalId,
+        SCOPE.userId,
+        RECORD_ID,
+        thirdDigest,
+        head2.rows[0].content_digest,
+        "concurrent-00000000000000000001",
+        "mutation.concurrent.interleaved",
+        versionPayload({
+          recordId: RECORD_ID,
+          version: 3,
+          contentDigest: thirdDigest,
+          predecessorDigest: head2.rows[0].content_digest,
+          authorizationId: "concurrent-00000000000000000001",
+          mutationReceiptId: "mutation.concurrent.interleaved",
+          content: { n: 2 },
+        }),
+      ],
+    );
+    held.release();
+    const result = await pending;
+    assert.equal(result.verified, false);
+    assert.notEqual(
+      result.rejection,
+      "read_back_diverged",
+      "a healthy write must never be filed as a storage divergence",
+    );
+    assert.equal(result.rejection, "unknown_outcome");
+    assert.equal(
+      result.receipt?.outcome.status,
+      "UNKNOWN_PENDING_RECONCILIATION",
+    );
+    assert.deepEqual(await receiptStatuses("mutation.concurrent.1"), [
+      { phase: "pending", status: "UNKNOWN_PENDING_RECONCILIATION" },
+      { phase: "terminal", status: "UNKNOWN_PENDING_RECONCILIATION" },
+    ]);
+  } finally {
+    await singleReadBack.end();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// L-1 — the attempt that used to leave no trace.
+// ---------------------------------------------------------------------------
+
+test("L-1 an unknown authorization id leaves a durable, attributable attempt", async () => {
+  // EXECUTED against 34ac77f: `authorization_not_found` wrote ZERO rows to
+  // memory_mutation_receipts. Cross-tenant attempts WERE logged; guessing at
+  // ids — the highest-volume attack against an id-only lookup — was not.
+  await seedGenesis({ note: "original" });
+  const result = await store().correct({
+    actor: SCOPE,
+    authorizationId: nextAuthorizationId(),
+    recordId: RECORD_ID,
+    proposedContent: { note: "x" },
+    mutationReceiptId: "mutation.enumerate.1",
+  });
+  assert.equal(result.rejection, "authorization_not_found");
+  // The CALLER still gets nothing to hide behind.
+  assert.equal(result.receipt, null);
+  assert.deepEqual(await receiptStatuses("mutation.enumerate.1"), [
+    { phase: "terminal", status: "ABORTED_NO_MUTATION" },
+  ]);
+  const row = await adminPool.query(
+    `SELECT tenant_id, principal_id, user_id, consumed_nonce_digest,
+            payload->'outcome'->>'abortReason' AS abort_reason
+       FROM memory_mutation_receipts
+      WHERE mutation_receipt_id = 'mutation.enumerate.1'`,
+  );
+  // Filed under the ACTOR, never under the scope it was reaching for, and
+  // marked unresolved by a digest no nonce can carry.
+  assert.equal(row.rows[0].tenant_id, SCOPE.tenantId);
+  assert.equal(row.rows[0].principal_id, SCOPE.principalId);
+  assert.equal(row.rows[0].user_id, SCOPE.userId);
+  assert.equal(row.rows[0].consumed_nonce_digest, `sha256:${"0".repeat(64)}`);
+  assert.equal(row.rows[0].abort_reason, "policy_rejected");
+  assert.equal(await countVersions(), 1);
+});
+
+test("L-1 a malformed authorization id is refused before it reaches the database", async () => {
+  const result = await store().correct({
+    actor: SCOPE,
+    authorizationId: "SENSITIVE: not an id",
+    recordId: RECORD_ID,
+    proposedContent: {},
+    mutationReceiptId: "mutation.enumerate.2",
+  });
+  assert.equal(result.rejection, "request_malformed");
+  assert.equal(result.receipt, null);
+  assert.deepEqual(await receiptStatuses("mutation.enumerate.2"), []);
 });

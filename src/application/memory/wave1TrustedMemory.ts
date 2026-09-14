@@ -92,6 +92,7 @@ export const TRUSTED_MEMORY_REJECTIONS = [
   "authorization_scope_mismatch",
   "authorization_action_mismatch",
   "authorization_target_mismatch",
+  "record_owner_mismatch",
   "authorization_expected_head_mismatch",
   "authorization_expired",
   "authorization_revoked",

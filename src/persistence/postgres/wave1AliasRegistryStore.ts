@@ -613,13 +613,10 @@ export function createPostgresAliasRegistryStore(
     if (consumed.rowCount !== 1) {
       throw new AliasMutationAborted("authorization_already_consumed");
     }
-    // Bookkeeping on the receipt row. NOT the authority on single use.
-    await client.query(
-      `UPDATE memory_authorization_receipts
-          SET consumed_at = now()
-        WHERE authorization_id = $1 AND consumed_at IS NULL`,
-      [stored.authorizationId],
-    );
+    // The receipt's `consumed_at` is NOT written here. Migration 035 revoked
+    // this role's UPDATE grant on that column and mirrors consumption from the
+    // nonce onto the receipt inside the database, so the two sources really are
+    // under different privileges rather than merely described as such.
   }
 
   /** Read the ACTUAL head, compare-and-swap, and append the successor. */

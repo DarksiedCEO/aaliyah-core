@@ -1069,6 +1069,457 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
                   removed_authorization_id)
       ON memory_alias_bindings TO aaliyah_memory_mutator`,
   },
+  {
+    // W1.3 PART B2, M-1 AND M-4 — NAME RESOLUTION AND MESSAGE HYGIENE.
+    //
+    // TWO DEFECTS, BOTH PROVEN AGAINST A LIVE DATABASE, BOTH CLOSED HERE.
+    //
+    // 1. SEARCH-PATH SHADOWING. Migration 027 claimed its trigger "holds for
+    //    psql, for a rogue service, for a migration, and for a writer that
+    //    never imports this package". It did not. The trigger function called
+    //    `aaliyah_memory_jsonb_numbers()` UNQUALIFIED, was not SECURITY
+    //    DEFINER, and carried no pinned `search_path`, so name resolution
+    //    happened in the CALLER's search_path. A non-superuser with CREATE on
+    //    a schema of its own declared a stub of that name, put the schema
+    //    first on its search_path, and stored
+    //    `{"balance":0.1000000000000000000001}` — the exact W1BR-006 value the
+    //    trigger exists to refuse. Every internal call is now schema-qualified
+    //    AND every function on this path pins `search_path`, so the resolution
+    //    a caller controls is no longer the resolution the trigger uses.
+    //
+    // 2. RECORD CONTENT IN THE SERVER LOG. The rejection interpolated the
+    //    OFFENDING VALUE into its message: a real mutation carrying
+    //    `{"coPayAmount": 4211.37}` put `4211.37` verbatim into the
+    //    PostgreSQL server log, where it is readable by anyone with the log
+    //    and is retained by whatever ships it. `TRUNCATED_MEMORY_REJECTIONS`
+    //    is a CLOSED enum precisely so a rejection can never carry record
+    //    content; a RAISE that interpolates the value walks around it. The
+    //    value is gone from the message. The class is still named, the
+    //    ERRCODE is unchanged, and the phrase every caller matches on
+    //    ("outside the exact numeric domain") is preserved.
+    //
+    // WHAT THIS STILL DOES NOT SOLVE: a superuser can replace these functions
+    // or drop the triggers. Nothing inside the database defends against the
+    // database's owner.
+    id: "033_memory_trigger_name_resolution",
+    sql: `CREATE OR REPLACE FUNCTION public.aaliyah_memory_jsonb_numbers(doc jsonb)
+      RETURNS SETOF text
+      LANGUAGE sql
+      IMMUTABLE
+      SET search_path = pg_catalog, public
+      AS $fn$
+        WITH RECURSIVE walk(node) AS (
+          SELECT doc
+          UNION ALL
+          SELECT child.value
+          FROM walk
+          CROSS JOIN LATERAL (
+            SELECT value FROM pg_catalog.jsonb_array_elements(
+              CASE WHEN pg_catalog.jsonb_typeof(walk.node) = 'array'
+                   THEN walk.node ELSE '[]'::jsonb END)
+            UNION ALL
+            SELECT value FROM pg_catalog.jsonb_each(
+              CASE WHEN pg_catalog.jsonb_typeof(walk.node) = 'object'
+                   THEN walk.node ELSE '{}'::jsonb END)
+          ) AS child(value)
+        )
+        SELECT node #>> '{}' FROM walk
+         WHERE pg_catalog.jsonb_typeof(node) = 'number';
+      $fn$;
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_reject_inexact_numbers()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        offending text;
+      BEGIN
+        SELECT n INTO offending
+        FROM public.aaliyah_memory_jsonb_numbers(NEW.payload) AS t(n)
+        WHERE n !~ '^-?(0|[1-9][0-9]*)$'
+           OR pg_catalog.abs(n::numeric) > 9007199254740991
+        LIMIT 1;
+        IF offending IS NOT NULL THEN
+          -- The VALUE is deliberately absent. A rejection on this path may
+          -- name the class and must never carry the record.
+          RAISE EXCEPTION
+            'aaliyah memory: a jsonb number in this payload is outside the exact numeric domain'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$;
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_forbid_row_rewrite()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SET search_path = pg_catalog, public
+      AS $fn$
+      BEGIN
+        RAISE EXCEPTION
+          'aaliyah memory: % on % is forbidden; this table is append-only'
+          , TG_OP, TG_TABLE_NAME
+          USING ERRCODE = 'check_violation';
+      END;
+      $fn$`,
+  },
+  {
+    // W1.3 PART B2, H-1 AND H-2 — WHAT MAY BE APPENDED, NOT ONLY WHO MAY
+    // APPEND IT.
+    //
+    // THE ROOT CAUSE, STATED ONCE. Migration 029 constrains WHO may rewrite
+    // history and WHO may mint authorizations. It places NO constraint on WHAT
+    // MAY BE APPENDED. Every integrity property — the authorization exists, it
+    // was consumed, the predecessor links, version = head + 1, the owner does
+    // not change mid-chain — lived only in TypeScript in `mutate()` and bound
+    // only writes that went through it. Executed as the LEAST-PRIVILEGE
+    // mutator role, against a live database:
+    //
+    //   * a record version naming `auth-does-not-exist-00000000` was ACCEPTED
+    //     (no foreign key existed and no trigger tied a version to a consumed
+    //     nonce);
+    //   * a TERMINAL `COMMITTED_AND_READ_BACK` receipt — the system's only
+    //     success signal — was minted for an authorization that did not exist;
+    //   * v99 then v5 were appended onto a chain at v4, and because the head
+    //     query orders by surrogate id, v5 became the head and carried a
+    //     predecessor digest from the genesis row.
+    //
+    // These triggers are the enforcement point. They bind every writer,
+    // including one that never imports this package, and they are INSERT
+    // guards: a mutation that has already been refused by a CHECK or by the
+    // numeric-domain trigger is still refused by that, with its own message.
+    // These are AFTER ROW triggers on purpose — a BEFORE trigger would preempt
+    // every CHECK constraint on these tables and make the most specific
+    // violation unreportable. An AFTER trigger only ever rejects a row that
+    // would otherwise have been ACCEPTED, which is exactly the population
+    // these guards exist for.
+    //
+    // THE WITNESS IS THE NONCE, NOT THE RECEIPT. `memory_authorization_nonces`
+    // is the one table the mutator can neither INSERT into nor mint a row of
+    // (029). It can only CONSUME. So "a consumed nonce that names this
+    // mutation receipt" is a link the mutator cannot fabricate, while "an
+    // authorization receipt exists" would be a link the issuer alone controls
+    // and a plain foreign key would not require consumption at all.
+    //
+    // SCOPE CONTINUITY IS HERE AND NOT ONLY IN THE APPLICATION. The four scope
+    // dimensions were compared actor <-> authorization and NEVER actor <->
+    // TARGET RECORD, so an authorization scoped to principal-attacker naming a
+    // record owned by principal-victim took the record over, changed its
+    // ownership columns mid-chain, and the read-back CONFIRMED the takeover
+    // because it compared the observed scope against the AUTHORIZATION. The
+    // application check is in wave1TrustedMemoryStore.mutate(); this is the
+    // half that holds when the application is not the writer.
+    //
+    // NOT SOLVED, SAID PLAINLY: a superuser drops these triggers. The nonce
+    // digest is still UNKEYED, so a party that can write the nonce table can
+    // still mint a consistent witness — that is W1BR-008 and it needs a keyed
+    // construction outside the database, which is not in this repository.
+    id: "034_memory_append_integrity",
+    sql: `CREATE OR REPLACE FUNCTION public.aaliyah_memory_record_version_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        witnessed boolean;
+        prior public.memory_record_versions%ROWTYPE;
+      BEGIN
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.memory_authorization_nonces AS n
+           WHERE n.tenant_id = NEW.tenant_id
+             AND n.authorization_id = NEW.authorization_id
+             AND n.target_record_id = NEW.record_id
+             AND n.consumed_at IS NOT NULL
+             AND n.consumed_by_mutation_receipt_id = NEW.mutation_receipt_id
+        ) INTO witnessed;
+        IF NOT witnessed THEN
+          RAISE EXCEPTION
+            'aaliyah memory: no consumed authorization witnesses this record version'
+            USING ERRCODE = 'check_violation';
+        END IF;
+
+        SELECT * INTO prior
+          FROM public.memory_record_versions AS v
+         WHERE v.tenant_id = NEW.tenant_id
+           AND v.workspace_id = NEW.workspace_id
+           AND v.record_id = NEW.record_id
+           AND v.id <> NEW.id
+         ORDER BY v.version DESC
+         LIMIT 1;
+
+        IF NOT FOUND THEN
+          IF NEW.version <> 1 THEN
+            RAISE EXCEPTION
+              'aaliyah memory: a record chain must begin at version 1'
+              USING ERRCODE = 'check_violation';
+          END IF;
+          RETURN NULL;
+        END IF;
+
+        IF NEW.version <> prior.version + 1 THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a record version must be exactly one past the head'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.predecessor_digest IS DISTINCT FROM prior.content_digest THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a record version must link to the head content digest'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.principal_id <> prior.principal_id
+           OR NEW.user_id <> prior.user_id THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a record chain may not change principal or user'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_record_versions_authorized_append
+      ON memory_record_versions;
+    CREATE TRIGGER memory_record_versions_authorized_append
+      AFTER INSERT ON memory_record_versions
+      FOR EACH ROW
+      EXECUTE FUNCTION public.aaliyah_memory_record_version_guard();
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_outcome_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        witnessed boolean;
+        committed boolean;
+      BEGIN
+        -- ABORTED_NO_MUTATION and UNKNOWN_PENDING_RECONCILIATION are what an
+        -- attempt that consumed nothing is REQUIRED to be able to record, so
+        -- they are deliberately not gated. The two statuses below are the
+        -- only ones that CLAIM a commit.
+        IF NEW.outcome_status NOT IN
+             ('COMMITTED_AND_READ_BACK', 'COMMITTED_READ_BACK_DIVERGED') THEN
+          RETURN NULL;
+        END IF;
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.memory_authorization_nonces AS n
+           WHERE n.tenant_id = NEW.tenant_id
+             AND n.authorization_id = NEW.authorization_id
+             AND n.binding_digest = NEW.consumed_nonce_digest
+             AND n.consumed_at IS NOT NULL
+             AND n.consumed_by_mutation_receipt_id = NEW.mutation_receipt_id
+        ) INTO witnessed;
+        IF NOT witnessed THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a committed outcome requires a consumed authorization'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.memory_record_versions AS v
+           WHERE v.tenant_id = NEW.tenant_id
+             AND v.workspace_id = NEW.workspace_id
+             AND v.record_id = NEW.target_record_id
+             AND v.mutation_receipt_id = NEW.mutation_receipt_id
+        ) INTO committed;
+        IF NOT committed THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a committed outcome requires the record version it claims'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_mutation_receipts_authorized_outcome
+      ON memory_mutation_receipts;
+    CREATE TRIGGER memory_mutation_receipts_authorized_outcome
+      AFTER INSERT ON memory_mutation_receipts
+      FOR EACH ROW
+      EXECUTE FUNCTION public.aaliyah_memory_outcome_guard();
+    CREATE OR REPLACE FUNCTION public.aaliyah_alias_binding_insert_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        witnessed boolean;
+      BEGIN
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.memory_authorization_nonces AS n
+           WHERE n.tenant_id = NEW.tenant_id
+             AND n.authorization_id = NEW.authorization_id
+             AND n.consumed_at IS NOT NULL
+             AND n.consumed_by_mutation_receipt_id = NEW.mutation_receipt_id
+        ) INTO witnessed;
+        IF NOT witnessed THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: no consumed authorization witnesses this binding'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_alias_bindings_authorized_bind
+      ON memory_alias_bindings;
+    CREATE TRIGGER memory_alias_bindings_authorized_bind
+      AFTER INSERT ON memory_alias_bindings
+      FOR EACH ROW
+      EXECUTE FUNCTION public.aaliyah_alias_binding_insert_guard();
+    CREATE OR REPLACE FUNCTION public.aaliyah_alias_binding_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        witnessed boolean;
+      BEGIN
+        IF TG_OP = 'DELETE' THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: DELETE on % is forbidden; a binding is retired, never erased'
+            , TG_TABLE_NAME
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF OLD.removed_at IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: a retired alias binding is immutable'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.removed_at IS NULL THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: retirement is the only permitted update'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF (pg_catalog.to_jsonb(NEW) - 'removed_at' - 'removed_by_mutation_receipt_id'
+              - 'removed_authorization_id')
+           IS DISTINCT FROM
+           (pg_catalog.to_jsonb(OLD) - 'removed_at' - 'removed_by_mutation_receipt_id'
+              - 'removed_authorization_id') THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: retirement may not rewrite a binding'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        -- LAST, so every check above still reports its own violation.
+        -- Retirement is a mutation and needs an authorization it has spent,
+        -- exactly as binding does.
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.memory_authorization_nonces AS n
+           WHERE n.tenant_id = NEW.tenant_id
+             AND n.authorization_id = NEW.removed_authorization_id
+             AND n.consumed_at IS NOT NULL
+             AND n.consumed_by_mutation_receipt_id
+                 = NEW.removed_by_mutation_receipt_id
+        ) INTO witnessed;
+        IF NOT witnessed THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: no consumed authorization witnesses this retirement'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$`,
+  },
+  {
+    // W1.3 PART B2, M-2 — CONSUMPTION IS IRREVERSIBLE, AND THE TWO SOURCES
+    // REALLY ARE UNDER DIFFERENT PRIVILEGES.
+    //
+    // wave1TrustedMemoryStore's header claimed "migration 029 puts those
+    // sources under different privileges". For CONSUMPTION that was false:
+    // 029 granted the mutator UPDATE(consumed_at, consumed_by_...) on the
+    // NONCE and UPDATE(consumed_at) on the RECEIPT, so one role held both.
+    // Executed as that role: consume, un-consume (set both back to NULL, which
+    // satisfies the consumption_witness CHECK), re-consume. Replay was stopped
+    // only by the version UNIQUE constraint, not by the privilege split.
+    //
+    // TWO CHANGES MAKE THE CLAIM TRUE.
+    //
+    // 1. MONOTONICITY. A trigger refuses any transition of `consumed_at` away
+    //    from a value it already holds, on BOTH tables, for EVERY writer
+    //    including the owner. Un-consuming is no longer representable, so a
+    //    spent approval cannot be resurrected and re-spent.
+    //
+    // 2. THE MUTATOR LOSES THE SECOND SOURCE. The receipt's `consumed_at` is
+    //    bookkeeping; the nonce is the authority. The mutator's UPDATE grant
+    //    on the receipt is REVOKED and the database itself mirrors consumption
+    //    from the nonce onto the receipt in a SECURITY DEFINER trigger. The
+    //    mutator can now write exactly one of the two sources, which is what
+    //    the header always said, and the two can no longer be made to disagree
+    //    by anything the mutator can do.
+    //
+    // STILL TRUE AND STILL DISCLOSED: the mutator can BURN a pending approval
+    // by consuming it out of band, which is a denial of service against an
+    // approval, not a forgery. Monotonicity is what makes that burn visible
+    // and permanent rather than something that can be covered up afterwards.
+    id: "035_memory_consumption_monotonic",
+    sql: `CREATE OR REPLACE FUNCTION public.aaliyah_memory_consumption_monotonic()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        old_row jsonb := pg_catalog.to_jsonb(OLD);
+        new_row jsonb := pg_catalog.to_jsonb(NEW);
+      BEGIN
+        IF old_row->>'consumed_at' IS NOT NULL
+           AND new_row->>'consumed_at' IS DISTINCT FROM old_row->>'consumed_at' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: consumption is irreversible on %'
+            , TG_TABLE_NAME
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF old_row->>'consumed_by_mutation_receipt_id' IS NOT NULL
+           AND new_row->>'consumed_by_mutation_receipt_id'
+               IS DISTINCT FROM old_row->>'consumed_by_mutation_receipt_id' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a consumption witness is irreversible on %'
+            , TG_TABLE_NAME
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_authorization_nonces_consumption_monotonic
+      ON memory_authorization_nonces;
+    CREATE TRIGGER memory_authorization_nonces_consumption_monotonic
+      BEFORE UPDATE ON memory_authorization_nonces
+      FOR EACH ROW
+      EXECUTE FUNCTION public.aaliyah_memory_consumption_monotonic();
+    DROP TRIGGER IF EXISTS memory_authorization_receipts_consumption_monotonic
+      ON memory_authorization_receipts;
+    CREATE TRIGGER memory_authorization_receipts_consumption_monotonic
+      BEFORE UPDATE ON memory_authorization_receipts
+      FOR EACH ROW
+      EXECUTE FUNCTION public.aaliyah_memory_consumption_monotonic();
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_mirror_consumption()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      BEGIN
+        IF OLD.consumed_at IS NULL AND NEW.consumed_at IS NOT NULL THEN
+          UPDATE public.memory_authorization_receipts
+             SET consumed_at = NEW.consumed_at
+           WHERE tenant_id = NEW.tenant_id
+             AND authorization_id = NEW.authorization_id
+             AND consumed_at IS NULL
+             AND revoked_at IS NULL;
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_authorization_nonces_mirror_consumption
+      ON memory_authorization_nonces;
+    CREATE TRIGGER memory_authorization_nonces_mirror_consumption
+      AFTER UPDATE ON memory_authorization_nonces
+      FOR EACH ROW
+      EXECUTE FUNCTION public.aaliyah_memory_mirror_consumption();
+    REVOKE UPDATE (consumed_at)
+      ON memory_authorization_receipts FROM aaliyah_memory_mutator`,
+  },
 ];
 
 export async function runMailMigrations(pool: Pool): Promise<void> {

@@ -240,6 +240,7 @@ beforeEach(async () => {
       tenantId === TENANT_EXCLUSIVE ? "tenant_exclusive" : "workspace_isolated",
     );
   }
+  genesisCounter = 0;
   // TENANT_UNGOVERNED deliberately gets NO policy row.
   await adminPool.query(
     `TRUNCATE ${SHADOW_RECORD_SCHEMA}.memory_record_versions RESTART IDENTITY`,
@@ -499,6 +500,68 @@ async function issue(
   return receipt;
 }
 
+/** Run one statement under a named least-privilege role, in its own transaction. */
+async function runAs(
+  role: string,
+  sql: string,
+  params: unknown[] = [],
+): Promise<void> {
+  const client = await adminPool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`SET LOCAL ROLE "${role}"`);
+    await client.query(sql, params);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Mint an authorization nonce and SPEND it, so a row appended outside the
+ * store still carries the witness migration 034 requires of every writer.
+ * Issued by the ISSUER role and spent by the MUTATOR role, so the fixture
+ * itself depends on the privilege split it is standing in for.
+ */
+async function witnessAppend(input: {
+  authorizationId: string;
+  mutationReceiptId: string;
+  targetRecordId: string;
+  scope?: MemoryScope;
+  action?: string;
+}): Promise<void> {
+  const scope = input.scope ?? SCOPE;
+  const bindingDigest = memoryContentDigest(input.authorizationId);
+  await runAs(
+    "aaliyah_memory_issuer",
+    `INSERT INTO memory_authorization_nonces
+       (tenant_id, workspace_id, binding_digest, authorization_id, action,
+        target_record_id, issued_at, expires_at)
+     VALUES ($1,$2,$3,$4,$5,$6, now() - interval '1 minute',
+             now() + interval '1 hour')`,
+    [
+      scope.tenantId,
+      scope.workspaceId,
+      bindingDigest,
+      input.authorizationId,
+      input.action ?? "assign_alias",
+      input.targetRecordId,
+    ],
+  );
+  await runAs(
+    "aaliyah_memory_mutator",
+    `UPDATE memory_authorization_nonces
+        SET consumed_at = now(), consumed_by_mutation_receipt_id = $2
+      WHERE binding_digest = $1 AND consumed_at IS NULL`,
+    [bindingDigest, input.mutationReceiptId],
+  );
+}
+
+let genesisCounter = 0;
+
 /** Seed version 1 of a participant identity record. */
 async function seedGenesis(
   recordId: string,
@@ -506,6 +569,16 @@ async function seedGenesis(
 ): Promise<string> {
   const content = { participant: recordId, generation: 1 };
   const digest = memoryContentDigest(content);
+  genesisCounter += 1;
+  const authorizationId = `genesis-${String(genesisCounter).padStart(21, "0")}`;
+  const mutationReceiptId = `mutation.genesis.${genesisCounter}`;
+  await witnessAppend({
+    authorizationId,
+    mutationReceiptId,
+    targetRecordId: recordId,
+    scope,
+    action: "create",
+  });
   const payload = {
     schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
     recordId,
@@ -515,8 +588,8 @@ async function seedGenesis(
     content,
     contentDigest: digest,
     predecessorDigest: null,
-    authorizationId: "genesis-000000000000000000000",
-    mutationReceiptId: "mutation.genesis",
+    authorizationId,
+    mutationReceiptId,
     createdAt: isoOffset(-120_000),
   };
   await adminPool.query(
@@ -2028,7 +2101,17 @@ test("an authorization whose expected head is stale refuses the assignment", asy
     observedAlias: "ceo@example.com",
     participantId: VICTIM,
   });
-  // Somebody else advanced the record between issuance and use.
+  // Somebody else advanced the record between issuance and use. Even an
+  // interloper has to have spent an authorization now (migration 034), so the
+  // fixture spends one: the point of this test is the STALE HEAD, and an
+  // append that the database would refuse for an unrelated reason would prove
+  // nothing about it.
+  await witnessAppend({
+    authorizationId: "interloper-000000000000000000",
+    mutationReceiptId: "mutation.interloper",
+    targetRecordId: VICTIM,
+    action: "correct",
+  });
   await adminPool.query(
     `INSERT INTO memory_record_versions
        (tenant_id, workspace_id, principal_id, user_id, record_id, version,
@@ -2043,7 +2126,7 @@ test("an authorization whose expected head is stale refuses the assignment", asy
       VICTIM,
       `sha256:${"d".repeat(64)}`,
       prepared.genesis,
-      "genesis-000000000000000000000",
+      "interloper-000000000000000000",
       "mutation.interloper",
       JSON.stringify({
         schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
@@ -2054,7 +2137,7 @@ test("an authorization whose expected head is stale refuses the assignment", asy
         content: { participant: VICTIM, generation: 99 },
         contentDigest: `sha256:${"d".repeat(64)}`,
         predecessorDigest: prepared.genesis,
-        authorizationId: "genesis-000000000000000000000",
+        authorizationId: "interloper-000000000000000000",
         mutationReceiptId: "mutation.interloper",
         createdAt: isoOffset(-1000),
       }),
@@ -2308,6 +2391,12 @@ test("a head at the WRONG VERSION is refused even when its content digest matche
   // A second row whose content digest is EXACTLY the one the authorization
   // expects, at a version the authorization does not expect. Only the VERSION
   // comparison can refuse this.
+  await witnessAppend({
+    authorizationId: "interloper-000000000000000001",
+    mutationReceiptId: "mutation.interloper.same-digest",
+    targetRecordId: VICTIM,
+    action: "correct",
+  });
   await adminPool.query(
     `INSERT INTO memory_record_versions
        (tenant_id, workspace_id, principal_id, user_id, record_id, version,
@@ -2321,7 +2410,7 @@ test("a head at the WRONG VERSION is refused even when its content digest matche
       SCOPE.userId,
       VICTIM,
       prepared.genesis,
-      "genesis-000000000000000000000",
+      "interloper-000000000000000001",
       "mutation.interloper.same-digest",
       JSON.stringify({
         schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
@@ -2332,7 +2421,7 @@ test("a head at the WRONG VERSION is refused even when its content digest matche
         content: { participant: VICTIM, generation: 1 },
         contentDigest: prepared.genesis,
         predecessorDigest: prepared.genesis,
-        authorizationId: "genesis-000000000000000000000",
+        authorizationId: "interloper-000000000000000001",
         mutationReceiptId: "mutation.interloper.same-digest",
         createdAt: isoOffset(-1000),
       }),
@@ -3208,4 +3297,137 @@ test("a malformed request never reaches the database", async () => {
   });
   assert.equal(result.rejection, "request_malformed");
   assert.equal(result.receipt, null);
+});
+
+// ---------------------------------------------------------------------------
+// W1.3 Part B2, Part D half — a binding is an APPENDED FACT and needs the same
+// witness a record version does.
+//
+// The same defect that let the least-privilege mutator forge a record chain
+// applies here: the alias registry's uniqueness indexes decide races, but
+// nothing tied a binding row to an authorization that was actually spent. A
+// forged binding would have been globally unique and completely unauthorized.
+// ---------------------------------------------------------------------------
+
+test("Part D a binding with no consumed authorization behind it is refused", async () => {
+  await assert.rejects(
+    () => insertRawBinding(),
+    /no consumed authorization witnesses this binding/,
+  );
+  assert.equal(await activeBindings(), 0);
+});
+
+test("Part D the mutation role cannot forge a binding either", async () => {
+  const client = await adminPool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query('SET LOCAL ROLE "aaliyah_memory_mutator"');
+    await assert.rejects(
+      () =>
+        client.query(
+          `INSERT INTO memory_alias_bindings
+             (tenant_id, workspace_id, principal_id, user_id,
+              cross_workspace_policy, scope_key, alias_id, normalized_alias,
+              skeleton, skeleton_algorithm, normalization_profile,
+              canonical_participant_id, registrable_domain, script_code,
+              restriction_level, subject_participant_id, source_evidence_ref,
+              source_evidence_digest, observed_at, fresh_until,
+              authorization_id, mutation_receipt_id, bound_at, payload)
+           VALUES ($1,$2,'p','u','workspace_isolated',$2,'alias-forged',
+                   'ceo@example.com','ceo@example.com','sk','np',$4,
+                   'example.com','Latn','ascii_only',$4,'identity:x/y',$3,
+                   now(), now() + interval '1 hour',
+                   'auth-does-not-exist-0000000','mutation.forged', now(), $5)`,
+          [
+            TENANT,
+            SCOPE.workspaceId,
+            EVIDENCE_DIGEST,
+            VICTIM,
+            JSON.stringify({
+              scope: {
+                tenantId: TENANT,
+                workspaceId: SCOPE.workspaceId,
+                principalId: "p",
+                userId: "u",
+              },
+              aliasId: "alias-forged",
+              normalizedAlias: "ceo@example.com",
+              skeleton: "ceo@example.com",
+              canonicalParticipantId: VICTIM,
+              subjectParticipantId: VICTIM,
+              crossWorkspacePolicy: "workspace_isolated",
+              scopeKey: SCOPE.workspaceId,
+              authorizationId: "auth-does-not-exist-0000000",
+              mutationReceiptId: "mutation.forged",
+            }),
+          ],
+        ),
+      /no consumed authorization witnesses this binding/,
+    );
+    await client.query("ROLLBACK");
+  } finally {
+    client.release();
+  }
+  assert.equal(await activeBindings(), 0);
+});
+
+test("Part D a WITNESSED raw binding is accepted, so the guard is not a blanket refusal", async () => {
+  // Without this the guard could be a statement that refuses everything, and
+  // every assertion above would still pass.
+  await witnessAppend({
+    authorizationId: "auth-alias-00000000000000000000",
+    mutationReceiptId: "mutation.raw",
+    targetRecordId: VICTIM,
+  });
+  await insertRawBinding();
+  assert.equal(await activeBindings(), 1);
+});
+
+test("Part D a retirement with no consumed authorization behind it is refused", async () => {
+  const bound = await bindThen(
+    "alias-retire-guard",
+    "ceo@example.com",
+    VICTIM,
+    "mutation.alias.retireguard.bind",
+  );
+  assert.equal(typeof bound.headDigest, "string");
+  assert.equal(await activeBindings(), 1);
+  await assert.rejects(
+    () =>
+      adminPool.query(
+        `UPDATE memory_alias_bindings
+            SET removed_at = now(),
+                removed_by_mutation_receipt_id = 'mutation.forged.retire',
+                removed_authorization_id = 'auth-does-not-exist-0000000'
+          WHERE alias_id = $1`,
+        ["alias-retire-guard"],
+      ),
+    /no consumed authorization witnesses this retirement/,
+  );
+  assert.equal(await activeBindings(), 1);
+});
+
+test("Part D the retirement guard still reports the more specific violation first", async () => {
+  // The witness check is deliberately LAST in the trigger, so a retirement
+  // that also rewrites the binding is still refused as a rewrite. Ordering the
+  // checks the other way would hide every message the earlier controls own.
+  await bindThen(
+    "alias-retire-order",
+    "ceo@example.com",
+    VICTIM,
+    "mutation.alias.retireorder.bind",
+  );
+  await assert.rejects(
+    () =>
+      adminPool.query(
+        `UPDATE memory_alias_bindings
+            SET removed_at = now(),
+                removed_by_mutation_receipt_id = 'mutation.forged.retire',
+                removed_authorization_id = 'auth-does-not-exist-0000000',
+                canonical_participant_id = $2
+          WHERE alias_id = $1`,
+        ["alias-retire-order", ATTACKER],
+      ),
+    /retirement may not rewrite a binding/,
+  );
 });

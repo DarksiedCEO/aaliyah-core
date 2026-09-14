@@ -177,6 +177,73 @@ verbatim, so the collapse is on the JS side, before the digest.
 
 ---
 
+## W1BR-007 — The mutation role can burn a pending approval
+
+- **Gate:** W1.3 · **Source:** Security, executed against `34ac77f` on a live
+  PostgreSQL 16 · **Severity:** MEDIUM
+- **Location:** `src/persistence/postgres/migrations.ts` migration 029
+  (`GRANT UPDATE (consumed_at, consumed_by_mutation_receipt_id) ON
+  memory_authorization_nonces TO aaliyah_memory_mutator`)
+
+Consumption has to be available to the mutation role — spending the nonce is
+the whole point of the role. That same grant lets it spend an approval it was
+never asked to spend:
+
+```sql
+SET LOCAL ROLE aaliyah_memory_mutator;
+UPDATE memory_authorization_nonces
+   SET consumed_at = now(), consumed_by_mutation_receipt_id = 'attacker'
+ WHERE binding_digest = $1;   -- ACCEPTED, 1 row
+```
+
+The legitimate holder of that approval then gets `authorization_already_consumed`
+and has to have a new one issued. This is a **denial of service against an
+approval**, not a forgery: migration 034 means a burned nonce cannot be turned
+into a record version or a committed outcome, and migration 035 means the burn
+cannot afterwards be undone or attributed to somebody else.
+
+- **Disposition:** `OPEN` (residual, disclosed and tested — the burn is
+  permanent and attributable, not silent)
+- **Closure path:** a consumption that names the mutation receipt id BEFORE the
+  mutation transaction begins (a reservation), or an issuer-side second factor
+  on consumption. Either changes the store's transaction shape and is out of
+  scope for Part B2.
+
+---
+
+## W1BR-008 — The unkeyed content digest is an offline oracle
+
+- **Gate:** W1.3 · **Source:** Security, executed against `34ac77f` on a live
+  PostgreSQL 16 · **Severity:** MEDIUM
+- **Location:** `src/application/memory/wave1TrustedMemory.ts:171`
+  (`memoryContentDigest`), `aaliyah-contracts` `canonicalDigest`
+
+`canonicalDigest` is an **unkeyed, deterministic** SHA-256 over canonical JSON.
+Anyone who holds a record's `contentDigest` — from a head read, from a mutation
+receipt, from a backup, from a log — can confirm guessed content offline by
+digesting the guess and comparing. For the low-entropy content this path
+actually carries (a participant identity, a status, a short note, a
+last-four) the guess space is small enough to enumerate.
+
+Executed: `memoryContentDigest({ ssn: "123-45-6789" })` equals the stored head
+digest of a record holding exactly that value, computed with no access to the
+database at all.
+
+The read-side half is narrowed by Part B2: `readHead` now filters on all four
+scope dimensions, so an actor from another principal in the same workspace can
+no longer obtain the digest through the store. The oracle itself is untouched —
+it lives in the digest construction, not in the query.
+
+- **Disposition:** `OPEN` (residual, disclosed; the read path is narrowed, the
+  construction is not changed)
+- **Closure path:** a KEYED construction — HMAC or a signature whose key lives
+  in a KMS/HSM, outside the database — so that possessing a digest without the
+  key confirms nothing. That primitive is not in this repository, and closing it
+  changes a shared contracts-level digest that other Wave 1 paths depend on, so
+  it is a coordinated migration and not a Part B2 change.
+
+---
+
 ## Cross-cutting note carried forward from the W1.3 review
 
 The W1.3 candidate's suite was green while 25 of 31 applied mutations survived,

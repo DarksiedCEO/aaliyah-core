@@ -1,4 +1,5 @@
 import {
+  MemoryAuthorizationIdSchema,
   MemoryAuthorizationReceiptSchema,
   MemoryIdSchema,
   MemoryMutationReceiptSchema,
@@ -63,8 +64,24 @@ import {
  * payload, the receipt's relational columns, and the out-of-band nonce row —
  * and the SAFEST reading always wins: the EARLIEST expiry, revoked if ANY
  * source says revoked, consumed if ANY source says consumed. Extending an
- * authorization therefore requires rewriting every source consistently, and
- * migration 029 puts those sources under different privileges.
+ * authorization therefore requires rewriting every source consistently.
+ *
+ * THAT CLAIM USED TO BE FALSE FOR CONSUMPTION AND IS NOW TRUE. Migration 029
+ * granted the mutation role UPDATE on the nonce's `consumed_at` AND on the
+ * receipt's, so one role held both sources and could consume, un-consume and
+ * re-consume an approval — executed, against a live database. Migration 035
+ * REVOKES the receipt grant, mirrors consumption from the nonce onto the
+ * receipt inside the database, and makes `consumed_at` monotonic on both
+ * tables for every writer including the owner. This code therefore no longer
+ * writes the receipt's `consumed_at` at all: it cannot, and it must not claim
+ * a separation it is itself violating.
+ *
+ * THE DATABASE IS THE ENFORCEMENT POINT, NOT THIS FILE. Everything below —
+ * the authorization exists, it was consumed, the predecessor links, version =
+ * head + 1, the owner does not change mid-chain — is ALSO enforced by triggers
+ * in migration 034, because a property that lives only here binds only writes
+ * that come through here. Deleting a check in this file changes the error a
+ * caller sees; it does not make the forgery representable.
  *
  * WHAT THIS DOES NOT SOLVE, SAID PLAINLY. `canonicalDigest` is UNKEYED. It
  * gives integrity of a binding and no authenticity whatsoever. Splitting the
@@ -74,7 +91,8 @@ import {
  * Authenticity needs a KEYED construction — an issuer signature or HMAC whose
  * key lives in a KMS or HSM, outside the database — verified before a receipt
  * is honoured. That primitive is not in this repository and nothing here
- * claims it.
+ * claims it. The same unkeyed digest makes a head digest an offline ORACLE for
+ * guessed content: see W1BR-008 in docs/WAVE1_BLOCKER_REGISTER.md.
  *
  * ALSO NOT HERE, ON PURPOSE: tombstones, the alias registry and legal-hold
  * ENFORCEMENT are later assignments. `delete()` advances the head to a
@@ -98,6 +116,22 @@ const NONCE_COLUMNS = `tenant_id, workspace_id, binding_digest,
 
 /** Unit separator. Keeps a lock key unambiguous across its components. */
 const LOCK_KEY_SEPARATOR = "\u001f";
+
+/**
+ * The nonce digest an ATTEMPT THAT RESOLVED NO AUTHORIZATION is filed under.
+ *
+ * An attempt with an unknown authorization id used to write nothing at all,
+ * which made id enumeration — the highest-volume attack against an id-only
+ * lookup — the one attempt that left no trace. It is now audited, and the
+ * durable row has to carry a `consumedNonceDigest` because the receipt shape
+ * requires one. This value is all zeroes: it is not the digest of anything, no
+ * nonce row can ever carry it (`memory_authorization_nonces` rows are written
+ * by the issuer from a real binding digest), and the outcome recorded with it
+ * is always ABORTED_NO_MUTATION, which migration 034 refuses to let anyone
+ * upgrade into a committed claim. Read it as "no authorization was resolved",
+ * never as a nonce.
+ */
+const UNRESOLVED_NONCE_DIGEST = `sha256:${"0".repeat(64)}`;
 
 type AuthorizationRow = {
   tenant_id: string;
@@ -154,6 +188,7 @@ const ABORT_REASON: Record<string, MemoryAbortReason> = {
   authorization_scope_mismatch: "policy_rejected",
   authorization_action_mismatch: "policy_rejected",
   authorization_target_mismatch: "policy_rejected",
+  record_owner_mismatch: "policy_rejected",
   authorization_expected_head_mismatch: "policy_rejected",
   authorization_expired: "authorization_expired",
   authorization_revoked: "authorization_revoked",
@@ -260,6 +295,20 @@ export function createPostgresTrustedMemoryStore(
     };
   }
 
+  /**
+   * The record's head AS THIS ACTOR IS ENTITLED TO SEE IT.
+   *
+   * All FOUR scope dimensions are predicates, not two. Filtering on tenant and
+   * workspace alone let an actor from another principal in the same workspace
+   * read a record it has no relationship to, INCLUDING the owner's identity —
+   * executed, against a live database. Principal and user are columns on every
+   * row and migration 034 pins them constant across a chain, so a head that
+   * belongs to somebody else can never be returned as this actor's head.
+   *
+   * WHAT THIS DOES NOT CLOSE: `contentDigest` is UNKEYED and deterministic, so
+   * whoever holds a head digest can confirm guessed content offline. That is
+   * W1BR-008 and it needs a keyed construction that is not in this repository.
+   */
   async function readHead(
     actor: TrustedMemoryActor,
     recordId: string,
@@ -272,9 +321,16 @@ export function createPostgresTrustedMemoryStore(
         `SELECT ${RECORD_COLUMNS}
            FROM memory_record_versions
           WHERE tenant_id = $1 AND workspace_id = $2 AND record_id = $3
+            AND principal_id = $4 AND user_id = $5
           ORDER BY id DESC
           LIMIT 1`,
-        [actor.tenantId, actor.workspaceId, recordId],
+        [
+          actor.tenantId,
+          actor.workspaceId,
+          recordId,
+          actor.principalId,
+          actor.userId,
+        ],
       );
       await client.query("COMMIT");
       const row = result.rows[0] as RecordRow | undefined;
@@ -404,6 +460,62 @@ export function createPostgresTrustedMemoryStore(
     return { verified: false, rejection: "unknown_outcome", receipt };
   }
 
+  /**
+   * AUDIT AN ATTEMPT THAT RESOLVED NOTHING.
+   *
+   * An unknown or unparseable authorization id is the enumeration case, and it
+   * was the one path in this store that wrote ZERO rows. Cross-tenant attempts
+   * were logged; guessing at ids was not. This writes the attempt down under
+   * the ACTOR's scope — never the scope it was reaching for — with the
+   * unresolved sentinel above, so the volume and the origin of an enumeration
+   * sweep are visible on disk.
+   *
+   * The CALLER still gets `receipt: null`. Handing back a receipt that names an
+   * authorization which does not exist would be a token to hide behind, and
+   * the honest answer to the caller is that there is nothing to return. The
+   * operator's evidence and the caller's answer are not the same artefact.
+   *
+   * `fromHead` IS OBSERVED, NOT INVENTED. The contract requires a `correct` or
+   * a `delete` receipt to name a prior version, so this reads the head the
+   * ACTOR is entitled to see and records that — the head the attempt would
+   * have been compared against, which is what `fromHead` means. DISCLOSED
+   * LIMIT: when the actor can see no head for the named record there is no
+   * honest value for that field and no row is written, so enumeration against
+   * record ids that do not exist for the actor is still unaudited here. That
+   * is a narrower gap than the one it replaces and it is not closed.
+   */
+  async function auditUnresolvedAttempt(
+    request: TrustedMemoryMutationRequest,
+    action: MemoryAction,
+  ): Promise<void> {
+    const head = await readHead(request.actor, request.recordId).catch(
+      () => null,
+    );
+    if (head === null) return;
+    const at = new Date().toISOString();
+    const receipt = MemoryMutationReceiptSchema.parse({
+      schemaVersion: "aaliyah.trusted-memory/v1",
+      mutationReceiptId: request.mutationReceiptId,
+      authorizationId: request.authorizationId,
+      consumedNonceDigest: UNRESOLVED_NONCE_DIGEST,
+      action,
+      scope: request.actor,
+      targetRecordId: request.recordId,
+      fromHead: {
+        kind: "version",
+        version: head.version,
+        contentDigest: head.contentDigest,
+      },
+      emittedAt: at,
+      outcome: {
+        status: "ABORTED_NO_MUTATION",
+        abortedAt: at,
+        abortReason: "policy_rejected",
+      },
+    });
+    await appendTerminal(receipt).catch(() => undefined);
+  }
+
   async function abortResult(
     request: TrustedMemoryMutationRequest,
     action: MemoryAction,
@@ -411,8 +523,9 @@ export function createPostgresTrustedMemoryStore(
     rejection: TrustedMemoryRejection,
   ): Promise<TrustedMemoryMutationResult> {
     if (stored === null || stored.expectedHead.kind !== "version") {
-      // Not enough real stored state to fill a structurally valid receipt.
-      // Inventing one would mean inventing a nonce digest and a from-head.
+      // Not enough real stored state to fill a structurally valid receipt for
+      // the CALLER. The attempt is still written down.
+      await auditUnresolvedAttempt(request, action);
       return { verified: false, rejection, receipt: null };
     }
     const at = new Date().toISOString();
@@ -443,7 +556,11 @@ export function createPostgresTrustedMemoryStore(
   ): Promise<TrustedMemoryMutationResult> {
     if (
       !MemoryIdSchema.safeParse(request.recordId).success ||
-      !MemoryIdSchema.safeParse(request.mutationReceiptId).success
+      !MemoryIdSchema.safeParse(request.mutationReceiptId).success ||
+      // Checked here so the enumeration audit below can always write a
+      // structurally valid row: a malformed id is refused before it reaches
+      // the database, exactly like a malformed record id.
+      !MemoryAuthorizationIdSchema.safeParse(request.authorizationId).success
     ) {
       return { verified: false, rejection: "request_malformed", receipt: null };
     }
@@ -616,18 +733,13 @@ export function createPostgresTrustedMemoryStore(
       if (consumed.rowCount !== 1) {
         throw new MutationAborted("authorization_already_consumed");
       }
-      // Bookkeeping on the receipt row. NOT the authority on single use — the
-      // nonce UPDATE above is. The receipt's jsonb `consumedAt` is left alone
-      // on purpose: the mutation role holds UPDATE on this ONE column and no
-      // grant on `payload`, so it cannot rewrite a receipt it is spending.
-      // The resulting divergence is read fail-closed (consumed if either says
-      // consumed), so it can only ever spend an authorization, never revive one.
-      await client.query(
-        `UPDATE memory_authorization_receipts
-            SET consumed_at = now()
-          WHERE authorization_id = $1 AND consumed_at IS NULL`,
-        [stored.authorizationId],
-      );
+      // THE RECEIPT'S `consumed_at` IS NOT WRITTEN HERE, AND CANNOT BE.
+      // Migration 035 revoked this role's UPDATE grant on that column and
+      // mirrors consumption from the nonce onto the receipt inside the
+      // database. One role writing both sources was the reason "the sources
+      // are under different privileges" was false; a statement here would
+      // simply fail with permission denied, and passing it through a role
+      // that could do it would re-open the hole.
 
       // ---- 5. READ THE ACTUAL HEAD AND COMPARE-AND-SWAP -----------------
       const headResult = await client.query(
@@ -645,6 +757,29 @@ export function createPostgresTrustedMemoryStore(
       const headRow = headResult.rows[0] as RecordRow | undefined;
       if (!headRow) throw new MutationAborted("head_mismatch");
       const head = headFromRow(headRow);
+
+      // ---- THE ACTOR MUST OWN THE RECORD IT IS MUTATING -----------------
+      // The four scope comparisons above are actor <-> AUTHORIZATION. They
+      // say nothing about the record. An authorization scoped to
+      // principal-attacker naming a record owned by principal-victim passed
+      // every one of them, overwrote the victim's content, changed the
+      // ownership columns mid-chain, and the post-commit read-back CONFIRMED
+      // the takeover because it compared the observed scope against the
+      // AUTHORIZATION rather than against the record that was there before.
+      //
+      // Deliberately read from the HEAD ROW and not from the CAS predicate:
+      // filtering the head lookup by principal and user would turn a takeover
+      // into an indistinguishable `head_mismatch` and leave these two
+      // comparisons with no reachable input, so no test could kill them.
+      // Migration 034 pins the same continuity for writers that never come
+      // through this function.
+      if (head.scope.principalId !== request.actor.principalId) {
+        throw new MutationAborted("record_owner_mismatch");
+      }
+      if (head.scope.userId !== request.actor.userId) {
+        throw new MutationAborted("record_owner_mismatch");
+      }
+
       if (head.version !== expectedHead.version) {
         throw new MutationAborted("head_mismatch");
       }
@@ -805,6 +940,31 @@ export function createPostgresTrustedMemoryStore(
     }
 
     if (observed === null || readBackDigest === "") {
+      return await finishUnknown(
+        request,
+        action,
+        authorized,
+        "read_back_attempted",
+      );
+    }
+
+    // THE VERSION COMES FIRST, AND THAT ORDER IS THE FIX.
+    //
+    // `pg_advisory_xact_lock` is released by COMMIT, and the read-back runs
+    // after the commit on a different pool, taking the newest row. A
+    // legitimate concurrent append landing in that window made `readBackDigest`
+    // the digest of SOMEBODY ELSE'S version, and because the digest comparison
+    // came first, a correct, committed mutation was durably recorded as
+    // COMMITTED_READ_BACK_DIVERGED — the strongest alarm in the system firing
+    // for a healthy write. Reproduced deterministically.
+    //
+    // A head that is not the version this mutation wrote is not evidence about
+    // what this mutation wrote. It is UNKNOWN, which is exactly what the
+    // post-state comparison further down already says for every other way the
+    // observed head can fail to be ours; this only moves the version half of
+    // that comparison ahead of the digest so divergence keeps its meaning:
+    // OUR version came back holding content that is not the content we wrote.
+    if (observed.version !== nextVersion) {
       return await finishUnknown(
         request,
         action,
