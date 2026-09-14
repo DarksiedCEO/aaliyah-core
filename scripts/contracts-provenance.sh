@@ -3,8 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-expected_sha="31801a029c79f8286a63300058e82b3c2687fb60"
-expected_tree="84c440d8211a91bb2ec551cc1d3a3603bb7b32f0"
+expected_sha="7d576681d1001eb4c4a7f044f7793cdb3f80af76"
+expected_tree="a34af636b5ce62dbb2830a8a7b716816f42ea041"
 expected_contract="aaliyah.postcondition-verification/v1"
 expected_executive_contract="aaliyah.executive-messaging/v1"
 expected_wave1_contract="aaliyah.executive-communications/wave1"
