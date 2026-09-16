@@ -1,0 +1,412 @@
+import type { Pool, PoolClient } from "pg";
+
+/**
+ * RECONCILING AN UNKNOWN OUTCOME.
+ *
+ * `UNKNOWN_PENDING_RECONCILIATION` is what the store records when a COMMIT did
+ * not come back cleanly, or a read-back could not be performed. Until now
+ * nothing consumed it: the ambiguity was persisted honestly and then sat
+ * there, so "unknown" was durable but permanent.
+ *
+ * WHY THE VERDICT IS DETERMINATE AND NOT A GUESS. The pending receipt is
+ * written on the mutation's OWN transaction, immediately before its COMMIT.
+ * A durable pending row is therefore proof that the transaction committed, and
+ * the absence of one is proof that it did not. Reconciliation is a reading of
+ * authoritative state — never an inference from elapsed time, never a retry
+ * that hopes to observe the same thing twice, and never a timeout treated as
+ * a failure.
+ *
+ * AMBIGUITY IS NEVER CONVERTED TO SUCCESS. A `COMMITTED_*` verdict requires a
+ * `memory_record_versions` row carrying this exact `mutation_receipt_id`.
+ * Migration 038 makes that row unique per receipt, so the evidence is the
+ * mutation itself rather than something that resembles it. Anything that does
+ * not resolve to one of the four verdicts is escalated as `IMPOSSIBLE_STATE`,
+ * which is a durable alarm, not a silent pass.
+ *
+ * THE RECONCILER CANNOT MUTATE. It runs as `aaliyah_memory_reconciler`, which
+ * holds SELECT on the evidence tables and INSERT on `memory_reconciliations`
+ * and nothing else — no INSERT on `memory_record_versions`, no consumption
+ * UPDATE. "Reconciliation never produces a duplicate mutation" is a privilege
+ * boundary enforced by PostgreSQL, not a property of this file's control flow.
+ */
+
+/** Four verdicts, and every one of them names what was observed. */
+export const MEMORY_RECONCILIATION_VERDICTS = [
+  /** The mutation committed and the stored content is what was authorized. */
+  "COMMITTED_CONFIRMED",
+  /** The mutation committed and the stored content is NOT what was authorized. */
+  "COMMITTED_DIVERGED",
+  /** The transaction never landed. Nothing was written, nothing was spent. */
+  "NOT_COMMITTED",
+  /** The evidence contradicts itself. Never resolved here; raised. */
+  "IMPOSSIBLE_STATE",
+] as const;
+export type MemoryReconciliationVerdict =
+  (typeof MEMORY_RECONCILIATION_VERDICTS)[number];
+
+export type MemoryReconciliationScope = {
+  tenantId: string;
+  workspaceId: string;
+  principalId: string;
+  userId: string;
+};
+
+export type UnresolvedMutation = {
+  scope: MemoryReconciliationScope;
+  mutationReceiptId: string;
+  authorizationId: string;
+  action: string;
+  targetRecordId: string;
+};
+
+export type MemoryReconciliation = {
+  scope: MemoryReconciliationScope;
+  mutationReceiptId: string;
+  authorizationId: string;
+  action: string;
+  targetRecordId: string;
+  verdict: MemoryReconciliationVerdict;
+  observedVersion: number | null;
+  observedContentDigest: string | null;
+  reconciledAt: string;
+  evidence: Record<string, unknown>;
+  /** True when this call found an existing verdict rather than writing one. */
+  alreadyReconciled: boolean;
+};
+
+const RECONCILER_ROLE = "aaliyah_memory_reconciler";
+// UNIT SEPARATOR, written as an escape. NOT NUL: PostgreSQL text cannot
+// carry a 0x00 byte, so a NUL-joined lock key is rejected by the server
+// with "invalid byte sequence for encoding UTF8" rather than hashing to
+// anything. Matches LOCK_KEY_SEPARATOR in the trusted-memory store.
+const LOCK_SEPARATOR = "\u001f";
+
+type ReconciliationRow = {
+  tenant_id: string;
+  workspace_id: string;
+  principal_id: string;
+  user_id: string;
+  mutation_receipt_id: string;
+  authorization_id: string;
+  action: string;
+  target_record_id: string;
+  verdict: MemoryReconciliationVerdict;
+  observed_version: number | null;
+  observed_content_digest: string | null;
+  reconciled_at: Date;
+  evidence: Record<string, unknown>;
+};
+
+function fromRow(row: ReconciliationRow, alreadyReconciled: boolean): MemoryReconciliation {
+  return {
+    scope: {
+      tenantId: row.tenant_id,
+      workspaceId: row.workspace_id,
+      principalId: row.principal_id,
+      userId: row.user_id,
+    },
+    mutationReceiptId: row.mutation_receipt_id,
+    authorizationId: row.authorization_id,
+    action: row.action,
+    targetRecordId: row.target_record_id,
+    verdict: row.verdict,
+    observedVersion: row.observed_version,
+    observedContentDigest: row.observed_content_digest,
+    reconciledAt: row.reconciled_at.toISOString(),
+    evidence: row.evidence,
+    alreadyReconciled,
+  };
+}
+
+export type MemoryReconcilerOptions = {
+  /** Overridable so a test can prove the role is what confines this. */
+  reconcilerRole?: string;
+};
+
+export function createPostgresMemoryReconciler(
+  pool: Pool,
+  options: MemoryReconcilerOptions = {},
+) {
+  const role = options.reconcilerRole ?? RECONCILER_ROLE;
+
+  async function enterRole(client: PoolClient): Promise<void> {
+    // Quoted and validated: a role name is an identifier and cannot be bound
+    // as a parameter, so it must not be caller-shaped text.
+    if (!/^[a-z_][a-z0-9_]*$/.test(role)) {
+      throw new Error(`unsafe reconciler role: ${role}`);
+    }
+    await client.query(`SET LOCAL ROLE "${role}"`);
+  }
+
+  /**
+   * MUTATIONS WHOSE LAST WORD IS STILL "UNKNOWN".
+   *
+   * Excludes anything that later reached a real terminal outcome, and anything
+   * already reconciled — so a restarted worker picks up exactly what is left
+   * rather than re-deciding settled history.
+   */
+  async function findUnresolved(limit = 100): Promise<UnresolvedMutation[]> {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await enterRole(client);
+      const result = await client.query(
+        `SELECT DISTINCT r.tenant_id, r.workspace_id, r.principal_id, r.user_id,
+                r.mutation_receipt_id, r.authorization_id, r.action,
+                r.target_record_id
+           FROM memory_mutation_receipts AS r
+          WHERE r.outcome_status = 'UNKNOWN_PENDING_RECONCILIATION'
+            AND NOT EXISTS (
+              SELECT 1 FROM memory_mutation_receipts AS t
+               WHERE t.tenant_id = r.tenant_id
+                 AND t.workspace_id = r.workspace_id
+                 AND t.mutation_receipt_id = r.mutation_receipt_id
+                 AND t.phase = 'terminal'
+                 AND t.outcome_status <> 'UNKNOWN_PENDING_RECONCILIATION')
+            AND NOT EXISTS (
+              SELECT 1 FROM memory_reconciliations AS c
+               WHERE c.tenant_id = r.tenant_id
+                 AND c.workspace_id = r.workspace_id
+                 AND c.mutation_receipt_id = r.mutation_receipt_id)
+          ORDER BY r.mutation_receipt_id
+          LIMIT $1`,
+        [limit],
+      );
+      await client.query("COMMIT");
+      return result.rows.map((row: ReconciliationRow) => ({
+        scope: {
+          tenantId: row.tenant_id,
+          workspaceId: row.workspace_id,
+          principalId: row.principal_id,
+          userId: row.user_id,
+        },
+        mutationReceiptId: row.mutation_receipt_id,
+        authorizationId: row.authorization_id,
+        action: row.action,
+        targetRecordId: row.target_record_id,
+      }));
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async function readExisting(
+    client: PoolClient,
+    scope: MemoryReconciliationScope,
+    mutationReceiptId: string,
+  ): Promise<ReconciliationRow | undefined> {
+    const result = await client.query(
+      `SELECT * FROM memory_reconciliations
+        WHERE tenant_id = $1 AND workspace_id = $2 AND mutation_receipt_id = $3
+        LIMIT 1`,
+      [scope.tenantId, scope.workspaceId, mutationReceiptId],
+    );
+    return result.rows[0] as ReconciliationRow | undefined;
+  }
+
+  /**
+   * RECONCILE ONE MUTATION.
+   *
+   * Idempotent by two independent mechanisms, because either alone leaves a
+   * race: the advisory lock serialises workers that arrive together, and the
+   * table's UNIQUE constraint refuses a second verdict even if a worker
+   * somehow bypassed the lock. A conflict is not an error — it means somebody
+   * else answered first, and their answer is returned.
+   */
+  async function reconcile(
+    unresolved: UnresolvedMutation,
+  ): Promise<MemoryReconciliation> {
+    const { scope, mutationReceiptId } = unresolved;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await enterRole(client);
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [
+          [scope.tenantId, scope.workspaceId, mutationReceiptId].join(
+            LOCK_SEPARATOR,
+          ),
+        ],
+      );
+
+      const existing = await readExisting(client, scope, mutationReceiptId);
+      if (existing !== undefined) {
+        await client.query("COMMIT");
+        return fromRow(existing, true);
+      }
+
+      // ---- THE PENDING ROW: DID THE TRANSACTION COMMIT? -----------------
+      const pending = await client.query(
+        `SELECT 1 FROM memory_mutation_receipts
+          WHERE tenant_id = $1 AND workspace_id = $2
+            AND mutation_receipt_id = $3 AND phase = 'pending'
+          LIMIT 1`,
+        [scope.tenantId, scope.workspaceId, mutationReceiptId],
+      );
+      const pendingPresent = pending.rowCount === 1;
+
+      // ---- THE MUTATION ITSELF ------------------------------------------
+      // Resolved by mutation receipt id, which migration 038 makes unique per
+      // record version. Deliberately NOT resolved by head: a later mutation
+      // may have advanced the record since, and this one still committed.
+      const version = await client.query(
+        `SELECT version, content_digest, state
+           FROM memory_record_versions
+          WHERE tenant_id = $1 AND workspace_id = $2
+            AND mutation_receipt_id = $3
+          LIMIT 1`,
+        [scope.tenantId, scope.workspaceId, mutationReceiptId],
+      );
+      const versionRow = version.rows[0] as
+        | { version: number; content_digest: string; state: string }
+        | undefined;
+
+      // ---- WHAT WAS AUTHORIZED ------------------------------------------
+      const authorization = await client.query(
+        `SELECT payload FROM memory_authorization_receipts
+          WHERE authorization_id = $1 LIMIT 1`,
+        [unresolved.authorizationId],
+      );
+      const authorizedDigest =
+        ((authorization.rows[0]?.payload as Record<string, unknown> | undefined)?.[
+          "proposedContentDigest"
+        ] as string | undefined) ?? null;
+
+      let verdict: MemoryReconciliationVerdict;
+      let escalation: string | null = null;
+      if (pendingPresent && versionRow !== undefined) {
+        // The content is compared against the AUTHORIZATION, not against what
+        // the caller said it sent. A committed row holding something nobody
+        // approved is a divergence, and it is reported as one rather than
+        // being rounded up to success because the row exists.
+        verdict =
+          authorizedDigest !== null &&
+          versionRow.content_digest === authorizedDigest
+            ? "COMMITTED_CONFIRMED"
+            : "COMMITTED_DIVERGED";
+      } else if (!pendingPresent && versionRow === undefined) {
+        verdict = "NOT_COMMITTED";
+      } else {
+        // The pending receipt and the record version are written by ONE
+        // transaction. Observing one without the other means something
+        // outside that transaction wrote or removed a row, and no verdict
+        // about this mutation can be honestly derived from it.
+        verdict = "IMPOSSIBLE_STATE";
+        escalation = pendingPresent
+          ? "pending receipt present with no record version"
+          : "record version present with no pending receipt";
+      }
+
+      const observedVersion =
+        verdict === "COMMITTED_CONFIRMED" || verdict === "COMMITTED_DIVERGED"
+          ? (versionRow?.version ?? null)
+          : null;
+      const observedDigest =
+        verdict === "COMMITTED_CONFIRMED" || verdict === "COMMITTED_DIVERGED"
+          ? (versionRow?.content_digest ?? null)
+          : null;
+
+      const reconciledAt = new Date().toISOString();
+      const evidence: Record<string, unknown> = {
+        schemaVersion: "aaliyah.trusted-memory.reconciliation/v1",
+        mutationReceiptId,
+        authorizationId: unresolved.authorizationId,
+        action: unresolved.action,
+        targetRecordId: unresolved.targetRecordId,
+        // The raw observations, so the verdict can be re-derived from the
+        // record rather than taken on the reconciler's word.
+        pendingReceiptPresent: pendingPresent,
+        recordVersionPresent: versionRow !== undefined,
+        authorizedContentDigest: authorizedDigest,
+        observedContentDigest: versionRow?.content_digest ?? null,
+        observedState: versionRow?.state ?? null,
+        escalation,
+        reconciledAt,
+      };
+
+      const inserted = await client.query(
+        `INSERT INTO memory_reconciliations
+           (tenant_id, workspace_id, principal_id, user_id, mutation_receipt_id,
+            authorization_id, action, target_record_id, verdict,
+            observed_version, observed_content_digest, reconciled_at, evidence)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         ON CONFLICT ON CONSTRAINT memory_reconciliations_once DO NOTHING
+         RETURNING *`,
+        [
+          scope.tenantId,
+          scope.workspaceId,
+          scope.principalId,
+          scope.userId,
+          mutationReceiptId,
+          unresolved.authorizationId,
+          unresolved.action,
+          unresolved.targetRecordId,
+          verdict,
+          observedVersion,
+          observedDigest,
+          reconciledAt,
+          JSON.stringify(evidence),
+        ],
+      );
+
+      if (inserted.rowCount === 1) {
+        await client.query("COMMIT");
+        return fromRow(inserted.rows[0] as ReconciliationRow, false);
+      }
+
+      // Somebody else got there first. Theirs stands; this one does not
+      // overwrite it, and does not pretend to have written it.
+      const winner = await readExisting(client, scope, mutationReceiptId);
+      await client.query("COMMIT");
+      if (winner === undefined) {
+        throw new Error(
+          `reconciliation for ${mutationReceiptId} neither inserted nor readable`,
+        );
+      }
+      return fromRow(winner, true);
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Reconcile every unresolved mutation currently visible. */
+  async function reconcileAll(limit = 100): Promise<MemoryReconciliation[]> {
+    const unresolved = await findUnresolved(limit);
+    const results: MemoryReconciliation[] = [];
+    for (const item of unresolved) {
+      // Sequential on purpose: each takes a transaction and an advisory lock,
+      // and a batch that opened one connection per mutation would exhaust a
+      // small pool exactly when the system is already unhealthy.
+      results.push(await reconcile(item));
+    }
+    return results;
+  }
+
+  async function readReconciliation(
+    scope: MemoryReconciliationScope,
+    mutationReceiptId: string,
+  ): Promise<MemoryReconciliation | null> {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await enterRole(client);
+      const row = await readExisting(client, scope, mutationReceiptId);
+      await client.query("COMMIT");
+      return row === undefined ? null : fromRow(row, true);
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  return { findUnresolved, reconcile, reconcileAll, readReconciliation };
+}

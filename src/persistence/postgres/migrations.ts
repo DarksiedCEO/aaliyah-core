@@ -3159,6 +3159,107 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       END;
       $fn$`,
   },
+  {
+    // ------------------------------------------------------------------
+    // RECONCILIATION IS A SEPARATE ARTEFACT, BECAUSE A RECEIPT CANNOT BE
+    // REWRITTEN.
+    //
+    // `memory_mutation_receipts` is UNIQUE on
+    // (tenant, workspace, mutation_receipt_id, phase) and carries an
+    // append-only trigger. Once a mutation has emitted its terminal
+    // UNKNOWN_PENDING_RECONCILIATION row, there is no second terminal row to
+    // append and no UPDATE to perform. That is deliberate — a receipt that
+    // could be revised is not evidence — and it is why reconciliation records
+    // its verdict HERE instead. The contract already points at this artefact:
+    // every unknown outcome carries a `reconciliationRef`.
+    //
+    // WHAT MAKES THE VERDICT DETERMINATE. The pending receipt is written on
+    // the mutation's own transaction, immediately before COMMIT. So a durable
+    // pending row is itself proof the transaction committed, and its absence
+    // is proof the transaction did not. Reconciliation is therefore a reading
+    // of authoritative state, never an inference from timing or a retry that
+    // hopes to observe the same thing twice.
+    //
+    // THE RECONCILER CANNOT MUTATE, AND THAT IS ENFORCED RATHER THAN
+    // PROMISED. `aaliyah_memory_reconciler` is granted SELECT on the evidence
+    // tables and INSERT on this one. It holds no INSERT on
+    // memory_record_versions, no INSERT on memory_mutation_receipts, and no
+    // UPDATE on the nonce or receipt consumption columns. "Reconciliation
+    // never produces a duplicate mutation" is thus a privilege, not a comment:
+    // a reconciler that tried would be refused by PostgreSQL.
+    //
+    // UNIQUE (tenant, workspace, mutation_receipt_id) is what makes retries
+    // idempotent — a second reconciliation of the same mutation is refused by
+    // the database, so a duplicate worker, a restarted worker and a stale
+    // worker all converge on one verdict instead of three.
+    // ------------------------------------------------------------------
+    id: "040_memory_reconciliation",
+    sql: `CREATE TABLE IF NOT EXISTS memory_reconciliations (
+      id bigserial PRIMARY KEY,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      principal_id text NOT NULL,
+      user_id text NOT NULL,
+      mutation_receipt_id text NOT NULL,
+      authorization_id text NOT NULL,
+      action text NOT NULL,
+      target_record_id text NOT NULL,
+      verdict text NOT NULL,
+      observed_version integer,
+      observed_content_digest text,
+      reconciled_at timestamptz NOT NULL,
+      evidence jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT memory_reconciliations_once
+        UNIQUE (tenant_id, workspace_id, mutation_receipt_id),
+      CONSTRAINT memory_reconciliations_verdict_domain CHECK (
+        verdict IN ('COMMITTED_CONFIRMED','COMMITTED_DIVERGED',
+                    'NOT_COMMITTED','IMPOSSIBLE_STATE')),
+      -- A committed verdict MUST name what it observed. A verdict of
+      -- "committed" with nothing observed is the ambiguity it claims to have
+      -- resolved, wearing a resolved label.
+      CONSTRAINT memory_reconciliations_committed_observes CHECK (
+        (verdict IN ('COMMITTED_CONFIRMED','COMMITTED_DIVERGED'))
+          = (observed_version IS NOT NULL AND observed_content_digest IS NOT NULL)),
+      -- And a NOT_COMMITTED verdict must observe NOTHING, so the two cannot
+      -- be filed with the same evidence.
+      CONSTRAINT memory_reconciliations_not_committed_observes_nothing CHECK (
+        verdict <> 'NOT_COMMITTED'
+          OR (observed_version IS NULL AND observed_content_digest IS NULL)),
+      CONSTRAINT memory_reconciliations_evidence_object CHECK (
+        jsonb_typeof(evidence) = 'object'),
+      CONSTRAINT memory_reconciliations_receipt_binding CHECK (
+        evidence ->> 'mutationReceiptId' = mutation_receipt_id),
+      CONSTRAINT memory_reconciliations_authorization_binding CHECK (
+        evidence ->> 'authorizationId' = authorization_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_reconciliations_target
+      ON memory_reconciliations (tenant_id, workspace_id, target_record_id, id DESC);
+    DROP TRIGGER IF EXISTS memory_reconciliations_append_only
+      ON memory_reconciliations;
+    CREATE TRIGGER memory_reconciliations_append_only
+      BEFORE UPDATE OR DELETE ON memory_reconciliations
+      FOR EACH ROW EXECUTE FUNCTION aaliyah_memory_forbid_row_rewrite();
+    DO $do$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aaliyah_memory_reconciler') THEN
+          CREATE ROLE aaliyah_memory_reconciler NOLOGIN;
+        END IF;
+      END
+      $do$;
+    GRANT SELECT ON
+      memory_record_versions,
+      memory_authorization_receipts,
+      memory_authorization_nonces,
+      memory_mutation_receipts,
+      memory_reconciliations
+      TO aaliyah_memory_reconciler;
+    GRANT INSERT ON memory_reconciliations TO aaliyah_memory_reconciler;
+    GRANT USAGE, SELECT ON SEQUENCE memory_reconciliations_id_seq
+      TO aaliyah_memory_reconciler;
+    GRANT SELECT ON memory_reconciliations
+      TO aaliyah_memory_reader, aaliyah_memory_mutator`,
+  },
 ];
 
 export async function runMailMigrations(pool: Pool): Promise<void> {
