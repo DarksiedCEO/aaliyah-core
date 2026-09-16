@@ -3048,6 +3048,117 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       END;
       $fn$`,
   },
+  {
+    // ------------------------------------------------------------------
+    // GENESIS HAS AN OWNER, AND THE DATABASE IS WHAT SAYS SO.
+    //
+    // Found by an independent security review of the `create` operation and
+    // reproduced on a live PostgreSQL 16 using the least-privilege
+    // `aaliyah_memory_mutator` role — the role the store itself runs as.
+    //
+    // Migration 034 pins ownership CONTINUITY: version N+1 may not change
+    // principal or user from version N. That check sits on the path taken
+    // when a prior version is found, so version 1 never reaches it. The
+    // witness — `aaliyah_memory_spent_nonce` plus the record id the guard
+    // adds — resolves on tenant, authorization and receipt, and says nothing
+    // about workspace, principal or user.
+    //
+    // The consequence, executed: a holder of the mutation role and ONE
+    // legitimately issued `create` authorization for its OWN scope spends
+    // that authorization and writes version 1 under somebody else's
+    // principal and user, in a different workspace. The victim's own
+    // `retrieve` then hands back attacker-chosen content as the victim's
+    // record, and an ordinary protocol `correct()` over it succeeds, so the
+    // forged root becomes an indistinguishable, digest-linked, receipted
+    // chain. The identical forgery at version 2 is refused by 034.
+    //
+    // Every other ownership control in this module has a database twin,
+    // explicitly for writers that never come through the store. Genesis had
+    // only the application-side argument that the owner of a genesis IS the
+    // authorization's scope. This is what makes that sentence enforceable.
+    //
+    // Read from `memory_authorization_receipts`, which already carries all
+    // four dimensions NOT NULL, so this needs no new column and no change to
+    // what an issuer writes.
+    // ------------------------------------------------------------------
+    id: "039_memory_genesis_owner_binding",
+    sql: `CREATE OR REPLACE FUNCTION public.aaliyah_memory_record_version_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        witnessed boolean;
+        prior public.memory_record_versions%ROWTYPE;
+      BEGIN
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.aaliyah_memory_spent_nonce(
+                   NEW.tenant_id, NEW.authorization_id,
+                   NEW.mutation_receipt_id) AS n
+           WHERE n.target_record_id = NEW.record_id
+        ) INTO witnessed;
+        IF NOT witnessed THEN
+          RAISE EXCEPTION
+            'aaliyah memory: no consumed authorization witnesses this record version'
+            USING ERRCODE = 'check_violation';
+        END IF;
+
+        SELECT * INTO prior
+          FROM public.memory_record_versions AS v
+         WHERE v.tenant_id = NEW.tenant_id
+           AND v.workspace_id = NEW.workspace_id
+           AND v.record_id = NEW.record_id
+           AND v.id <> NEW.id
+         ORDER BY v.version DESC
+         LIMIT 1;
+
+        IF NOT FOUND THEN
+          IF NEW.version <> 1 THEN
+            RAISE EXCEPTION
+              'aaliyah memory: a record chain must begin at version 1'
+              USING ERRCODE = 'check_violation';
+          END IF;
+          -- THE GENESIS OWNER IS THE AUTHORIZATION'S OWNER. All four
+          -- dimensions in one predicate: a partial match is a mismatch, and
+          -- splitting them here would only produce three ways to say the
+          -- same refusal.
+          PERFORM 1
+            FROM public.memory_authorization_receipts AS a
+           WHERE a.authorization_id = NEW.authorization_id
+             AND a.tenant_id = NEW.tenant_id
+             AND a.workspace_id = NEW.workspace_id
+             AND a.principal_id = NEW.principal_id
+             AND a.user_id = NEW.user_id;
+          IF NOT FOUND THEN
+            RAISE EXCEPTION
+              'aaliyah memory: a record chain must begin under the scope its authorization names'
+              USING ERRCODE = 'check_violation';
+          END IF;
+          RETURN NULL;
+        END IF;
+
+        IF NEW.version <> prior.version + 1 THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a record version must be exactly one past the head'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.predecessor_digest IS DISTINCT FROM prior.content_digest THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a record version must link to the head content digest'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.principal_id <> prior.principal_id
+           OR NEW.user_id <> prior.user_id THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a record chain may not change principal or user'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$`,
+  },
 ];
 
 export async function runMailMigrations(pool: Pool): Promise<void> {

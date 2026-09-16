@@ -966,8 +966,20 @@ export function createPostgresTrustedMemoryStore(
         // record does not exist, so there is no prior owner to continue. The
         // owner of a genesis IS the authorization's scope, and all four of
         // its dimensions were compared against the AUTHENTICATED actor above,
-        // each in its own statement. Migration 034 pins the continuity from
-        // version 1 onward for writers that never come through here.
+        // each in its own statement.
+        //
+        // THAT SENTENCE WAS AN UNENFORCED CLAIM WHEN IT WAS FIRST WRITTEN,
+        // and an independent security review executed the consequence. The
+        // comment here used to cite migration 034, which pins ownership
+        // CONTINUITY — version N+1 may not change principal or user from
+        // version N — on the path taken when a prior version is found. A
+        // genesis never reaches it. So the mutation role, holding one
+        // legitimately issued `create` authorization for its own scope, wrote
+        // version 1 under another principal and user in another workspace,
+        // and the victim's own reads returned it. Migration 039 is what makes
+        // the claim true: it binds a genesis row's workspace, principal and
+        // user to the authorization its id resolves to, in the database,
+        // where it binds writers that never come through this function.
         if (head !== null) throw new MutationAborted("head_mismatch");
       } else {
         if (head === null) throw new MutationAborted("head_mismatch");

@@ -374,6 +374,44 @@ async function witnessAppend(input: {
       input.recordId ?? RECORD_ID,
     ],
   );
+  // THE AUTHORIZATION THAT WITNESSES A GENESIS MUST NAME ITS SCOPE.
+  //
+  // Migration 039 binds version 1's (tenant, workspace, principal, user) to
+  // the receipt its authorization id resolves to. Seeding a chain root with a
+  // spent nonce and no stored authorization is exactly the shape the security
+  // review forged, so the fixture issues the receipt too rather than writing
+  // rows the protocol could not have written.
+  await runAs(
+    "aaliyah_memory_issuer",
+    `INSERT INTO memory_authorization_receipts
+       (tenant_id, workspace_id, principal_id, user_id, authorization_id,
+        action, target_record_id, binding_digest, issued_at, expires_at,
+        revoked_at, consumed_at, payload)
+     VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,$6::text,
+             $7::text,$8::text,
+             now() - interval '1 minute', now() + interval '1 hour',
+             NULL, NULL,
+             jsonb_build_object(
+               'authorizationId', $5::text,
+               'action', $6::text,
+               'targetRecordId', $7::text,
+               'scope', jsonb_build_object('tenantId',$1::text,
+                                           'workspaceId',$2::text,
+                                           'principalId',$3::text,
+                                           'userId',$4::text),
+               'nonce', jsonb_build_object('bindingDigest',$8::text)))
+     ON CONFLICT DO NOTHING`,
+    [
+      scope.tenantId,
+      scope.workspaceId,
+      scope.principalId,
+      scope.userId,
+      input.authorizationId,
+      input.action ?? "correct",
+      input.recordId ?? RECORD_ID,
+      bindingDigest,
+    ],
+  );
   await runAs(
     "aaliyah_memory_mutator",
     `UPDATE memory_authorization_nonces
@@ -3165,6 +3203,44 @@ async function witnessAppendInWindow(input: {
       input.recordId ?? RECORD_ID,
     ],
   );
+  // THE AUTHORIZATION THAT WITNESSES A GENESIS MUST NAME ITS SCOPE.
+  //
+  // Migration 039 binds version 1's (tenant, workspace, principal, user) to
+  // the receipt its authorization id resolves to. Seeding a chain root with a
+  // spent nonce and no stored authorization is exactly the shape the security
+  // review forged, so the fixture issues the receipt too rather than writing
+  // rows the protocol could not have written.
+  await runAs(
+    "aaliyah_memory_issuer",
+    `INSERT INTO memory_authorization_receipts
+       (tenant_id, workspace_id, principal_id, user_id, authorization_id,
+        action, target_record_id, binding_digest, issued_at, expires_at,
+        revoked_at, consumed_at, payload)
+     VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,$6::text,
+             $7::text,$8::text,
+             now() - interval '1 minute', now() + interval '1 hour',
+             NULL, NULL,
+             jsonb_build_object(
+               'authorizationId', $5::text,
+               'action', $6::text,
+               'targetRecordId', $7::text,
+               'scope', jsonb_build_object('tenantId',$1::text,
+                                           'workspaceId',$2::text,
+                                           'principalId',$3::text,
+                                           'userId',$4::text),
+               'nonce', jsonb_build_object('bindingDigest',$8::text)))
+     ON CONFLICT DO NOTHING`,
+    [
+      SCOPE.tenantId,
+      SCOPE.workspaceId,
+      SCOPE.principalId,
+      SCOPE.userId,
+      input.authorizationId,
+      input.action ?? "correct",
+      input.recordId ?? RECORD_ID,
+      bindingDigest,
+    ],
+  );
   await runAs(
     "aaliyah_memory_mutator",
     `UPDATE memory_authorization_nonces
@@ -3800,4 +3876,182 @@ test("a create whose content does not digest to the authorized content is refuse
   assert.equal(result.rejection, "proposed_content_digest_mismatch");
   assert.equal(await countVersions(), 0);
   assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
+});
+
+// ---------------------------------------------------------------------------
+// W1BR-009 — THE GENESIS OWNER, PINNED IN THE DATABASE.
+//
+// Found by an independent security review of `create` and reproduced on this
+// database before migration 039 existed. Migration 034 pins ownership
+// CONTINUITY — version N+1 may not change principal or user from version N —
+// but that check is on the path taken when a prior version is FOUND, so
+// version 1 never reached it. The witness resolves on tenant, authorization
+// and receipt, and says nothing about workspace, principal or user.
+//
+// The executed consequence: a holder of `aaliyah_memory_mutator` and ONE
+// legitimately issued `create` authorization for its OWN scope spent that
+// authorization and wrote version 1 under another principal and user, in
+// another workspace. The victim's own `retrieve` returned attacker-chosen
+// content as the victim's record, and an ordinary `correct()` over it
+// succeeded — so the forged root became an indistinguishable, digest-linked,
+// receipted chain.
+//
+// These attack the DATABASE directly, under the least-privilege role, because
+// the store is not the only writer and an application-side argument is not a
+// control. The positive control at the end is what stops all of this from
+// passing against a guard that simply refuses every genesis.
+// ---------------------------------------------------------------------------
+
+/**
+ * Spend a legitimately issued `create` authorization and write version 1
+ * under `rowScope`, as `aaliyah_memory_mutator`. Returns the database's
+ * refusal, or null when the row landed.
+ */
+async function plantGenesis(input: {
+  authScope: MemoryScope;
+  rowScope: MemoryScope;
+  recordId: string;
+  mutationReceiptId: string;
+}): Promise<string | null> {
+  const content = { planted: "by-mutator" };
+  const receipt = await issue(
+    authorization({
+      action: "create",
+      scope: input.authScope,
+      targetRecordId: input.recordId,
+      expectedHead: NO_PRIOR_HEAD,
+      proposedContent: content,
+    }),
+  );
+  const digest = memoryContentDigest(content);
+  await runAs(
+    "aaliyah_memory_mutator",
+    `UPDATE memory_authorization_nonces
+        SET consumed_at = now(), consumed_by_mutation_receipt_id = $2
+      WHERE binding_digest = $1 AND consumed_at IS NULL`,
+    [receipt.nonce.bindingDigest, input.mutationReceiptId],
+  );
+  const payload = {
+    schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
+    recordId: input.recordId,
+    version: 1,
+    state: "active",
+    scope: input.rowScope,
+    content,
+    contentDigest: digest,
+    predecessorDigest: null,
+    authorizationId: receipt.authorizationId,
+    mutationReceiptId: input.mutationReceiptId,
+    createdAt: isoOffset(-1_000),
+  };
+  try {
+    await runAs(
+      "aaliyah_memory_mutator",
+      `INSERT INTO memory_record_versions
+         (tenant_id, workspace_id, principal_id, user_id, record_id, version,
+          state, content_digest, predecessor_digest, authorization_id,
+          mutation_receipt_id, payload)
+       VALUES ($1,$2,$3,$4,$5,1,'active',$6,NULL,$7,$8,$9)`,
+      [
+        input.rowScope.tenantId,
+        input.rowScope.workspaceId,
+        input.rowScope.principalId,
+        input.rowScope.userId,
+        input.recordId,
+        digest,
+        receipt.authorizationId,
+        input.mutationReceiptId,
+        JSON.stringify(payload),
+      ],
+    );
+    return null;
+  } catch (error) {
+    return (error as Error).message;
+  }
+}
+
+test("the mutation role cannot plant a genesis under another PRINCIPAL", async () => {
+  const refusal = await plantGenesis({
+    authScope: SCOPE,
+    rowScope: { ...SCOPE, principalId: "principal-victim" },
+    recordId: "record-plant-principal",
+    mutationReceiptId: "mutation.plant.principal",
+  });
+
+  assert.match(
+    refusal ?? "",
+    /must begin under the scope its authorization names/,
+  );
+  assert.equal(await countVersions("record-plant-principal"), 0);
+});
+
+test("the mutation role cannot plant a genesis under another USER", async () => {
+  const refusal = await plantGenesis({
+    authScope: SCOPE,
+    rowScope: { ...SCOPE, userId: "user-victim" },
+    recordId: "record-plant-user",
+    mutationReceiptId: "mutation.plant.user",
+  });
+
+  assert.match(
+    refusal ?? "",
+    /must begin under the scope its authorization names/,
+  );
+  assert.equal(await countVersions("record-plant-user"), 0);
+});
+
+test("the mutation role cannot plant a genesis in another WORKSPACE", async () => {
+  const refusal = await plantGenesis({
+    authScope: SCOPE,
+    rowScope: { ...SCOPE, workspaceId: "workspace-victim" },
+    recordId: "record-plant-workspace",
+    mutationReceiptId: "mutation.plant.workspace",
+  });
+
+  assert.match(
+    refusal ?? "",
+    /must begin under the scope its authorization names/,
+  );
+  assert.equal(await countVersions("record-plant-workspace"), 0);
+});
+
+test("a genesis whose row scope MATCHES its authorization is accepted, so the pin is not a blanket refusal", async () => {
+  // Without this, every test above would pass against a guard that refused
+  // every genesis ever written, including the store's own.
+  const refusal = await plantGenesis({
+    authScope: SCOPE,
+    rowScope: SCOPE,
+    recordId: "record-plant-legit",
+    mutationReceiptId: "mutation.plant.legit",
+  });
+
+  assert.equal(refusal, null);
+  assert.equal(await countVersions("record-plant-legit"), 1);
+});
+
+test("the ownership continuity pin at version 2 still refuses separately", async () => {
+  // The control migration 034 already carried. Kept alongside so a change that
+  // merged the two checks cannot silently drop this one.
+  const genesis = await seedGenesis({ note: "original" });
+  await witnessAppend({
+    authorizationId: "continuity-00000000000001",
+    mutationReceiptId: "mutation.continuity",
+    action: "correct",
+  });
+
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        `INSERT INTO memory_record_versions
+           (tenant_id, workspace_id, principal_id, user_id, record_id, version,
+            state, content_digest, predecessor_digest, authorization_id,
+            mutation_receipt_id, payload)
+         VALUES ($1,$2,'principal-victim','user-victim',$3,2,'active',$4,$5,
+                 'continuity-00000000000001','mutation.continuity','{}'::jsonb)`,
+        [SCOPE.tenantId, SCOPE.workspaceId, RECORD_ID, `sha256:${"f".repeat(64)}`, genesis],
+      ),
+    /may not change principal or user|authorization_binding/,
+  );
+  assert.equal(await countVersions(), 1);
 });

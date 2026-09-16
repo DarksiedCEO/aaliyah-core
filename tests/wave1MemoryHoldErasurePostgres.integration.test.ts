@@ -404,6 +404,44 @@ async function witnessAppend(input: {
       input.recordId,
     ],
   );
+  // THE AUTHORIZATION THAT WITNESSES A GENESIS MUST NAME ITS SCOPE.
+  //
+  // Migration 039 binds version 1's (tenant, workspace, principal, user) to
+  // the receipt its authorization id resolves to. Seeding a chain root with a
+  // spent nonce and no stored authorization is exactly the shape the security
+  // review forged, so the fixture issues the receipt too rather than writing
+  // rows the protocol could not have written.
+  await runAs(
+    "aaliyah_memory_issuer",
+    `INSERT INTO memory_authorization_receipts
+       (tenant_id, workspace_id, principal_id, user_id, authorization_id,
+        action, target_record_id, binding_digest, issued_at, expires_at,
+        revoked_at, consumed_at, payload)
+     VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,$6::text,
+             $7::text,$8::text,
+             now() - interval '1 minute', now() + interval '1 hour',
+             NULL, NULL,
+             jsonb_build_object(
+               'authorizationId', $5::text,
+               'action', $6::text,
+               'targetRecordId', $7::text,
+               'scope', jsonb_build_object('tenantId',$1::text,
+                                           'workspaceId',$2::text,
+                                           'principalId',$3::text,
+                                           'userId',$4::text),
+               'nonce', jsonb_build_object('bindingDigest',$8::text)))
+     ON CONFLICT DO NOTHING`,
+    [
+      scope.tenantId,
+      scope.workspaceId,
+      scope.principalId,
+      scope.userId,
+      input.authorizationId,
+      input.action,
+      input.recordId,
+      bindingDigest,
+    ],
+  );
   await runAs(
     "aaliyah_memory_mutator",
     `UPDATE memory_authorization_nonces

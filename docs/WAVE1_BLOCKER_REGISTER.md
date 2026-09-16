@@ -251,3 +251,124 @@ including a mutant that deleted 71 of 73 lines of runtime verification. Any
 entry above that is later claimed CLOSED must be closed with tests that
 **fail when the control is deleted** — not merely tests that pass while it is
 present. See founder authorization Part G, mandatory mutation targets.
+
+---
+
+## W1BR-009 — A genesis could be planted under another principal, user, or workspace
+
+- **Gate:** W1.3 · **Source:** Security, executed against `d6d77ad` on a live
+  PostgreSQL 16 under `aaliyah_memory_mutator` · **Severity:** CRITICAL
+- **Location:** `src/persistence/postgres/migrations.ts` migrations 034/038
+  (`aaliyah_memory_record_version_guard`, `aaliyah_memory_spent_nonce`)
+
+Migration 034 pins ownership **continuity**: version N+1 may not change
+principal or user from version N. That check sits on the branch taken when a
+prior version is found, so **version 1 never reached it**. The witness
+resolves on tenant, authorization and receipt, plus the record id the guard
+adds — nothing about workspace, principal or user.
+
+Executed: a holder of the mutation role and **one legitimately issued `create`
+authorization for its own scope** spent that authorization and wrote version 1
+under another principal and user, in another workspace.
+
+```sql
+SET LOCAL ROLE "aaliyah_memory_mutator";
+UPDATE memory_authorization_nonces SET consumed_at=now(),
+       consumed_by_mutation_receipt_id='m.poc' WHERE binding_digest=$own;
+INSERT INTO memory_record_versions (..., principal_id, user_id, ...)
+VALUES (..., 'principal-victim', 'user-victim', ...);   -- ACCEPTED
+```
+
+The victim's own `retrieve` returned attacker-chosen content as the victim's
+record, and an ordinary protocol `correct()` over it succeeded — so the forged
+root became an indistinguishable, digest-linked, receipted chain. The identical
+forgery at version 2 was refused by 034.
+
+**Provenance:** inherited. `migrations.ts` is byte-identical at `8de7da9` and
+`d6d77ad`. The `create` operation did not introduce the gap; it converted
+genesis from "something privileged inserted" into a protocol operation whose
+safety argument was stated inline and **was not enforceable**.
+
+- **Disposition:** `CLOSED` by migration
+  `039_memory_genesis_owner_binding`, which binds a genesis row's
+  `(tenant, workspace, principal, user)` to the `memory_authorization_receipts`
+  row its `authorization_id` resolves to. No new column; the receipt already
+  carries all four NOT NULL.
+- **Falsification performed:** with 039 reverted in the database, the three
+  new attack tests fail and the positive control still passes; with 039
+  applied, all four pass. The pin is therefore not a blanket refusal.
+
+---
+
+## W1BR-010 — `create` is a cross-principal record-id existence oracle
+
+- **Gate:** W1.3 · **Source:** Security, executed against `d6d77ad` ·
+  **Severity:** LOW
+- **Location:** `src/persistence/postgres/wave1TrustedMemoryStore.ts`, the
+  CAS-on-absence head lookup
+
+The genesis CAS reads the head filtered by `(tenant, workspace, record_id)`
+only, so any head — owned by any principal in the workspace — refuses the
+genesis. `head_mismatch` versus success therefore discriminates whether a
+record id is taken by somebody else. The probe is free: consumption happens
+after the CAS, so an aborted attempt does not burn the nonce.
+
+Bounded: no content, digest or owner leaks (`retrieve` and `readHead` both
+answer null for the prober), nothing of the victim's is mutated, and the
+**equivalent oracle already exists on the unchanged `correct()` path**
+(`record_owner_mismatch` versus `head_mismatch`). `create` adds a cleaner
+signal, not a new capability.
+
+- **Disposition:** `OPEN` (residual, disclosed and bounded — not introduced by
+  W1.3, present on an existing action)
+- **Closure path:** return an indistinguishable rejection for "exists but not
+  yours" and "does not exist", or scope the CAS-on-absence lookup to all four
+  actor dimensions. **In tension** with the deliberate choice at the ownership
+  comparison not to filter the head lookup, which exists so a takeover is
+  distinguishable from a `head_mismatch` and the control stays killable. The
+  tradeoff should be decided explicitly, not drifted into.
+
+---
+
+## W1BR-011 — Unresolved `create` attempts are an unbounded durable-write primitive
+
+- **Gate:** W1.3 · **Source:** Security, executed against `d6d77ad` ·
+  **Severity:** LOW
+- **Location:** `src/persistence/postgres/wave1TrustedMemoryStore.ts`,
+  `auditUnresolvedAttempt`
+
+**Introduced by W1.3.** For non-create actions the function returns early when
+no head is observable, so a sweep against unreachable ids writes zero rows. For
+`create`, `fromHead` is the constant `no_prior_version`, so a row is always
+written. Executed: 100 `create()` calls with valid-shaped but nonexistent
+authorization ids, by a caller holding no authorizations, produced 100 durable
+rows in 160ms; the same 100 `correct()` calls produced 0.
+
+The audit widening itself is intended and disclosed — probing ids that do not
+exist is exactly what a genesis sweep looks like, and it was previously
+unaudited. The **denial-of-service side was not disclosed**, and is here.
+`UNIQUE (tenant, workspace, mutation_receipt_id, phase)` does not bound it:
+`mutationReceiptId` is caller-supplied.
+
+Attribution holds — rows are filed under the authenticated actor's scope and
+could not be forged onto another party.
+
+- **Disposition:** `OPEN` (residual, disclosed, bounded and attributable)
+- **Closure path:** a per-actor rate limit upstream of the store, or a
+  retention policy on the audit partition of `memory_mutation_receipts`, with
+  the ceiling stated. Not a store-layer change.
+
+---
+
+## W1BR-012 — Retention obligations do not gate `create` (informational)
+
+- **Gate:** W1.3 · **Source:** Security, executed against `d6d77ad` ·
+  **Severity:** INFORMATIONAL
+
+The retention check sits inside the `delete` branch, so a `create` on a record
+id carrying an unexpired obligation succeeds. This is **not** a bypass: an
+obligation constrains destruction, a genesis over a non-existent id destroys
+nothing, and a genesis over an existing id is refused by the CAS.
+
+- **Disposition:** `BOUNDED_AND_PROVEN_NONBLOCKING` — recorded so the absence
+  is not later read as an oversight.
