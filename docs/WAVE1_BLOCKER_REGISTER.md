@@ -524,3 +524,49 @@ from an actual request is not yet wired.
 - **Closure path:** an inbound route that constructs the EA deps — including
   the memory service `src/server.ts` already builds — and calls the pipeline.
   That is W1.4 surface, not W1.3.
+
+---
+
+## W1BR-013 UPDATE — the CHECK-constraint destroyers
+
+The residual left open under W1BR-013 was: 67 of the CHECK constraints on the
+five memory tables had never been drop-tested, and 15 of 19 sampled survived.
+
+`tests/wave1MemoryConstraintDestroyersPostgres.integration.test.ts` now writes
+a row DIRECTLY, as the table owner, that is valid in every respect except the
+one constraint it names, and pins that constraint **by name** — a generic "it
+was refused" passes when a different constraint fires, which is exactly how a
+constraint appears covered while never having been exercised.
+
+**Verified by dropping all 81 CHECK constraints, one at a time**, restoring
+each afterwards, and running the suite against every drop:
+
+| Result | Count |
+| --- | --- |
+| Killed — the drop turns the suite red | **77** |
+| Survived | 4 |
+
+**The four survivors are one structural fact, not four gaps.**
+`<table>_payload_object` on `memory_record_versions`,
+`memory_authorization_receipts`, `memory_tombstones` and
+`memory_alias_bindings` cannot be violated in isolation: every payload binding
+reads `payload ->> 'x'`, which is NULL for an array or a scalar, so the
+bindings refuse a non-object payload before the object check is reached.
+Dropping any of the four changes nothing observable. They are reported as
+SURVIVING, not claimed as covered; a consolidated test proves the property
+that actually matters — a non-object payload lands on none of the four.
+
+Two preconditions the positive controls caught, which would otherwise have made
+every case in their table pass for the wrong reason:
+
+- `memory_tombstones_structural` is a BEFORE trigger requiring the target to
+  already be a deleted record, so **no** tombstone row reached the CHECK layer
+  at all. The cases run with it stood down and always restored; its own
+  behaviour is proven in the hold/erasure suite.
+- `memory_alias_bindings` carries a FOREIGN KEY onto the tenant's alias policy,
+  so without that row the base binding was refused by the FK and never reached
+  a CHECK.
+
+- **Disposition:** `CLOSED` for 77 of 81; the remaining 4 are
+  `BOUNDED_AND_PROVEN_NONBLOCKING` — structurally unreachable, disclosed, with
+  the property they exist to protect proven by other means.
