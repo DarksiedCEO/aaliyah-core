@@ -240,6 +240,39 @@ async function createRecord(
   return memoryContentDigest(content);
 }
 
+/**
+ * Issue an authorization and SPEND its nonce, without going through the store.
+ *
+ * A raw write needs a real witness, or migration 034's guard refuses it first
+ * and whatever control the test is actually aiming at is never reached. Two of
+ * these tests passed for exactly that wrong reason until a mutation sweep of
+ * the triggers showed the trigger could be dropped with nothing going red.
+ */
+async function spendAuthorization(input: {
+  action: MemoryAction;
+  targetRecordId: string;
+  expectedHead: MemoryExpectedHead;
+  proposedContent: unknown;
+  mutationReceiptId: string;
+}): Promise<string> {
+  const receipt = await issue(
+    authorization({
+      action: input.action,
+      targetRecordId: input.targetRecordId,
+      expectedHead: input.expectedHead,
+      proposedContent: input.proposedContent,
+    }),
+  );
+  await runAs(
+    "aaliyah_memory_mutator",
+    `UPDATE memory_authorization_nonces
+        SET consumed_at = now(), consumed_by_mutation_receipt_id = $2
+      WHERE binding_digest = $1 AND consumed_at IS NULL`,
+    [receipt.nonce.bindingDigest, input.mutationReceiptId],
+  );
+  return receipt.authorizationId;
+}
+
 function mergeOrder(survivorRecordId: string, reason = "duplicate_participant") {
   return {
     schemaVersion: MEMORY_IDENTITY_MERGE_ORDER_SCHEMA_VERSION,
@@ -412,8 +445,22 @@ test("the DATABASE refuses a version on a merged-away record, for writers that n
     order: mergeOrder(ALICE),
     mutationReceiptId: "mutation.merge.dbfreeze",
   });
-
   const frozenHead = await store().readHead(SCOPE, ALIAS_OF_ALICE);
+  const next = { name: "A. Smith", note: "raw edit" };
+  // A REAL witness, so migration 034's guard is satisfied and the freeze is
+  // the only control left that can refuse this.
+  const authorizationId = await spendAuthorization({
+    action: "correct",
+    targetRecordId: ALIAS_OF_ALICE,
+    expectedHead: {
+      kind: "version",
+      version: 2,
+      contentDigest: frozenHead!.contentDigest,
+    },
+    proposedContent: next,
+    mutationReceiptId: "mutation.raw.frozen",
+  });
+
   await assert.rejects(
     () =>
       runAs(
@@ -423,12 +470,11 @@ test("the DATABASE refuses a version on a merged-away record, for writers that n
             state, content_digest, predecessor_digest, authorization_id,
             mutation_receipt_id, payload)
          VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,3,'active',
-                 $6::text,$7::text,'raw-auth-00000000000000001',
-                 'mutation.raw.frozen',
+                 $6::text,$7::text,$8::text,'mutation.raw.frozen',
                  jsonb_build_object(
                    'recordId',$5::text,'version','3','state','active',
                    'contentDigest',$6::text,'predecessorDigest',$7::text,
-                   'authorizationId','raw-auth-00000000000000001',
+                   'authorizationId',$8::text,
                    'mutationReceiptId','mutation.raw.frozen',
                    'scope', jsonb_build_object('tenantId',$1::text,
                                                'workspaceId',$2::text,
@@ -440,13 +486,75 @@ test("the DATABASE refuses a version on a merged-away record, for writers that n
           SCOPE.principalId,
           SCOPE.userId,
           ALIAS_OF_ALICE,
-          `sha256:${"a".repeat(64)}`,
+          memoryContentDigest(next),
           frozenHead!.contentDigest,
+          authorizationId,
         ],
       ),
-    /merged into another accepts no further versions|no consumed authorization witnesses/,
+    // PINNED to the freeze alone. This assertion previously also accepted the
+    // witness guard's message, so dropping the freeze trigger changed nothing
+    // and the test still passed.
+    /merged into another accepts no further versions/,
   );
   assert.equal(await countVersions(ALIAS_OF_ALICE), 2);
+});
+
+test("the DATABASE refuses a SECOND merge edge for one record, even with a valid witness", async () => {
+  // The app-level freeze refuses this before the index is reached, so the
+  // unique index had no test at all until the sweep said so. This goes around
+  // the store entirely.
+  await createRecord(ALICE, { name: "Alice" });
+  await createRecord("record-identity-third", { name: "Third" });
+  const absorbed = await createRecord(ALIAS_OF_ALICE, { name: "A. Smith" });
+  await runIdentity({
+    action: "merge_identity",
+    targetRecordId: ALIAS_OF_ALICE,
+    headVersion: 1,
+    headDigest: absorbed,
+    order: mergeOrder(ALICE),
+    mutationReceiptId: "mutation.merge.first",
+  });
+  const head = await store().readHead(SCOPE, ALIAS_OF_ALICE);
+  const authorizationId = await spendAuthorization({
+    action: "merge_identity",
+    targetRecordId: ALIAS_OF_ALICE,
+    expectedHead: {
+      kind: "version",
+      version: 2,
+      contentDigest: head!.contentDigest,
+    },
+    proposedContent: mergeOrder("record-identity-third"),
+    mutationReceiptId: "mutation.merge.rawsecond",
+  });
+
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        `INSERT INTO memory_identity_edges
+           (tenant_id, workspace_id, principal_id, user_id, kind,
+            from_record_id, to_record_id, from_version, authorization_id,
+            mutation_receipt_id, reason, reason_evidence_ref, effective_at,
+            payload)
+         VALUES ($1::text,$2::text,$3::text,$4::text,'merged_into',
+                 $5::text,$6::text,3,$7::text,'mutation.merge.rawsecond',
+                 'duplicate_participant','matter:identity-merge/0002', now(),
+                 jsonb_build_object('kind','merged_into',
+                   'fromRecordId',$5::text,'toRecordId',$6::text,
+                   'authorizationId',$7::text))`,
+        [
+          SCOPE.tenantId,
+          SCOPE.workspaceId,
+          SCOPE.principalId,
+          SCOPE.userId,
+          ALIAS_OF_ALICE,
+          "record-identity-third",
+          authorizationId,
+        ],
+      ),
+    /memory_identity_edges_merged_once/,
+  );
+  assert.equal((await edgesFor(ALIAS_OF_ALICE)).length, 1);
 });
 
 test("a record can be merged away at most once", async () => {
