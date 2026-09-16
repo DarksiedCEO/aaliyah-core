@@ -207,6 +207,25 @@ export type TrustedMemoryRecord = {
 };
 
 export interface TrustedMemoryStore {
+  /**
+   * BRING A RECORD INTO EXISTENCE, UNDER THE SAME PROTOCOL AS EVERY OTHER
+   * MUTATION.
+   *
+   * Genesis used to be the one mutation with no protocol: a record appeared
+   * because something privileged inserted version 1 directly, so the chain
+   * every later control compares against was founded on an unauthorized,
+   * unreceipted, un-read-back write.
+   *
+   * The compare-and-swap here asserts ABSENCE. The authorization must carry
+   * `no_prior_version` — not a sentinel version 0, which is a number a caller
+   * could supply — and any existing head refuses it, including a `deleted`
+   * one. Returning a deleted record to service is `restore`, which is a
+   * separate authority over a chain that still exists; `create` is only ever
+   * the first link.
+   */
+  create(
+    request: TrustedMemoryMutationRequest,
+  ): Promise<TrustedMemoryMutationResult>;
   correct(
     request: TrustedMemoryMutationRequest,
   ): Promise<TrustedMemoryMutationResult>;

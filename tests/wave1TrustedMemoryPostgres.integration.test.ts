@@ -7,6 +7,7 @@ import {
   MemoryAuthorizationReceiptSchema,
   WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION,
   memoryAuthorizationNonce,
+  type MemoryAction,
   type MemoryAuthorizationReceipt,
   type MemoryExpectedHead,
   type MemoryScope,
@@ -187,7 +188,7 @@ function isoOffset(ms: number): string {
 
 /** Build a structurally valid, correctly nonce-bound authorization receipt. */
 function authorization(input: {
-  action: "correct" | "delete";
+  action: MemoryAction;
   scope?: MemoryScope;
   targetRecordId?: string;
   expectedHead: MemoryExpectedHead;
@@ -3450,4 +3451,353 @@ test("B3 H-1 a terminal COMMITTED outcome requires the pending receipt it conclu
     { phase: "pending", status: "UNKNOWN_PENDING_RECONCILIATION" },
     { phase: "terminal", status: "COMMITTED_AND_READ_BACK" },
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// W1.3 — `create`: GENESIS THROUGH THE PROTOCOL.
+//
+// Until now every version 1 in this suite was seeded by `seedGenesis`, which
+// is a privileged raw INSERT under the owner role. That helper's own comment
+// said it plainly: "`create` is a later assignment". So the store could append
+// to a chain it had no authorized way to start, and the only way a record came
+// into existence was a path that skipped authorization, CAS, consumption, the
+// receipt and the read-back entirely.
+//
+// `create` is the same protocol as every other action, with one difference
+// that is the whole point: the compare-and-swap asserts ABSENCE. The
+// authorization must carry `no_prior_version`, and a head that exists — active
+// OR deleted — refuses it.
+// ---------------------------------------------------------------------------
+
+const NO_PRIOR_HEAD: MemoryExpectedHead = { kind: "no_prior_version" };
+
+test("a create commits version 1, reads back independently, and only then reports verified", async () => {
+  const content = { note: "first", revision: 1 };
+  const receipt = await issue(
+    authorization({
+      action: "create",
+      expectedHead: NO_PRIOR_HEAD,
+      proposedContent: content,
+    }),
+  );
+
+  const result = await store().create({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: content,
+    mutationReceiptId: "mutation.create.001",
+  });
+
+  assert.equal(result.rejection, null);
+  assert.equal(result.verified, true);
+  assert.ok(
+    result.receipt &&
+      result.receipt.outcome.status === "COMMITTED_AND_READ_BACK",
+  );
+  assert.equal(result.receipt.outcome.resultingHead.version, 1);
+  assert.equal(result.receipt.outcome.readBackSource, "independent_session");
+  assert.equal(
+    result.receipt.outcome.readBackDigest,
+    memoryContentDigest(content),
+  );
+  // The receipt records the head it expected to find, and for a genesis that
+  // is the absence itself — not a sentinel version 0 an attacker could supply.
+  assert.equal(result.receipt.fromHead.kind, "no_prior_version");
+
+  const head = await store().readHead(SCOPE, RECORD_ID);
+  assert.equal(head?.version, 1);
+  assert.equal(head?.state, "active");
+  assert.equal(head?.contentDigest, memoryContentDigest(content));
+  // Version 1 has no predecessor. A digest here would be a forged chain link.
+  assert.equal(head?.predecessorDigest, null);
+
+  assert.deepEqual(await receiptStatuses("mutation.create.001"), [
+    { phase: "pending", status: "UNKNOWN_PENDING_RECONCILIATION" },
+    { phase: "terminal", status: "COMMITTED_AND_READ_BACK" },
+  ]);
+  assert.notEqual(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
+});
+
+test("a create is refused when the record already exists, and the existing head is untouched", async () => {
+  const genesis = await seedGenesis({ note: "already here", revision: 1 });
+  const content = { note: "second genesis", revision: 1 };
+  const receipt = await issue(
+    authorization({
+      action: "create",
+      expectedHead: NO_PRIOR_HEAD,
+      proposedContent: content,
+    }),
+  );
+
+  const result = await store().create({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: content,
+    mutationReceiptId: "mutation.create.dup",
+  });
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "head_mismatch");
+
+  // The refusal is not a silent no-op: the record still holds exactly what it
+  // held, at the version it held it.
+  const head = await store().readHead(SCOPE, RECORD_ID);
+  assert.equal(head?.version, 1);
+  assert.equal(head?.contentDigest, genesis);
+  assert.equal(await countVersions(), 1);
+});
+
+test("a create cannot resurrect a DELETED record — that is what restore is for", async () => {
+  await seedGenesis({ note: "doomed", revision: 1 });
+  const order = {
+    schemaVersion: MEMORY_DELETION_ORDER_SCHEMA_VERSION,
+    reason: "subject_erasure_request" as const,
+    reasonEvidenceRef: "matter:erasure-request/create-0001",
+  };
+  const deleteReceipt = await issue(
+    authorization({
+      action: "delete",
+      expectedHead: headOf(1, memoryContentDigest({ note: "doomed", revision: 1 })),
+      proposedContent: order,
+    }),
+  );
+  const deleted = await store().delete({
+    actor: SCOPE,
+    authorizationId: deleteReceipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: order,
+    mutationReceiptId: "mutation.create.predelete",
+  });
+  assert.equal(deleted.verified, true);
+
+  // A deleted head is still a head. If `create` looked only for an ACTIVE
+  // record it would append a fresh version 1 alongside a tombstoned chain and
+  // hand back a record whose history says it was destroyed.
+  const content = { note: "reborn", revision: 1 };
+  const receipt = await issue(
+    authorization({
+      action: "create",
+      expectedHead: NO_PRIOR_HEAD,
+      proposedContent: content,
+    }),
+  );
+  const result = await store().create({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: content,
+    mutationReceiptId: "mutation.create.reborn",
+  });
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "head_mismatch");
+  const head = await store().readHead(SCOPE, RECORD_ID);
+  assert.equal(head?.state, "deleted");
+});
+
+// THE CONTRACT MAKES THE MISMATCH UNCONSTRUCTIBLE, SO THIS ATTACKS THE ROW.
+//
+// `MemoryAuthorizationReceiptSchema` refines a biconditional: an authorization
+// expects `no_prior_version` if and only if its action is `create`. A caller
+// therefore CANNOT issue a create grant that names a concrete predecessor —
+// the schema refuses to build it.
+//
+// That leaves exactly one way to present the store with a crossed pair: rewrite
+// the stored payload after issuance, which is the threat the store's own
+// expected-head branch exists for. The refusal lands as `authorization_malformed`
+// rather than `authorization_expected_head_mismatch`, because the schema parse
+// runs first and catches it. Asserted as observed, not as hoped.
+//
+// DISCLOSED CONSEQUENCE: the store's `expectedHeadKindFor` comparison inside
+// `mutate` is therefore UNREACHABLE — `stored.action === action` is checked
+// above it, and the biconditional then fixes the expected-head kind. It is a
+// backstop against the refinement being weakened, not a tested control, and it
+// is reported as a surviving mutant rather than claimed as covered.
+test("a stored create authorization rewritten to name a version is refused as malformed", async () => {
+  const content = { note: "first", revision: 1 };
+  const receipt = await issue(
+    authorization({
+      action: "create",
+      expectedHead: NO_PRIOR_HEAD,
+      proposedContent: content,
+    }),
+  );
+  await adminPool.query(
+    `UPDATE memory_authorization_receipts
+        SET payload = jsonb_set(payload, '{expectedHead}', $2::jsonb)
+      WHERE authorization_id = $1`,
+    [
+      receipt.authorizationId,
+      JSON.stringify({
+        kind: "version",
+        version: 1,
+        contentDigest: memoryContentDigest({ note: "anything" }),
+      }),
+    ],
+  );
+
+  const result = await store().create({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: content,
+    mutationReceiptId: "mutation.create.wronghead",
+  });
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "authorization_malformed");
+  assert.equal(await countVersions(), 0);
+  // A malformed authorization must not spend the approver's token.
+  assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
+  // The attempt is still written down under the ACTOR's scope. For a `create`
+  // this row is reachable even though the record does not exist, because a
+  // genesis receipt's `fromHead` is a constant and needs nothing observed.
+  assert.deepEqual(await receiptStatuses("mutation.create.wronghead"), [
+    { phase: "terminal", status: "ABORTED_NO_MUTATION" },
+  ]);
+});
+
+test("a stored correct authorization rewritten to name no prior version is refused as malformed", async () => {
+  // The mirror, and it has to exist: admitting `no_prior_version` for `create`
+  // must not admit it for anything else.
+  const genesis = await seedGenesis({ note: "original", revision: 1 });
+  const content = { note: "corrected", revision: 2 };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, genesis),
+      proposedContent: content,
+    }),
+  );
+  await adminPool.query(
+    `UPDATE memory_authorization_receipts
+        SET payload = jsonb_set(payload, '{expectedHead}', $2::jsonb)
+      WHERE authorization_id = $1`,
+    [receipt.authorizationId, JSON.stringify({ kind: "no_prior_version" })],
+  );
+
+  const result = await store().correct({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: content,
+    mutationReceiptId: "mutation.create.mirror",
+  });
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "authorization_malformed");
+  assert.equal(await countVersions(), 1);
+  assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
+});
+
+test("a correct authorization cannot be spent as a create", async () => {
+  // A structurally PERFECT correct grant — the contract will not let it carry
+  // `no_prior_version`, so it names the head it was issued against — handed to
+  // the genesis call site. The action binding is what refuses it.
+  const genesis = await seedGenesis({ note: "original", revision: 1 });
+  const content = { note: "first", revision: 1 };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, genesis),
+      proposedContent: content,
+    }),
+  );
+
+  const result = await store().create({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: content,
+    mutationReceiptId: "mutation.create.substituted",
+  });
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "authorization_action_mismatch");
+  // The record is exactly as it was: no genesis was appended over it.
+  assert.equal(await countVersions(), 1);
+  // An action substitution must not spend the approver's token.
+  assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
+});
+
+test("a create authorization issued for another tenant cannot create here", async () => {
+  const content = { note: "first", revision: 1 };
+  const foreign: MemoryScope = { ...SCOPE, tenantId: "tenant-other" };
+  const receipt = await issue(
+    authorization({
+      action: "create",
+      scope: foreign,
+      expectedHead: NO_PRIOR_HEAD,
+      proposedContent: content,
+    }),
+  );
+
+  const result = await store().create({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: content,
+    mutationReceiptId: "mutation.create.tenant",
+  });
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "authorization_scope_mismatch");
+  assert.equal(await countVersions(), 0);
+});
+
+test("a create authorization is single-use: the replay is refused and no second version 1 appears", async () => {
+  const content = { note: "first", revision: 1 };
+  const receipt = await issue(
+    authorization({
+      action: "create",
+      expectedHead: NO_PRIOR_HEAD,
+      proposedContent: content,
+    }),
+  );
+  const first = await store().create({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: content,
+    mutationReceiptId: "mutation.create.once",
+  });
+  assert.equal(first.verified, true);
+
+  const replay = await store().create({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: content,
+    mutationReceiptId: "mutation.create.twice",
+  });
+
+  assert.equal(replay.verified, false);
+  assert.equal(replay.rejection, "authorization_already_consumed");
+  assert.equal(await countVersions(), 1);
+});
+
+test("a create whose content does not digest to the authorized content is refused", async () => {
+  const authorized = { note: "first", revision: 1 };
+  const receipt = await issue(
+    authorization({
+      action: "create",
+      expectedHead: NO_PRIOR_HEAD,
+      proposedContent: authorized,
+    }),
+  );
+
+  const result = await store().create({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: { note: "something nobody approved", revision: 1 },
+    mutationReceiptId: "mutation.create.digest",
+  });
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "proposed_content_digest_mismatch");
+  assert.equal(await countVersions(), 0);
+  assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
 });

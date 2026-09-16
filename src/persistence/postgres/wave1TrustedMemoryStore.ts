@@ -497,13 +497,29 @@ export function createPostgresTrustedMemoryStore(
     }
   }
 
+  /**
+   * THE EXPECTED-HEAD SHAPE THIS ACTION IS ALLOWED TO CARRY.
+   *
+   * `MemoryMutationReceiptSchema` refines a BICONDITIONAL: a receipt names
+   * `no_prior_version` if and only if its action is `create`. Stated once,
+   * here, because the three paths below all build receipts and a copy of this
+   * rule in each is three rules — and the one that drifts turns a refusal into
+   * an unparseable receipt, which is the same as no evidence at all.
+   */
+  function expectedHeadKindFor(action: MemoryAction): MemoryExpectedHead["kind"] {
+    return action === "create" ? "no_prior_version" : "version";
+  }
+
   async function finishUnknown(
     request: TrustedMemoryMutationRequest,
     action: MemoryAction,
     stored: MemoryAuthorizationReceipt | null,
     phase: MemoryMutationPhase,
   ): Promise<TrustedMemoryMutationResult> {
-    if (stored === null || stored.expectedHead.kind !== "version") {
+    if (
+      stored === null ||
+      stored.expectedHead.kind !== expectedHeadKindFor(action)
+    ) {
       return { verified: false, rejection: "unknown_outcome", receipt: null };
     }
     const at = new Date().toISOString();
@@ -547,15 +563,32 @@ export function createPostgresTrustedMemoryStore(
    * honest value for that field and no row is written, so enumeration against
    * record ids that do not exist for the actor is still unaudited here. That
    * is a narrower gap than the one it replaces and it is not closed.
+   *
+   * `create` IS THE EXCEPTION, AND IT NARROWS THAT GAP. A genesis receipt is
+   * required by the contract to carry `no_prior_version`, which is a CONSTANT:
+   * there is nothing to observe, so nothing to be unable to observe. An
+   * unresolved `create` is therefore audited whether or not the record exists,
+   * including the enumeration case the limit above describes — probing ids
+   * that are absent is exactly what a `create` sweep looks like.
    */
   async function auditUnresolvedAttempt(
     request: TrustedMemoryMutationRequest,
     action: MemoryAction,
   ): Promise<void> {
-    const head = await readHead(request.actor, request.recordId).catch(
-      () => null,
-    );
-    if (head === null) return;
+    let fromHead: MemoryExpectedHead;
+    if (action === "create") {
+      fromHead = { kind: "no_prior_version" };
+    } else {
+      const head = await readHead(request.actor, request.recordId).catch(
+        () => null,
+      );
+      if (head === null) return;
+      fromHead = {
+        kind: "version",
+        version: head.version,
+        contentDigest: head.contentDigest,
+      };
+    }
     const at = new Date().toISOString();
     const receipt = MemoryMutationReceiptSchema.parse({
       schemaVersion: "aaliyah.trusted-memory/v1",
@@ -565,11 +598,7 @@ export function createPostgresTrustedMemoryStore(
       action,
       scope: request.actor,
       targetRecordId: request.recordId,
-      fromHead: {
-        kind: "version",
-        version: head.version,
-        contentDigest: head.contentDigest,
-      },
+      fromHead,
       emittedAt: at,
       outcome: {
         status: "ABORTED_NO_MUTATION",
@@ -586,7 +615,10 @@ export function createPostgresTrustedMemoryStore(
     stored: MemoryAuthorizationReceipt | null,
     rejection: TrustedMemoryRejection,
   ): Promise<TrustedMemoryMutationResult> {
-    if (stored === null || stored.expectedHead.kind !== "version") {
+    if (
+      stored === null ||
+      stored.expectedHead.kind !== expectedHeadKindFor(action)
+    ) {
       // Not enough real stored state to fill a structurally valid receipt for
       // the CALLER. The attempt is still written down.
       await auditUnresolvedAttempt(request, action);
@@ -641,7 +673,7 @@ export function createPostgresTrustedMemoryStore(
   async function mutate(
     action: Extract<
       MemoryAction,
-      "correct" | "delete" | "restore" | "promote"
+      "create" | "correct" | "delete" | "restore" | "promote"
     >,
     request: TrustedMemoryMutationRequest,
     deletion: TrustedMemoryDeleteRequest | null = null,
@@ -669,7 +701,14 @@ export function createPostgresTrustedMemoryStore(
     let committedAt: string | null = null;
     let nextVersion = 0;
     let proposedDigest = "";
-    let predecessorDigest = "";
+    // Null is the GENESIS value, not "not yet known": version 1 has no
+    // predecessor, and writing a digest there would forge a chain link to a
+    // version that never existed.
+    let predecessorDigest: string | null = "";
+    // The head this mutation compared against, kept for the post-commit
+    // comparison and for the erasure sweep. Null for a `create`, which is
+    // the one action that expects to find nothing.
+    let priorHead: TrustedMemoryHead | null = null;
     let deletionOrder: ReturnType<typeof parseDeletionOrder> = null;
 
     const lockKey = [
@@ -736,7 +775,30 @@ export function createPostgresTrustedMemoryStore(
       if (stored.targetRecordId !== request.recordId) {
         throw new MutationAborted("authorization_target_mismatch");
       }
-      if (stored.expectedHead.kind !== "version") {
+      // A GENESIS NAMES THE ABSENCE IT EXPECTS; EVERY OTHER ACTION NAMES A
+      // CONCRETE PREDECESSOR. A `create` carrying a version would be a genesis
+      // grant with a compare-and-swap target, which is an approval that can be
+      // aimed at an existing chain. A `correct` carrying `no_prior_version`
+      // would have no CAS target at all.
+      //
+      // DISCLOSED UNREACHABLE BACKSTOP. No test in this repository can kill
+      // this branch, and the reason is structural rather than an oversight:
+      // `MemoryAuthorizationReceiptSchema` refines the same pair as a
+      // BICONDITIONAL, so a crossed authorization fails `safeParse` above and
+      // is refused as `authorization_malformed` before reaching here; and
+      // `stored.action !== action` is refused between the two, so by this line
+      // the stored action IS this action and the refinement has already fixed
+      // the expected-head kind. Kept because the property it states is the one
+      // the contract depends on, and a weakened refinement would otherwise
+      // leave nothing checking it in Core. Reported as a surviving mutant, not
+      // claimed as a tested control. The REACHABLE refusal is proven in
+      // "a stored create authorization rewritten to name a version is refused
+      // as malformed".
+      if (action === "create") {
+        if (stored.expectedHead.kind !== "no_prior_version") {
+          throw new MutationAborted("authorization_expected_head_mismatch");
+        }
+      } else if (stored.expectedHead.kind !== "version") {
         throw new MutationAborted("authorization_expected_head_mismatch");
       }
       const expectedHead = stored.expectedHead;
@@ -886,74 +948,109 @@ export function createPostgresTrustedMemoryStore(
         ],
       );
       const headRow = headResult.rows[0] as RecordRow | undefined;
-      if (!headRow) throw new MutationAborted("head_mismatch");
-      const head = headFromRow(headRow);
+      const head = headRow ? headFromRow(headRow) : null;
 
-      // ---- THE ACTOR MUST OWN THE RECORD IT IS MUTATING -----------------
-      // The four scope comparisons above are actor <-> AUTHORIZATION. They
-      // say nothing about the record. An authorization scoped to
-      // principal-attacker naming a record owned by principal-victim passed
-      // every one of them, overwrote the victim's content, changed the
-      // ownership columns mid-chain, and the post-commit read-back CONFIRMED
-      // the takeover because it compared the observed scope against the
-      // AUTHORIZATION rather than against the record that was there before.
-      //
-      // Deliberately read from the HEAD ROW and not from the CAS predicate:
-      // filtering the head lookup by principal and user would turn a takeover
-      // into an indistinguishable `head_mismatch` and leave these two
-      // comparisons with no reachable input, so no test could kill them.
-      // Migration 034 pins the same continuity for writers that never come
-      // through this function.
-      if (head.scope.principalId !== request.actor.principalId) {
-        throw new MutationAborted("record_owner_mismatch");
-      }
-      if (head.scope.userId !== request.actor.userId) {
-        throw new MutationAborted("record_owner_mismatch");
-      }
-
-      if (head.version !== expectedHead.version) {
-        throw new MutationAborted("head_mismatch");
-      }
-      // The PREDECESSOR digest. A forged one fails here even when the version
-      // happens to line up.
-      if (head.contentDigest !== expectedHead.contentDigest) {
-        throw new MutationAborted("head_mismatch");
-      }
-
-      // ---- RESTORATION IS A SEPARATE AUTHORITY --------------------------
-      // The contract binds the ACTION into the nonce, so a `delete` receipt
-      // relabelled as `restore` no longer matches its own token, and
-      // `stored.action !== action` above refuses a receipt handed to the
-      // wrong call site. These two statements are the STATE half: a restore
-      // only ever lifts a deleted head, and nothing but a restore may append
-      // onto one. Migration 037 pins exactly the same pair in the database,
-      // reading the action from the consumed nonce, for writers that never
-      // come through here.
-      if (action === "restore" && head.state !== "deleted") {
-        throw new MutationAborted("restore_head_not_deleted");
-      }
-      if (action !== "restore" && head.state === "deleted") {
-        throw new MutationAborted("record_deleted");
-      }
-
-      if (action === "delete") {
-        // The reason and the order reference are the APPROVER's, carried
-        // inside the content the authorization's digest binds. A caller
-        // cannot name a reason nobody approved.
+      if (action === "create") {
+        // ---- THE COMPARE-AND-SWAP IS AGAINST ABSENCE --------------------
         //
-        // Checked HERE, after ownership and the compare-and-swap, so that an
-        // attacker aiming a delete at somebody else's record is still told
-        // `record_owner_mismatch`: the more specific refusal must not be
-        // masked by a shape complaint about the attacker's own payload.
-        deletionOrder = parseDeletionOrder(request.proposedContent);
-        if (deletionOrder === null) {
-          throw new MutationAborted("deletion_order_malformed");
+        // Any head refuses the genesis, WHATEVER STATE IT IS IN. A `deleted`
+        // head is still a head: if this looked only for an `active` record, a
+        // destroyed record could be re-founded with a fresh version 1 sitting
+        // on top of its own tombstone, the erasure accounting would still
+        // describe a chain nobody could reach, and the record would read as
+        // though the destruction never happened. Returning a deleted record
+        // to service is `restore`, under its own authority, over the chain
+        // that is already there.
+        //
+        // There is no owner comparison here and there cannot be one: the
+        // record does not exist, so there is no prior owner to continue. The
+        // owner of a genesis IS the authorization's scope, and all four of
+        // its dimensions were compared against the AUTHENTICATED actor above,
+        // each in its own statement. Migration 034 pins the continuity from
+        // version 1 onward for writers that never come through here.
+        if (head !== null) throw new MutationAborted("head_mismatch");
+      } else {
+        if (head === null) throw new MutationAborted("head_mismatch");
+        // Refused above for every non-create action; restated so the
+        // narrowing below is a control and not a type assertion.
+        if (expectedHead.kind !== "version") {
+          throw new MutationAborted("authorization_expected_head_mismatch");
+        }
+        priorHead = head;
+
+        // ---- THE ACTOR MUST OWN THE RECORD IT IS MUTATING -----------------
+        // The four scope comparisons above are actor <-> AUTHORIZATION. They
+        // say nothing about the record. An authorization scoped to
+        // principal-attacker naming a record owned by principal-victim passed
+        // every one of them, overwrote the victim's content, changed the
+        // ownership columns mid-chain, and the post-commit read-back CONFIRMED
+        // the takeover because it compared the observed scope against the
+        // AUTHORIZATION rather than against the record that was there before.
+        //
+        // Deliberately read from the HEAD ROW and not from the CAS predicate:
+        // filtering the head lookup by principal and user would turn a takeover
+        // into an indistinguishable `head_mismatch` and leave these two
+        // comparisons with no reachable input, so no test could kill them.
+        // Migration 034 pins the same continuity for writers that never come
+        // through this function.
+        if (head.scope.principalId !== request.actor.principalId) {
+          throw new MutationAborted("record_owner_mismatch");
+        }
+        if (head.scope.userId !== request.actor.userId) {
+          throw new MutationAborted("record_owner_mismatch");
+        }
+
+        if (head.version !== expectedHead.version) {
+          throw new MutationAborted("head_mismatch");
+        }
+        // The PREDECESSOR digest. A forged one fails here even when the version
+        // happens to line up.
+        if (head.contentDigest !== expectedHead.contentDigest) {
+          throw new MutationAborted("head_mismatch");
+        }
+
+        // ---- RESTORATION IS A SEPARATE AUTHORITY --------------------------
+        // The contract binds the ACTION into the nonce, so a `delete` receipt
+        // relabelled as `restore` no longer matches its own token, and
+        // `stored.action !== action` above refuses a receipt handed to the
+        // wrong call site. These two statements are the STATE half: a restore
+        // only ever lifts a deleted head, and nothing but a restore may append
+        // onto one. Migration 037 pins exactly the same pair in the database,
+        // reading the action from the consumed nonce, for writers that never
+        // come through here.
+        if (action === "restore" && head.state !== "deleted") {
+          throw new MutationAborted("restore_head_not_deleted");
+        }
+        if (action !== "restore" && head.state === "deleted") {
+          throw new MutationAborted("record_deleted");
+        }
+
+        if (action === "delete") {
+          // The reason and the order reference are the APPROVER's, carried
+          // inside the content the authorization's digest binds. A caller
+          // cannot name a reason nobody approved.
+          //
+          // Checked HERE, after ownership and the compare-and-swap, so that an
+          // attacker aiming a delete at somebody else's record is still told
+          // `record_owner_mismatch`: the more specific refusal must not be
+          // masked by a shape complaint about the attacker's own payload.
+          deletionOrder = parseDeletionOrder(request.proposedContent);
+          if (deletionOrder === null) {
+            throw new MutationAborted("deletion_order_malformed");
+          }
         }
       }
 
       // ---- 6. WRITE THE NEW VERSION -------------------------------------
-      nextVersion = head.version + 1;
-      predecessorDigest = head.contentDigest;
+      // A genesis is version 1 with NO predecessor. Every other action
+      // advances the head it just compared against, and chains to its digest.
+      if (priorHead === null) {
+        nextVersion = 1;
+        predecessorDigest = null;
+      } else {
+        nextVersion = priorHead.version + 1;
+        predecessorDigest = priorHead.contentDigest;
+      }
       committedAt = txNow.toISOString();
       const version: MemoryRecordVersion = MemoryRecordVersionSchema.parse({
         schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
@@ -998,6 +1095,11 @@ export function createPostgresTrustedMemoryStore(
       // trigger that fires at COMMIT and rejects a deleted head that still
       // has an unerased predecessor, no matter who wrote it.
       if (action === "delete" && deletionOrder !== null) {
+        // `delete` always compared against a head — the branch above throws
+        // `head_mismatch` when there is none — so this is a contradiction,
+        // not a skippable case. Refused rather than silently erasing nothing
+        // and reporting a destruction that did not happen.
+        if (priorHead === null) throw new MutationAborted("head_mismatch");
         // The field names are computed from the content that was ACTUALLY
         // stored, never from a caller's description of it.
         const priorResult = await client.query(
@@ -1011,7 +1113,7 @@ export function createPostgresTrustedMemoryStore(
             stored.scope.tenantId,
             stored.scope.workspaceId,
             stored.targetRecordId,
-            head.version,
+            priorHead.version,
           ],
         );
         const destroyedFieldNames = destroyedContentFieldNames(
@@ -1068,7 +1170,7 @@ export function createPostgresTrustedMemoryStore(
           tombstoneId: deletion?.tombstoneId ?? request.mutationReceiptId,
           scope: stored.scope,
           targetRecordId: stored.targetRecordId,
-          targetVersion: head.version,
+          targetVersion: priorHead.version,
           tombstoneVersion: nextVersion,
           deletionAuthority: {
             authorizationId: stored.authorizationId,
@@ -1135,7 +1237,7 @@ export function createPostgresTrustedMemoryStore(
             stored.scope.tenantId,
             stored.scope.workspaceId,
             stored.targetRecordId,
-            head.version,
+            priorHead.version,
             tombstone.tombstoneId,
           ],
         );
@@ -1206,7 +1308,13 @@ export function createPostgresTrustedMemoryStore(
     }
     const authorized = stored;
     const fromHead = authorized.expectedHead;
-    if (fromHead.kind !== "version") {
+    // `no_prior_version` is the LEGITIMATE expected head of a genesis, and for
+    // no other action. Reaching the read-back with that pair mismatched means
+    // the commit went through under an expected head this action never
+    // accepts, which is not something to report a verdict on.
+    if (
+      fromHead.kind !== (action === "create" ? "no_prior_version" : "version")
+    ) {
       return await finishUnknown(
         request,
         action,
@@ -1523,6 +1631,7 @@ export function createPostgresTrustedMemoryStore(
   }
 
   return {
+    create: (request) => mutate("create", request),
     correct: (request) => mutate("correct", request),
     delete: deleteRecord,
     restore: (request) => mutate("restore", request),
