@@ -701,3 +701,48 @@ in an HTTP handler.
 - **Disposition:** `OPEN` (residual, disclosed, no control weakened)
 - **Closure path:** model the assistant principal explicitly when an agent
   acts on a user's behalf rather than as them — W1.6 authority surface.
+
+---
+
+## ENGINEERING DOCTRINE — WORKTREE SEPARATION
+
+Adopted after two incidents in one session, both self-inflicted, both
+recovered: `git checkout -- <file>` during mutation testing reverted a file to
+HEAD and destroyed uncommitted implementation — once for `merge_identity` /
+`split_identity`, once for the W1BR-014 migration-order guard. Writing the
+lesson into a commit message did not prevent the repeat, because the failure is
+one of ORDERING, not of intent.
+
+An earlier incident is the same class: two reviewers were dispatched into the
+worktree and database the builder was actively committing to, and both flagged
+that the candidate moved under them mid-review.
+
+```text
+BUILDER WORKTREE
+  Never used for destructive mutation experiments.
+  Implement -> verify green -> COMMIT -> only then mutate.
+
+MUTATION WORKTREE
+  Disposable. Detached at the exact candidate SHA. Own database.
+  May be destroyed freely; nothing of value lives here.
+
+REVIEW WORKTREE
+  Immutable for the duration of the review. One reviewer.
+  Own database. No concurrent writer, including the builder.
+```
+
+A reviewer's guarantee is "the candidate was immovable while I judged it", not
+"the evidence happened to survive". A mutation sweep's guarantee is "the only
+thing I destroyed was disposable".
+
+Applies to Aaliyah beyond W1.3.
+
+---
+
+## W1.3 CANDIDATE FREEZE
+
+The candidate below is frozen for adjudication. No feature work, no polish, no
+W1.4 surface is added to it. Remediation of any reviewer finding produces a
+DESCENDANT SHA, and every applicable reviewer re-inspects that new subject —
+a candidate does not become GREEN because six reviewers passed while one found
+a real Critical or Important defect.
