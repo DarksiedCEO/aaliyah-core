@@ -18,6 +18,7 @@ import {
   MEMORY_RECORD_VERSION_SCHEMA_VERSION,
   memoryContentDigest,
   type TrustedMemoryActor,
+  type TrustedMemoryMutationResult,
 } from "../src/application/memory/wave1TrustedMemory";
 import { runMailMigrations } from "../src/persistence/postgres/migrations";
 import { createMailDbPool } from "../src/persistence/postgres/pool";
@@ -4475,4 +4476,349 @@ test("the head lookup is scoped to the WORKSPACE, not merely the tenant and reco
     RECORD_ID,
   );
   assert.equal(theirs?.version, 1);
+});
+
+// ---------------------------------------------------------------------------
+// THE CONSUMPTION UPDATE'S OWN PREDICATES — A REAL TOCTOU WINDOW.
+//
+// The liveness verdict at step 3/4 is read with a plain SELECT. The atomic
+// consumption UPDATE at step 4 then restates `revoked_at IS NULL`,
+// `expires_at > now()` and `tenant_id = $1` in its WHERE clause. The mutation
+// sweep dropped each of those three and the suite stayed green, because every
+// existing test runs the two statements with nothing happening in between.
+//
+// The advisory lock does NOT close this window: it is taken on the RECORD, and
+// the authorization row is not covered by it. A revocation committed between
+// the SELECT and the UPDATE is therefore a genuine race, and the conjunct in
+// the UPDATE is the only thing that sees it.
+//
+// These drive the interleaving deterministically with row locks rather than
+// sleeps: the attacking transaction takes the nonce's row lock first and holds
+// it, the mutation reads the still-committed old row, passes liveness, then
+// BLOCKS on the UPDATE. The attacker commits, the UPDATE re-evaluates its
+// predicate against the new row version under READ COMMITTED, and refuses.
+// ---------------------------------------------------------------------------
+
+/** Wait until some backend is actually blocked on a lock. Not a sleep. */
+async function waitForBlockedBackend(): Promise<void> {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const result = await adminPool.query(
+      `SELECT count(*)::int AS n
+         FROM pg_stat_activity
+        WHERE wait_event_type = 'Lock'
+          AND state = 'active'
+          AND datname = current_database()`,
+    );
+    if ((result.rows[0].n as number) > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("no backend ever blocked: the interleaving did not happen");
+}
+
+/**
+ * Hold the nonce row's lock, let a mutation block on it, then commit.
+ * Returns whatever the mutation finally decided.
+ */
+async function raceAgainstConsumption(input: {
+  bindingDigest: string;
+  role: string;
+  sql: string;
+  mutation: () => Promise<TrustedMemoryMutationResult>;
+}): Promise<TrustedMemoryMutationResult> {
+  const attacker = await adminPool.connect();
+  try {
+    await attacker.query("BEGIN");
+    await attacker.query(`SET LOCAL ROLE "${input.role}"`);
+    // Takes the row lock. Uncommitted, so the mutation's plain SELECT still
+    // reads the old version and passes its liveness verdict.
+    await attacker.query(input.sql, [input.bindingDigest]);
+
+    const running = input.mutation();
+    await waitForBlockedBackend();
+    await attacker.query("COMMIT");
+    return await running;
+  } catch (error) {
+    // WITHOUT THIS, A FAILURE HERE POISONS THE POOL. An aborted transaction
+    // released back to `adminPool` makes the NEXT test's first statement fail
+    // with "current transaction is aborted", which reads as a failure in a
+    // test that is actually fine. Cost one confusing red already.
+    await attacker.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    attacker.release();
+  }
+}
+
+test("a revocation committed between the liveness read and the consumption UPDATE is caught", async () => {
+  const genesis = await seedGenesis({ note: "original" });
+  const next = { note: "corrected" };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, genesis),
+      proposedContent: next,
+    }),
+  );
+
+  const result = await raceAgainstConsumption({
+    bindingDigest: receipt.nonce.bindingDigest,
+    // The revoker role, which is the party that legitimately does this.
+    role: "aaliyah_memory_revoker",
+    sql: `UPDATE memory_authorization_nonces
+             SET revoked_at = now() WHERE binding_digest = $1`,
+    mutation: () =>
+      store().correct({
+        actor: SCOPE,
+        authorizationId: receipt.authorizationId,
+        recordId: RECORD_ID,
+        proposedContent: next,
+        mutationReceiptId: "mutation.race.revoked",
+      }),
+  });
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "authorization_already_consumed");
+  // The revoked approval bought nothing: the record never advanced.
+  const head = await store().readHead(SCOPE, RECORD_ID);
+  assert.equal(head?.version, 1);
+  assert.equal(head?.contentDigest, genesis);
+  assert.equal(await countVersions(), 1);
+});
+
+test("an expiry moved into the past between the liveness read and the consumption UPDATE is caught", async () => {
+  // DISCLOSED SCOPE: only the table OWNER holds UPDATE on `expires_at` —
+  // migration 029 grants the revoker `revoked_at` alone. So this conjunct
+  // defends against an owner-level change, a replica, or a restored backup
+  // whose expiry differs, NOT against the revoker role. Within a single
+  // unchanging transaction it is redundant, because the UPDATE's `now()` and
+  // the liveness check's `txNow` are the same instant. The window is real
+  // only when the ROW changes, which is what this drives.
+  const genesis = await seedGenesis({ note: "original" });
+  const next = { note: "corrected" };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, genesis),
+      proposedContent: next,
+    }),
+  );
+
+  const result = await raceAgainstConsumption({
+    bindingDigest: receipt.nonce.bindingDigest,
+    role: "postgres",
+    // Still AFTER issued_at, so `memory_authorization_nonces_window` holds —
+    // the row stays legal and only its expiry moves into the past. An expiry
+    // before issuance would be refused by the table and would prove nothing
+    // about the consumption predicate.
+    sql: `UPDATE memory_authorization_nonces
+             SET expires_at = issued_at + interval '1 second'
+           WHERE binding_digest = $1`,
+    mutation: () =>
+      store().correct({
+        actor: SCOPE,
+        authorizationId: receipt.authorizationId,
+        recordId: RECORD_ID,
+        proposedContent: next,
+        mutationReceiptId: "mutation.race.expired",
+      }),
+  });
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "authorization_already_consumed");
+  assert.equal(await countVersions(), 1);
+});
+
+test("the consumption UPDATE is scoped to the tenant, so it cannot spend another tenant's identically-bound nonce", async () => {
+  // `memory_authorization_nonces` is UNIQUE on (tenant_id, binding_digest),
+  // NOT on binding_digest alone — two tenants may legitimately hold nonces
+  // that share one. Without the tenant predicate the UPDATE matches both, the
+  // rowCount is 2 rather than 1, and a correct mutation is refused while a
+  // second tenant's approval is touched on the way.
+  const genesis = await seedGenesis({ note: "original" });
+  const next = { note: "corrected" };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, genesis),
+      proposedContent: next,
+    }),
+  );
+  // A different tenant, same binding digest. Legitimate, and the uniqueness
+  // constraint permits it.
+  await runAs(
+    "aaliyah_memory_issuer",
+    `INSERT INTO memory_authorization_nonces
+       (tenant_id, workspace_id, binding_digest, authorization_id, action,
+        target_record_id, issued_at, expires_at)
+     VALUES ('tenant-neighbour', $2, $1, 'neighbour-000000000001', 'correct',
+             $3, now() - interval '1 minute', now() + interval '1 hour')`,
+    [receipt.nonce.bindingDigest, SCOPE.workspaceId, RECORD_ID],
+  );
+
+  const result = await store().correct({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: next,
+    mutationReceiptId: "mutation.race.tenant",
+  });
+
+  // The legitimate mutation succeeds ...
+  assert.equal(result.rejection, null);
+  assert.equal(result.verified, true);
+  // ... and the neighbour's approval is untouched.
+  const neighbour = await adminPool.query(
+    `SELECT consumed_at FROM memory_authorization_nonces
+      WHERE tenant_id = 'tenant-neighbour' AND binding_digest = $1`,
+    [receipt.nonce.bindingDigest],
+  );
+  assert.equal(neighbour.rows[0].consumed_at, null);
+});
+
+// ---------------------------------------------------------------------------
+// THE NUMERIC DOMAIN, ON THE OTHER TWO TABLES.
+//
+// Migration 027 puts `aaliyah_memory_reject_inexact_numbers` on THREE tables.
+// Only the `memory_record_versions` trigger had a test: the sweep dropped the
+// `memory_authorization_receipts` and `memory_tombstones` triggers and the
+// suite stayed green. A jsonb number outside the exact integer domain is a
+// value that does not survive a round trip through a float, which is how a
+// digest stops matching the content it was computed over.
+// ---------------------------------------------------------------------------
+
+test("the database refuses an inexact jsonb number in an AUTHORIZATION receipt", async () => {
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_issuer",
+        `INSERT INTO memory_authorization_receipts
+           (tenant_id, workspace_id, principal_id, user_id, authorization_id,
+            action, target_record_id, binding_digest, issued_at, expires_at,
+            revoked_at, consumed_at, payload)
+         VALUES ($1,$2,$3,$4,'inexact-receipt-000001','correct',$5,$6,
+                 now() - interval '1 minute', now() + interval '1 hour',
+                 NULL, NULL,
+                 jsonb_build_object(
+                   'authorizationId','inexact-receipt-000001',
+                   'action','correct',
+                   'targetRecordId',$5::text,
+                   'scope', jsonb_build_object('tenantId',$1::text,
+                                               'workspaceId',$2::text,
+                                               'principalId',$3::text,
+                                               'userId',$4::text),
+                   'nonce', jsonb_build_object('bindingDigest',$6::text),
+                   'amount', 0.1))`,
+        [
+          SCOPE.tenantId,
+          SCOPE.workspaceId,
+          SCOPE.principalId,
+          SCOPE.userId,
+          RECORD_ID,
+          `sha256:${"c".repeat(64)}`,
+        ],
+      ),
+    /outside the exact numeric domain/,
+  );
+});
+
+test("the database refuses an integer beyond exact representation in an authorization receipt", async () => {
+  // 2^53. Representable as jsonb text, NOT representable exactly as a double,
+  // so it is the boundary the guard names rather than a decimal point.
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_issuer",
+        `INSERT INTO memory_authorization_receipts
+           (tenant_id, workspace_id, principal_id, user_id, authorization_id,
+            action, target_record_id, binding_digest, issued_at, expires_at,
+            revoked_at, consumed_at, payload)
+         VALUES ($1,$2,$3,$4,'inexact-receipt-000002','correct',$5,$6,
+                 now() - interval '1 minute', now() + interval '1 hour',
+                 NULL, NULL,
+                 jsonb_build_object(
+                   'authorizationId','inexact-receipt-000002',
+                   'action','correct',
+                   'targetRecordId',$5::text,
+                   'scope', jsonb_build_object('tenantId',$1::text,
+                                               'workspaceId',$2::text,
+                                               'principalId',$3::text,
+                                               'userId',$4::text),
+                   'nonce', jsonb_build_object('bindingDigest',$6::text),
+                   'sequence', 9007199254740992))`,
+        [
+          SCOPE.tenantId,
+          SCOPE.workspaceId,
+          SCOPE.principalId,
+          SCOPE.userId,
+          RECORD_ID,
+          `sha256:${"d".repeat(64)}`,
+        ],
+      ),
+    /outside the exact numeric domain/,
+  );
+});
+
+test("an exact integer in an authorization receipt is ACCEPTED, so the numeric guard is not a blanket refusal", async () => {
+  await runAs(
+    "aaliyah_memory_issuer",
+    `INSERT INTO memory_authorization_receipts
+       (tenant_id, workspace_id, principal_id, user_id, authorization_id,
+        action, target_record_id, binding_digest, issued_at, expires_at,
+        revoked_at, consumed_at, payload)
+     VALUES ($1,$2,$3,$4,'exact-receipt-0000001','correct',$5,$6,
+             now() - interval '1 minute', now() + interval '1 hour',
+             NULL, NULL,
+             jsonb_build_object(
+               'authorizationId','exact-receipt-0000001',
+               'action','correct',
+               'targetRecordId',$5::text,
+               'scope', jsonb_build_object('tenantId',$1::text,
+                                           'workspaceId',$2::text,
+                                           'principalId',$3::text,
+                                           'userId',$4::text),
+               'nonce', jsonb_build_object('bindingDigest',$6::text),
+               'sequence', 9007199254740991))`,
+    [
+      SCOPE.tenantId,
+      SCOPE.workspaceId,
+      SCOPE.principalId,
+      SCOPE.userId,
+      RECORD_ID,
+      `sha256:${"e".repeat(64)}`,
+    ],
+  );
+  const stored = await adminPool.query(
+    `SELECT payload -> 'sequence' AS sequence FROM memory_authorization_receipts
+      WHERE authorization_id = 'exact-receipt-0000001'`,
+  );
+  assert.equal(String(stored.rows[0].sequence), "9007199254740991");
+});
+
+test("the database refuses an inexact jsonb number in a TOMBSTONE", async () => {
+  await assert.rejects(
+    () =>
+      adminPool.query(
+        `INSERT INTO memory_tombstones
+           (tenant_id, workspace_id, principal_id, user_id,
+            tombstone_id, target_record_id, target_version, tombstone_version,
+            authorization_id, mutation_receipt_id, reason, effective_at,
+            retain_until, legal_hold_state, cache_index_propagation,
+            restoration_eligibility_kind, tombstone_digest, payload)
+         VALUES ($1,$2,$3,$4,'tombstone-inexact-01',$5,1,2,
+                 'auth-inexact-0000001','mutation-inexact-01',
+                 'subject_erasure_request', now(), NULL,
+                 'none','unknown','ineligible_payload_destroyed',$6,
+                 jsonb_build_object('reason','subject_erasure_request',
+                                    'ratio', 0.5))`,
+        [
+          SCOPE.tenantId,
+          SCOPE.workspaceId,
+          SCOPE.principalId,
+          SCOPE.userId,
+          RECORD_ID,
+          `sha256:${"f".repeat(64)}`,
+        ],
+      ),
+    /outside the exact numeric domain/,
+  );
 });

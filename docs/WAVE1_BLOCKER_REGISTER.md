@@ -372,3 +372,78 @@ nothing, and a genesis over an existing id is refused by the CAS.
 
 - **Disposition:** `BOUNDED_AND_PROVEN_NONBLOCKING` — recorded so the absence
   is not later read as an oversight.
+
+---
+
+## W1BR-013 — 34 of 103 mutants survived at `002aec2`
+
+- **Gate:** W1.3 · **Source:** Mutation-discrimination sweep, isolated worktree
+  and database, executed against `002aec2` · **Severity:** HIGH (test evidence)
+
+A comprehensive sweep applied 103 mutants and 34 survived — the failure mode
+this register already warns about. The headline: **all nine conjuncts of
+`postStateAgrees` survived independently.** That expression is the last gate
+before a `COMMITTED_AND_READ_BACK` receipt is minted, and no test had ever
+built a read-back agreeing on eight fields and disagreeing on the ninth.
+
+- **Disposition:** `PARTIALLY CLOSED`.
+
+**Closed and re-falsified** (each mutant re-applied after the test existed, and
+each now turns the suite red):
+
+| Control | Why it had no test |
+| --- | --- |
+| `postStateAgrees.contentDigest` | stored column can differ from the recomputed payload digest |
+| `postStateAgrees.predecessorDigest` | no test observed a head linking elsewhere |
+| `postStateAgrees.state` | no test observed a head in the wrong state |
+| `postStateAgrees.scope.principalId` | the ownership half of the takeover |
+| `postStateAgrees.scope.userId` | the ownership half of the takeover |
+| CAS head lookup `workspace_id` | no test placed one record id under two workspaces |
+| migration 039 `a.tenant_id` | the fix shipped with principal/user/workspace tests and no tenant test |
+| migration 039 `a.authorization_id` | a guard checking only scope would accept another party's approval |
+| consumption `revoked_at IS NULL` | a real TOCTOU window, now driven by row locks |
+| consumption `expires_at > now()` | only non-redundant when the ROW changes |
+| consumption `tenant_id = $1` | `UNIQUE (tenant_id, binding_digest)` permits a shared digest |
+| `memory_authorization_receipts_exact_numbers` | only the `record_versions` sibling was tested |
+| `memory_tombstones_exact_numbers` | only the `record_versions` sibling was tested |
+
+**Reported as surviving, NOT claimed covered.** Four `postStateAgrees`
+conjuncts — `recordId`, `version`, `scope.tenantId`, `scope.workspaceId` — are
+UNREACHABLE: `headFromRow` refuses a payload disagreeing with its columns on
+all four, the read-back query filters on three of them, and the version is
+rejected earlier. Plus the two backstops the code already discloses
+(`expectedHeadKindFor`, the erasure `rowCount` equality).
+
+**STILL OPEN:** 15 of 19 sampled CHECK constraints survived a direct
+`DROP CONSTRAINT`, and **67 of 86 CHECK constraints on the five memory tables
+were never drop-tested at all** — `NOT_VERIFIED`, not passing. Two mutants were
+inconclusive (the run hung rather than completing); neither is reachable
+through the application surface.
+
+---
+
+## W1BR-014 — Migrations are not independently replayable
+
+- **Gate:** W1.3 · **Source:** Encountered directly while restoring a mutant ·
+  **Severity:** MEDIUM (operational)
+
+Migration 027 creates `aaliyah_memory_jsonb_numbers` and
+`aaliyah_memory_reject_inexact_numbers` unqualified and without a pinned
+`search_path`. Migration **033** redefines both as `public.`-qualified with
+`SET search_path = pg_catalog, public`, which is what defeats a caller that
+shadows the helper in its own `search_path`.
+
+Both use `CREATE OR REPLACE`. So deleting 027's row from
+`aaliyah_mail_migrations` and re-running **silently reverts 033's hardening**,
+and the only visible symptom is that the search-path shadowing test starts
+failing. Observed exactly that way.
+
+Not reachable through `runMailMigrations`, which skips applied ids. It is
+reachable by an operator re-applying a migration by hand, by tooling that
+replays by id, and by a partial restore.
+
+- **Disposition:** `OPEN` (residual, disclosed, operational)
+- **Closure path:** make later hardening idempotent under replay — either fold
+  033's definitions back into 027 so there is one definition, or add a
+  migration-order assertion that refuses to apply an id lower than the highest
+  already applied. Both are schema-tooling changes, not store changes.
