@@ -120,6 +120,17 @@ export const TRUSTED_MEMORY_REJECTIONS = [
   "deletion_order_malformed",
   /** A restore whose head is not in the `deleted` state. */
   "restore_head_not_deleted",
+  /** A merge or split whose authorized content is not a valid identity order. */
+  "identity_order_malformed",
+  /** An identity order naming the record it is issued against. */
+  "identity_counterparty_invalid",
+  /** An identity order naming a record that is not an active record here. */
+  "identity_counterparty_missing",
+  /**
+   * The target has been merged into another record. It keeps its history and
+   * accepts no further versions; the survivor is where mutations go.
+   */
+  "record_merged_away",
   /** A mutation on a record whose head is deleted, other than a restore. */
   "record_deleted",
   /**
@@ -243,6 +254,34 @@ export interface TrustedMemoryStore {
    * which is what the tombstone's `ineligible_payload_destroyed` says.
    */
   restore(
+    request: TrustedMemoryMutationRequest,
+  ): Promise<TrustedMemoryMutationResult>;
+  /**
+   * ABSORB THIS RECORD INTO ANOTHER.
+   *
+   * The authorization targets the record being ABSORBED, and the authorized
+   * content names the survivor — so the approver's grant is over the identity
+   * that loses its independent existence, not the one that gains.
+   *
+   * Appends one version to the absorbed record and writes one identity edge,
+   * atomically. It does NOT write to the survivor: one authorization produces
+   * exactly one record version, enforced by the nonce's uniqueness, its single
+   * witnessed receipt id, and migration 038. The absorbed record is then
+   * FROZEN — it keeps its history and accepts no further versions. A merge is
+   * not a deletion and does not become a quiet one.
+   */
+  mergeIdentity(
+    request: TrustedMemoryMutationRequest,
+  ): Promise<TrustedMemoryMutationResult>;
+  /**
+   * RECORD THAT THIS RECORD'S IDENTITY WAS TWO PEOPLE.
+   *
+   * The authorized content names an ALREADY-EXISTING active record in the same
+   * scope, created under its own `create` authorization. A split that also
+   * created that record would be two mutations under one approval; one that
+   * promised it for later would leave the graph naming something absent.
+   */
+  splitIdentity(
     request: TrustedMemoryMutationRequest,
   ): Promise<TrustedMemoryMutationResult>;
   /** Advance a record under a `promote` authorization. */

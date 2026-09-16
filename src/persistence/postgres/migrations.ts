@@ -3260,6 +3260,193 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
     GRANT SELECT ON memory_reconciliations
       TO aaliyah_memory_reader, aaliyah_memory_mutator`,
   },
+  {
+    // ------------------------------------------------------------------
+    // THE IDENTITY GRAPH, AND WHY IT IS A SEPARATE TABLE.
+    //
+    // A merge or a split re-shapes which records are which people. Neither can
+    // append a version to BOTH records involved, because one authorization
+    // produces exactly one record version and that is enforced three times
+    // over: `memory_authorization_nonces` is UNIQUE on `authorization_id`, a
+    // nonce carries one `consumed_by_mutation_receipt_id`, and migration 038
+    // makes `(tenant, workspace, mutation_receipt_id)` unique on
+    // `memory_record_versions`. That triple IS the H-1 fix, and an identity
+    // operation is not a reason to weaken it.
+    //
+    // So the graph change lives here. One version on the record the
+    // authorization targets, one edge, one transaction.
+    //
+    // THE EDGE CARRIES THE SAME WITNESS EVERY OTHER MUTATION CARRIES. Without
+    // it, this table would be the one place a writer could re-shape the
+    // identity graph with no consumed authorization behind it — the exact hole
+    // migration 034 closed for record versions and 038 closed for tombstones
+    // and alias bindings.
+    //
+    // A MERGED-AWAY RECORD IS FROZEN, NOT DELETED. Appending to a record that
+    // has been merged into another is editing a ghost, so the guard refuses
+    // it. It is not destroyed: a merge is not a deletion and must not become a
+    // quiet one, and the absorbed record's history stays readable.
+    // ------------------------------------------------------------------
+    id: "041_memory_identity_graph",
+    sql: `CREATE TABLE IF NOT EXISTS memory_identity_edges (
+      id bigserial PRIMARY KEY,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      principal_id text NOT NULL,
+      user_id text NOT NULL,
+      kind text NOT NULL,
+      from_record_id text NOT NULL,
+      to_record_id text NOT NULL,
+      from_version integer NOT NULL,
+      authorization_id text NOT NULL,
+      mutation_receipt_id text NOT NULL,
+      reason text NOT NULL,
+      reason_evidence_ref text NOT NULL,
+      effective_at timestamptz NOT NULL,
+      payload jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT memory_identity_edges_kind_domain
+        CHECK (kind IN ('merged_into','split_to')),
+      -- A record cannot be merged into, or split from, ITSELF. Without this a
+      -- self-edge would freeze a record against every future mutation while
+      -- reading as a legitimate graph entry.
+      CONSTRAINT memory_identity_edges_not_self
+        CHECK (from_record_id <> to_record_id),
+      CONSTRAINT memory_identity_edges_version_positive
+        CHECK (from_version > 0),
+      -- One edge per mutation, the same shape migration 038 gives every other
+      -- mutating table.
+      CONSTRAINT memory_identity_edges_receipt_unique
+        UNIQUE (tenant_id, workspace_id, mutation_receipt_id),
+      CONSTRAINT memory_identity_edges_payload_object
+        CHECK (jsonb_typeof(payload) = 'object'),
+      CONSTRAINT memory_identity_edges_kind_binding
+        CHECK (payload ->> 'kind' = kind),
+      CONSTRAINT memory_identity_edges_from_binding
+        CHECK (payload ->> 'fromRecordId' = from_record_id),
+      CONSTRAINT memory_identity_edges_to_binding
+        CHECK (payload ->> 'toRecordId' = to_record_id),
+      CONSTRAINT memory_identity_edges_authorization_binding
+        CHECK (payload ->> 'authorizationId' = authorization_id)
+    );
+    -- A record may be merged away AT MOST ONCE. Two survivors for one absorbed
+    -- record is a graph that cannot be read, and it is how an identity ends up
+    -- pointing two ways at once.
+    CREATE UNIQUE INDEX IF NOT EXISTS memory_identity_edges_merged_once
+      ON memory_identity_edges (tenant_id, workspace_id, from_record_id)
+      WHERE kind = 'merged_into';
+    CREATE INDEX IF NOT EXISTS idx_memory_identity_edges_to
+      ON memory_identity_edges (tenant_id, workspace_id, to_record_id, id DESC);
+    DROP TRIGGER IF EXISTS memory_identity_edges_append_only
+      ON memory_identity_edges;
+    CREATE TRIGGER memory_identity_edges_append_only
+      BEFORE UPDATE OR DELETE ON memory_identity_edges
+      FOR EACH ROW EXECUTE FUNCTION aaliyah_memory_forbid_row_rewrite();
+    DROP TRIGGER IF EXISTS memory_identity_edges_exact_numbers
+      ON memory_identity_edges;
+    CREATE TRIGGER memory_identity_edges_exact_numbers
+      BEFORE INSERT OR UPDATE ON memory_identity_edges
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_reject_inexact_numbers();
+
+    -- EVERY EDGE IS WITNESSED BY A CONSUMED AUTHORIZATION, and the action that
+    -- authorization was issued for must be the one this edge records.
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_identity_edge_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        acted text;
+      BEGIN
+        SELECT n.action INTO acted
+          FROM public.aaliyah_memory_spent_nonce(
+                 NEW.tenant_id, NEW.authorization_id,
+                 NEW.mutation_receipt_id) AS n
+         WHERE n.target_record_id = NEW.from_record_id
+         LIMIT 1;
+        IF acted IS NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: no consumed authorization witnesses this identity edge'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.kind = 'merged_into' AND acted <> 'merge_identity' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a merge edge requires a merge_identity authorization'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.kind = 'split_to' AND acted <> 'split_identity' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a split edge requires a split_identity authorization'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        -- BOTH ENDS MUST EXIST, IN THIS SCOPE. An edge naming a record that is
+        -- not there re-shapes the graph around something unreadable, and an
+        -- edge reaching into another principal's records is a graph-level
+        -- version of the takeover migration 039 closed for genesis.
+        PERFORM 1 FROM public.memory_record_versions AS v
+         WHERE v.tenant_id = NEW.tenant_id
+           AND v.workspace_id = NEW.workspace_id
+           AND v.principal_id = NEW.principal_id
+           AND v.user_id = NEW.user_id
+           AND v.record_id = NEW.to_record_id
+         LIMIT 1;
+        IF NOT FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah memory: an identity edge must name a record in the same scope'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_identity_edges_authorized
+      ON memory_identity_edges;
+    CREATE TRIGGER memory_identity_edges_authorized
+      AFTER INSERT ON memory_identity_edges
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_identity_edge_guard();
+
+    -- A MERGED-AWAY RECORD ACCEPTS NO FURTHER VERSIONS.
+    --
+    -- Layered as its own AFTER INSERT trigger rather than folded into
+    -- aaliyah_memory_record_version_guard, so migration 039's genesis
+    -- binding and this freeze are independently killable by their own tests.
+    -- Fires after the row, before the edge that the merge itself writes later
+    -- in the same transaction, so a merge does not refuse its own version.
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_merged_record_frozen()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      BEGIN
+        PERFORM 1 FROM public.memory_identity_edges AS e
+         WHERE e.tenant_id = NEW.tenant_id
+           AND e.workspace_id = NEW.workspace_id
+           AND e.from_record_id = NEW.record_id
+           AND e.kind = 'merged_into'
+         LIMIT 1;
+        IF FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a record merged into another accepts no further versions'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_record_versions_merged_frozen
+      ON memory_record_versions;
+    CREATE TRIGGER memory_record_versions_merged_frozen
+      AFTER INSERT ON memory_record_versions
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_merged_record_frozen();
+
+    GRANT SELECT ON memory_identity_edges
+      TO aaliyah_memory_mutator, aaliyah_memory_reader,
+         aaliyah_memory_issuer, aaliyah_memory_revoker,
+         aaliyah_memory_reconciler;
+    GRANT INSERT ON memory_identity_edges TO aaliyah_memory_mutator;
+    GRANT USAGE, SELECT ON SEQUENCE memory_identity_edges_id_seq
+      TO aaliyah_memory_mutator`,
+  },
 ];
 
 export async function runMailMigrations(pool: Pool): Promise<void> {

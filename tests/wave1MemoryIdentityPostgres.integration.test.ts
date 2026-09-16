@@ -1,0 +1,912 @@
+import assert from "node:assert/strict";
+import test, { after, before, beforeEach } from "node:test";
+import { Pool } from "pg";
+
+import {
+  MEMORY_AUTHORIZATION_NONCE_SCHEMA_VERSION,
+  MemoryAuthorizationReceiptSchema,
+  WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION,
+  memoryAuthorizationNonce,
+  type MemoryAction,
+  type MemoryAuthorizationReceipt,
+  type MemoryExpectedHead,
+  type MemoryScope,
+} from "@aaliyah/contracts/v1";
+
+import {
+  MEMORY_IDENTITY_MERGE_ORDER_SCHEMA_VERSION,
+  MEMORY_IDENTITY_SPLIT_ORDER_SCHEMA_VERSION,
+} from "../src/application/memory/wave1MemoryIdentity";
+import { memoryContentDigest } from "../src/application/memory/wave1TrustedMemory";
+import { runMailMigrations } from "../src/persistence/postgres/migrations";
+import { createPostgresTrustedMemoryStore } from "../src/persistence/postgres/wave1TrustedMemoryStore";
+import {
+  lockSharedMemoryTables,
+  type SharedTableLock,
+} from "./support/sharedMemoryTables";
+
+/**
+ * IDENTITY MERGE AND SPLIT, AGAINST A REAL DATABASE.
+ *
+ * The design constraint these prove out: one authorization produces exactly
+ * ONE record version, so neither operation can write to both records. Each
+ * appends one version to the record its authorization targets and writes one
+ * append-only identity edge, in the same transaction.
+ *
+ * Every refusal below pins its exact reason. A bare "it failed" would pass
+ * against a store that refused every merge, which is the shape a broken one
+ * takes.
+ */
+
+const DB_URL =
+  process.env.AALIYAH_TEST_DATABASE_URL ??
+  "postgres://postgres:test@127.0.0.1:54329/aaliyah_test";
+
+const SCOPE: MemoryScope = {
+  tenantId: "tenant-identity",
+  workspaceId: "workspace-identity",
+  principalId: "principal-identity",
+  userId: "user-identity",
+};
+
+const ALICE = "record-identity-alice";
+const ALIAS_OF_ALICE = "record-identity-alice-dup";
+const EVIDENCE_DIGEST = `sha256:${"b".repeat(64)}`;
+
+let adminPool: Pool;
+let writePool: Pool;
+let readPool: Pool;
+let sharedTableLock: SharedTableLock;
+let authCounter = 0;
+
+before(async () => {
+  adminPool = new Pool({ connectionString: DB_URL, max: 8 });
+  sharedTableLock = await lockSharedMemoryTables(adminPool);
+  await runMailMigrations(adminPool);
+  writePool = new Pool({ connectionString: DB_URL, max: 8 });
+  readPool = new Pool({ connectionString: DB_URL, max: 4 });
+});
+
+after(async () => {
+  await readPool.end();
+  await writePool.end();
+  await sharedTableLock.release();
+  await adminPool.end();
+});
+
+beforeEach(async () => {
+  await adminPool.query(
+    `TRUNCATE memory_identity_edges,
+              memory_record_versions,
+              memory_authorization_receipts,
+              memory_authorization_nonces,
+              memory_mutation_receipts,
+              memory_tombstones,
+              memory_legal_hold_carve_outs,
+              memory_legal_hold_records,
+              memory_legal_hold_subjects,
+              memory_legal_holds
+     RESTART IDENTITY`,
+  );
+  authCounter = 0;
+});
+
+function store() {
+  return createPostgresTrustedMemoryStore(writePool, readPool);
+}
+
+function isoOffset(ms: number): string {
+  return new Date(Date.now() + ms).toISOString();
+}
+
+function authorization(input: {
+  action: MemoryAction;
+  targetRecordId: string;
+  expectedHead: MemoryExpectedHead;
+  proposedContent: unknown;
+  scope?: MemoryScope;
+}): MemoryAuthorizationReceipt {
+  const scope = input.scope ?? SCOPE;
+  authCounter += 1;
+  const authorizationId = `identity-auth-${String(authCounter).padStart(14, "0")}`;
+  const proposedContentDigest = memoryContentDigest(input.proposedContent);
+  const bindingDigest = memoryAuthorizationNonce({
+    bindingSchemaVersion: MEMORY_AUTHORIZATION_NONCE_SCHEMA_VERSION,
+    authorizationId,
+    action: input.action,
+    scope,
+    targetRecordId: input.targetRecordId,
+    expectedHead: input.expectedHead,
+    proposedContentDigest,
+  });
+  return MemoryAuthorizationReceiptSchema.parse({
+    schemaVersion: WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION,
+    authorizationId,
+    action: input.action,
+    approverAuthorityId: "authority.memory-steward",
+    approverActorId: "actor.memory-steward",
+    scope,
+    targetRecordId: input.targetRecordId,
+    expectedHead: input.expectedHead,
+    proposedContentDigest,
+    nonce: {
+      bindingSchemaVersion: MEMORY_AUTHORIZATION_NONCE_SCHEMA_VERSION,
+      bindingDigest,
+    },
+    issuedAt: isoOffset(-60_000),
+    expiresAt: isoOffset(3_600_000),
+    revokedAt: null,
+    consumedAt: null,
+    policyVersion: "memory-policy/v1",
+    evidenceDigest: EVIDENCE_DIGEST,
+  });
+}
+
+async function runAs(role: string, sql: string, params: unknown[] = []) {
+  const client = await adminPool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`SET LOCAL ROLE "${role}"`);
+    await client.query(sql, params);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function issue(
+  receipt: MemoryAuthorizationReceipt,
+): Promise<MemoryAuthorizationReceipt> {
+  const client = await adminPool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query('SET LOCAL ROLE "aaliyah_memory_issuer"');
+    await client.query(
+      `INSERT INTO memory_authorization_receipts
+         (tenant_id, workspace_id, principal_id, user_id, authorization_id,
+          action, target_record_id, binding_digest, issued_at, expires_at,
+          revoked_at, consumed_at, payload)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [
+        receipt.scope.tenantId,
+        receipt.scope.workspaceId,
+        receipt.scope.principalId,
+        receipt.scope.userId,
+        receipt.authorizationId,
+        receipt.action,
+        receipt.targetRecordId,
+        receipt.nonce.bindingDigest,
+        receipt.issuedAt,
+        receipt.expiresAt,
+        receipt.revokedAt,
+        receipt.consumedAt,
+        JSON.stringify(receipt),
+      ],
+    );
+    await client.query(
+      `INSERT INTO memory_authorization_nonces
+         (tenant_id, workspace_id, binding_digest, authorization_id, action,
+          target_record_id, issued_at, expires_at, revoked_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [
+        receipt.scope.tenantId,
+        receipt.scope.workspaceId,
+        receipt.nonce.bindingDigest,
+        receipt.authorizationId,
+        receipt.action,
+        receipt.targetRecordId,
+        receipt.issuedAt,
+        receipt.expiresAt,
+        receipt.revokedAt,
+      ],
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+  return receipt;
+}
+
+/** Bring a record into existence through the real `create` protocol. */
+async function createRecord(
+  recordId: string,
+  content: unknown,
+  scope: MemoryScope = SCOPE,
+): Promise<string> {
+  const receipt = await issue(
+    authorization({
+      action: "create",
+      targetRecordId: recordId,
+      expectedHead: { kind: "no_prior_version" },
+      proposedContent: content,
+      scope,
+    }),
+  );
+  const result = await store().create({
+    actor: scope,
+    authorizationId: receipt.authorizationId,
+    recordId,
+    proposedContent: content,
+    mutationReceiptId: `mutation.create.${recordId}`,
+  });
+  assert.equal(result.rejection, null);
+  assert.equal(result.verified, true);
+  return memoryContentDigest(content);
+}
+
+function mergeOrder(survivorRecordId: string, reason = "duplicate_participant") {
+  return {
+    schemaVersion: MEMORY_IDENTITY_MERGE_ORDER_SCHEMA_VERSION,
+    reason,
+    reasonEvidenceRef: "matter:identity-merge/0001",
+    survivorRecordId,
+  };
+}
+
+function splitOrder(splitRecordId: string) {
+  return {
+    schemaVersion: MEMORY_IDENTITY_SPLIT_ORDER_SCHEMA_VERSION,
+    reason: "conflated_participants",
+    reasonEvidenceRef: "matter:identity-split/0001",
+    splitRecordId,
+  };
+}
+
+async function edgesFor(fromRecordId: string) {
+  const result = await adminPool.query(
+    `SELECT kind, from_record_id, to_record_id, from_version, authorization_id,
+            mutation_receipt_id, reason, reason_evidence_ref
+       FROM memory_identity_edges
+      WHERE from_record_id = $1
+      ORDER BY id`,
+    [fromRecordId],
+  );
+  return result.rows;
+}
+
+async function countVersions(recordId: string): Promise<number> {
+  const result = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_record_versions WHERE record_id = $1`,
+    [recordId],
+  );
+  return result.rows[0].n as number;
+}
+
+async function nonceConsumedAt(bindingDigest: string): Promise<Date | null> {
+  const result = await adminPool.query(
+    `SELECT consumed_at FROM memory_authorization_nonces WHERE binding_digest = $1`,
+    [bindingDigest],
+  );
+  return (result.rows[0]?.consumed_at as Date | null) ?? null;
+}
+
+/** Spend a merge/split authorization through the store. */
+async function runIdentity(input: {
+  action: "merge_identity" | "split_identity";
+  targetRecordId: string;
+  headVersion: number;
+  headDigest: string;
+  order: unknown;
+  mutationReceiptId: string;
+}) {
+  const receipt = await issue(
+    authorization({
+      action: input.action,
+      targetRecordId: input.targetRecordId,
+      expectedHead: {
+        kind: "version",
+        version: input.headVersion,
+        contentDigest: input.headDigest,
+      },
+      proposedContent: input.order,
+    }),
+  );
+  const call =
+    input.action === "merge_identity"
+      ? store().mergeIdentity
+      : store().splitIdentity;
+  const result = await call({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: input.targetRecordId,
+    proposedContent: input.order,
+    mutationReceiptId: input.mutationReceiptId,
+  });
+  return { receipt, result };
+}
+
+// ---------------------------------------------------------------------------
+// merge_identity
+// ---------------------------------------------------------------------------
+
+test("a merge appends one version to the ABSORBED record, writes one edge, and leaves the survivor alone", async () => {
+  const survivor = await createRecord(ALICE, { name: "Alice", source: "crm" });
+  const absorbed = await createRecord(ALIAS_OF_ALICE, { name: "A. Smith" });
+
+  const { result } = await runIdentity({
+    action: "merge_identity",
+    targetRecordId: ALIAS_OF_ALICE,
+    headVersion: 1,
+    headDigest: absorbed,
+    order: mergeOrder(ALICE),
+    mutationReceiptId: "mutation.merge.001",
+  });
+
+  assert.equal(result.rejection, null);
+  assert.equal(result.verified, true);
+
+  // ONE version on the absorbed record ...
+  assert.equal(await countVersions(ALIAS_OF_ALICE), 2);
+  // ... and NONE on the survivor. One authorization, one record version.
+  assert.equal(await countVersions(ALICE), 1);
+  const survivorHead = await store().readHead(SCOPE, ALICE);
+  assert.equal(survivorHead?.version, 1);
+  assert.equal(survivorHead?.contentDigest, survivor);
+
+  const edges = await edgesFor(ALIAS_OF_ALICE);
+  assert.equal(edges.length, 1);
+  assert.equal(edges[0].kind, "merged_into");
+  assert.equal(edges[0].to_record_id, ALICE);
+  assert.equal(edges[0].from_version, 2);
+  assert.equal(edges[0].reason, "duplicate_participant");
+  assert.equal(edges[0].mutation_receipt_id, "mutation.merge.001");
+});
+
+test("a merged-away record is FROZEN: no further version, and its history survives", async () => {
+  await createRecord(ALICE, { name: "Alice" });
+  const absorbed = await createRecord(ALIAS_OF_ALICE, { name: "A. Smith" });
+  await runIdentity({
+    action: "merge_identity",
+    targetRecordId: ALIAS_OF_ALICE,
+    headVersion: 1,
+    headDigest: absorbed,
+    order: mergeOrder(ALICE),
+    mutationReceiptId: "mutation.merge.frozen",
+  });
+
+  const head = await store().readHead(SCOPE, ALIAS_OF_ALICE);
+  const next = { name: "A. Smith", note: "edited after the merge" };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      targetRecordId: ALIAS_OF_ALICE,
+      expectedHead: {
+        kind: "version",
+        version: 2,
+        contentDigest: head!.contentDigest,
+      },
+      proposedContent: next,
+    }),
+  );
+  const result = await store().correct({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: ALIAS_OF_ALICE,
+    proposedContent: next,
+    mutationReceiptId: "mutation.merge.afteredit",
+  });
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "record_merged_away");
+  // Refused BEFORE consumption, so the approval is not burned.
+  assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
+  // The record is frozen, NOT destroyed. A merge is not a quiet deletion.
+  assert.equal(await countVersions(ALIAS_OF_ALICE), 2);
+  assert.equal((await store().retrieve(SCOPE, ALIAS_OF_ALICE))?.version, 2);
+});
+
+test("the DATABASE refuses a version on a merged-away record, for writers that never come through the store", async () => {
+  await createRecord(ALICE, { name: "Alice" });
+  const absorbed = await createRecord(ALIAS_OF_ALICE, { name: "A. Smith" });
+  await runIdentity({
+    action: "merge_identity",
+    targetRecordId: ALIAS_OF_ALICE,
+    headVersion: 1,
+    headDigest: absorbed,
+    order: mergeOrder(ALICE),
+    mutationReceiptId: "mutation.merge.dbfreeze",
+  });
+
+  const frozenHead = await store().readHead(SCOPE, ALIAS_OF_ALICE);
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        `INSERT INTO memory_record_versions
+           (tenant_id, workspace_id, principal_id, user_id, record_id, version,
+            state, content_digest, predecessor_digest, authorization_id,
+            mutation_receipt_id, payload)
+         VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,3,'active',
+                 $6::text,$7::text,'raw-auth-00000000000000001',
+                 'mutation.raw.frozen',
+                 jsonb_build_object(
+                   'recordId',$5::text,'version','3','state','active',
+                   'contentDigest',$6::text,'predecessorDigest',$7::text,
+                   'authorizationId','raw-auth-00000000000000001',
+                   'mutationReceiptId','mutation.raw.frozen',
+                   'scope', jsonb_build_object('tenantId',$1::text,
+                                               'workspaceId',$2::text,
+                                               'principalId',$3::text,
+                                               'userId',$4::text)))`,
+        [
+          SCOPE.tenantId,
+          SCOPE.workspaceId,
+          SCOPE.principalId,
+          SCOPE.userId,
+          ALIAS_OF_ALICE,
+          `sha256:${"a".repeat(64)}`,
+          frozenHead!.contentDigest,
+        ],
+      ),
+    /merged into another accepts no further versions|no consumed authorization witnesses/,
+  );
+  assert.equal(await countVersions(ALIAS_OF_ALICE), 2);
+});
+
+test("a record can be merged away at most once", async () => {
+  await createRecord(ALICE, { name: "Alice" });
+  const third = await createRecord("record-identity-third", { name: "Third" });
+  const absorbed = await createRecord(ALIAS_OF_ALICE, { name: "A. Smith" });
+  await runIdentity({
+    action: "merge_identity",
+    targetRecordId: ALIAS_OF_ALICE,
+    headVersion: 1,
+    headDigest: absorbed,
+    order: mergeOrder(ALICE),
+    mutationReceiptId: "mutation.merge.once",
+  });
+  assert.equal(third.length > 0, true);
+
+  const head = await store().readHead(SCOPE, ALIAS_OF_ALICE);
+  const { result } = await runIdentity({
+    action: "merge_identity",
+    targetRecordId: ALIAS_OF_ALICE,
+    headVersion: 2,
+    headDigest: head!.contentDigest,
+    order: mergeOrder("record-identity-third"),
+    mutationReceiptId: "mutation.merge.twice",
+  });
+
+  // Refused by the freeze before it ever reaches the unique index — an
+  // identity pointing two ways at once is a graph nobody can read.
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "record_merged_away");
+  assert.equal((await edgesFor(ALIAS_OF_ALICE)).length, 1);
+});
+
+test("a merge naming ITSELF is refused", async () => {
+  const absorbed = await createRecord(ALIAS_OF_ALICE, { name: "A. Smith" });
+
+  const { result } = await runIdentity({
+    action: "merge_identity",
+    targetRecordId: ALIAS_OF_ALICE,
+    headVersion: 1,
+    headDigest: absorbed,
+    order: mergeOrder(ALIAS_OF_ALICE),
+    mutationReceiptId: "mutation.merge.self",
+  });
+
+  // A self-edge would freeze the record against every future mutation while
+  // reading as a legitimate graph entry.
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "identity_counterparty_invalid");
+  assert.equal(await countVersions(ALIAS_OF_ALICE), 1);
+  assert.equal((await edgesFor(ALIAS_OF_ALICE)).length, 0);
+});
+
+test("a merge naming a record that does not exist is refused", async () => {
+  const absorbed = await createRecord(ALIAS_OF_ALICE, { name: "A. Smith" });
+
+  const { result } = await runIdentity({
+    action: "merge_identity",
+    targetRecordId: ALIAS_OF_ALICE,
+    headVersion: 1,
+    headDigest: absorbed,
+    order: mergeOrder("record-identity-nobody"),
+    mutationReceiptId: "mutation.merge.missing",
+  });
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "identity_counterparty_missing");
+  assert.equal(await countVersions(ALIAS_OF_ALICE), 1);
+});
+
+test("a merge cannot reach into ANOTHER PRINCIPAL's record", async () => {
+  const foreign: MemoryScope = { ...SCOPE, principalId: "principal-other" };
+  await createRecord("record-identity-foreign", { name: "Someone else" }, foreign);
+  const absorbed = await createRecord(ALIAS_OF_ALICE, { name: "A. Smith" });
+
+  const { result } = await runIdentity({
+    action: "merge_identity",
+    targetRecordId: ALIAS_OF_ALICE,
+    headVersion: 1,
+    headDigest: absorbed,
+    order: mergeOrder("record-identity-foreign"),
+    mutationReceiptId: "mutation.merge.foreign",
+  });
+
+  // The record exists — just not for this actor. A graph-level version of the
+  // takeover migration 039 closed for genesis.
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "identity_counterparty_missing");
+  assert.equal((await edgesFor(ALIAS_OF_ALICE)).length, 0);
+});
+
+test("a merge whose authorized content is not an identity order is refused, and the token is not burned", async () => {
+  await createRecord(ALICE, { name: "Alice" });
+  const absorbed = await createRecord(ALIAS_OF_ALICE, { name: "A. Smith" });
+
+  const { receipt, result } = await runIdentity({
+    action: "merge_identity",
+    targetRecordId: ALIAS_OF_ALICE,
+    headVersion: 1,
+    headDigest: absorbed,
+    order: { survivorRecordId: ALICE },
+    mutationReceiptId: "mutation.merge.malformed",
+  });
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "identity_order_malformed");
+  assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
+  assert.equal(await countVersions(ALIAS_OF_ALICE), 1);
+});
+
+test("a merge authorization cannot be spent as a correction, or the reverse", async () => {
+  await createRecord(ALICE, { name: "Alice" });
+  const absorbed = await createRecord(ALIAS_OF_ALICE, { name: "A. Smith" });
+  const order = mergeOrder(ALICE);
+  const receipt = await issue(
+    authorization({
+      action: "merge_identity",
+      targetRecordId: ALIAS_OF_ALICE,
+      expectedHead: { kind: "version", version: 1, contentDigest: absorbed },
+      proposedContent: order,
+    }),
+  );
+
+  const asCorrect = await store().correct({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: ALIAS_OF_ALICE,
+    proposedContent: order,
+    mutationReceiptId: "mutation.merge.assubstitute",
+  });
+
+  assert.equal(asCorrect.verified, false);
+  assert.equal(asCorrect.rejection, "authorization_action_mismatch");
+  assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
+});
+
+// ---------------------------------------------------------------------------
+// split_identity
+// ---------------------------------------------------------------------------
+
+test("a split appends one version to the SOURCE and records the edge to an existing record", async () => {
+  const source = await createRecord(ALICE, { name: "Alice and Bob, conflated" });
+  await createRecord("record-identity-bob", { name: "Bob" });
+
+  const { result } = await runIdentity({
+    action: "split_identity",
+    targetRecordId: ALICE,
+    headVersion: 1,
+    headDigest: source,
+    order: splitOrder("record-identity-bob"),
+    mutationReceiptId: "mutation.split.001",
+  });
+
+  assert.equal(result.rejection, null);
+  assert.equal(result.verified, true);
+  assert.equal(await countVersions(ALICE), 2);
+  // The split-off record is untouched: it was created under its own
+  // authorization, which is the only way one authorization stays one mutation.
+  assert.equal(await countVersions("record-identity-bob"), 1);
+
+  const edges = await edgesFor(ALICE);
+  assert.equal(edges.length, 1);
+  assert.equal(edges[0].kind, "split_to");
+  assert.equal(edges[0].to_record_id, "record-identity-bob");
+});
+
+test("a split record is NOT frozen: the source stays mutable afterwards", async () => {
+  // The asymmetry with merge is the point. A split says "some of this was
+  // somebody else"; the source is still a live identity.
+  const source = await createRecord(ALICE, { name: "Alice and Bob" });
+  await createRecord("record-identity-bob", { name: "Bob" });
+  await runIdentity({
+    action: "split_identity",
+    targetRecordId: ALICE,
+    headVersion: 1,
+    headDigest: source,
+    order: splitOrder("record-identity-bob"),
+    mutationReceiptId: "mutation.split.mutable",
+  });
+
+  const head = await store().readHead(SCOPE, ALICE);
+  const next = { name: "Alice" };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      targetRecordId: ALICE,
+      expectedHead: {
+        kind: "version",
+        version: 2,
+        contentDigest: head!.contentDigest,
+      },
+      proposedContent: next,
+    }),
+  );
+  const result = await store().correct({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: ALICE,
+    proposedContent: next,
+    mutationReceiptId: "mutation.split.aftercorrect",
+  });
+
+  assert.equal(result.rejection, null);
+  assert.equal(result.verified, true);
+  assert.equal(await countVersions(ALICE), 3);
+});
+
+test("a split naming a record that does not exist is refused", async () => {
+  const source = await createRecord(ALICE, { name: "Alice and Bob" });
+
+  const { result } = await runIdentity({
+    action: "split_identity",
+    targetRecordId: ALICE,
+    headVersion: 1,
+    headDigest: source,
+    order: splitOrder("record-identity-nobody"),
+    mutationReceiptId: "mutation.split.missing",
+  });
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "identity_counterparty_missing");
+  assert.equal((await edgesFor(ALICE)).length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// The database carries the same rules, for writers that never come through
+// the store.
+// ---------------------------------------------------------------------------
+
+test("an identity edge with no consumed authorization behind it is refused", async () => {
+  await createRecord(ALICE, { name: "Alice" });
+  await createRecord(ALIAS_OF_ALICE, { name: "A. Smith" });
+
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        `INSERT INTO memory_identity_edges
+           (tenant_id, workspace_id, principal_id, user_id, kind,
+            from_record_id, to_record_id, from_version, authorization_id,
+            mutation_receipt_id, reason, reason_evidence_ref, effective_at,
+            payload)
+         VALUES ($1,$2,$3,$4,'merged_into',$5,$6,2,'unwitnessed-00000001',
+                 'mutation.edge.unwitnessed','duplicate_participant',
+                 'matter:x/0001', now(),
+                 jsonb_build_object('kind','merged_into',
+                   'fromRecordId',$5::text,'toRecordId',$6::text,
+                   'authorizationId','unwitnessed-00000001'))`,
+        [
+          SCOPE.tenantId,
+          SCOPE.workspaceId,
+          SCOPE.principalId,
+          SCOPE.userId,
+          ALIAS_OF_ALICE,
+          ALICE,
+        ],
+      ),
+    /no consumed authorization witnesses this identity edge/,
+  );
+  assert.equal((await edgesFor(ALIAS_OF_ALICE)).length, 0);
+});
+
+test("a merge edge cannot be written under a split authorization", async () => {
+  const source = await createRecord(ALICE, { name: "Alice" });
+  await createRecord("record-identity-bob", { name: "Bob" });
+  // Spend a REAL split authorization, which leaves a consumed nonce whose
+  // action is `split_identity`.
+  await runIdentity({
+    action: "split_identity",
+    targetRecordId: ALICE,
+    headVersion: 1,
+    headDigest: source,
+    order: splitOrder("record-identity-bob"),
+    mutationReceiptId: "mutation.split.forkind",
+  });
+  const spent = await adminPool.query(
+    `SELECT authorization_id FROM memory_authorization_nonces
+      WHERE consumed_by_mutation_receipt_id = 'mutation.split.forkind'`,
+  );
+
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        `INSERT INTO memory_identity_edges
+           (tenant_id, workspace_id, principal_id, user_id, kind,
+            from_record_id, to_record_id, from_version, authorization_id,
+            mutation_receipt_id, reason, reason_evidence_ref, effective_at,
+            payload)
+         VALUES ($1,$2,$3,$4,'merged_into',$5,$6,2,$7,
+                 'mutation.split.forkind','duplicate_participant',
+                 'matter:x/0001', now(),
+                 jsonb_build_object('kind','merged_into',
+                   'fromRecordId',$5::text,'toRecordId',$6::text,
+                   'authorizationId',$7::text))`,
+        [
+          SCOPE.tenantId,
+          SCOPE.workspaceId,
+          SCOPE.principalId,
+          SCOPE.userId,
+          ALICE,
+          "record-identity-bob",
+          spent.rows[0].authorization_id,
+        ],
+      ),
+    /a merge edge requires a merge_identity authorization|receipt_unique/,
+  );
+});
+
+test("an identity edge cannot name a record outside the actor's scope", async () => {
+  const foreign: MemoryScope = { ...SCOPE, principalId: "principal-other" };
+  await createRecord("record-identity-foreign", { name: "Elsewhere" }, foreign);
+  const source = await createRecord(ALICE, { name: "Alice" });
+  await createRecord("record-identity-bob", { name: "Bob" });
+  await runIdentity({
+    action: "split_identity",
+    targetRecordId: ALICE,
+    headVersion: 1,
+    headDigest: source,
+    order: splitOrder("record-identity-bob"),
+    mutationReceiptId: "mutation.split.forscope",
+  });
+  const spent = await adminPool.query(
+    `SELECT authorization_id FROM memory_authorization_nonces
+      WHERE consumed_by_mutation_receipt_id = 'mutation.split.forscope'`,
+  );
+
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        `INSERT INTO memory_identity_edges
+           (tenant_id, workspace_id, principal_id, user_id, kind,
+            from_record_id, to_record_id, from_version, authorization_id,
+            mutation_receipt_id, reason, reason_evidence_ref, effective_at,
+            payload)
+         VALUES ($1,$2,$3,$4,'split_to',$5,$6,2,$7,
+                 'mutation.split.forscope','conflated_participants',
+                 'matter:x/0001', now(),
+                 jsonb_build_object('kind','split_to',
+                   'fromRecordId',$5::text,'toRecordId',$6::text,
+                   'authorizationId',$7::text))`,
+        [
+          SCOPE.tenantId,
+          SCOPE.workspaceId,
+          SCOPE.principalId,
+          SCOPE.userId,
+          ALICE,
+          "record-identity-foreign",
+          spent.rows[0].authorization_id,
+        ],
+      ),
+    /must name a record in the same scope|receipt_unique/,
+  );
+});
+
+test("a self-edge is refused by the database as well as by the store", async () => {
+  await createRecord(ALICE, { name: "Alice" });
+
+  await assert.rejects(
+    () =>
+      adminPool.query(
+        `INSERT INTO memory_identity_edges
+           (tenant_id, workspace_id, principal_id, user_id, kind,
+            from_record_id, to_record_id, from_version, authorization_id,
+            mutation_receipt_id, reason, reason_evidence_ref, effective_at,
+            payload)
+         VALUES ($1,$2,$3,$4,'merged_into',$5,$5,2,'a-0000000000000000001',
+                 'mutation.edge.self','duplicate_participant',
+                 'matter:x/0001', now(),
+                 jsonb_build_object('kind','merged_into',
+                   'fromRecordId',$5::text,'toRecordId',$5::text,
+                   'authorizationId','a-0000000000000000001'))`,
+        [
+          SCOPE.tenantId,
+          SCOPE.workspaceId,
+          SCOPE.principalId,
+          SCOPE.userId,
+          ALICE,
+        ],
+      ),
+    /memory_identity_edges_not_self/,
+  );
+});
+
+test("a written identity edge cannot be rewritten or deleted, by anyone", async () => {
+  await createRecord(ALICE, { name: "Alice" });
+  const absorbed = await createRecord(ALIAS_OF_ALICE, { name: "A. Smith" });
+  await runIdentity({
+    action: "merge_identity",
+    targetRecordId: ALIAS_OF_ALICE,
+    headVersion: 1,
+    headDigest: absorbed,
+    order: mergeOrder(ALICE),
+    mutationReceiptId: "mutation.merge.appendonly",
+  });
+
+  await assert.rejects(
+    () =>
+      adminPool.query(
+        `UPDATE memory_identity_edges SET to_record_id = 'record-identity-third'`,
+      ),
+    /append-only|forbid|rewrite/i,
+  );
+  await assert.rejects(
+    () => adminPool.query(`DELETE FROM memory_identity_edges`),
+    /append-only|forbid|rewrite/i,
+  );
+  assert.equal((await edgesFor(ALIAS_OF_ALICE)).length, 1);
+});
+
+test("ONE AUTHORIZATION CANNOT PRODUCE TWO RECORD VERSIONS — the constraint the design rests on", async () => {
+  // Stated as a test because the whole merge/split shape follows from it: if
+  // this were false, a merge could write to both records under one approval.
+  const source = await createRecord(ALICE, { name: "Alice" });
+  await createRecord("record-identity-bob", { name: "Bob" });
+  await runIdentity({
+    action: "split_identity",
+    targetRecordId: ALICE,
+    headVersion: 1,
+    headDigest: source,
+    order: splitOrder("record-identity-bob"),
+    mutationReceiptId: "mutation.split.oneauth",
+  });
+  const spent = await adminPool.query(
+    `SELECT authorization_id FROM memory_authorization_nonces
+      WHERE consumed_by_mutation_receipt_id = 'mutation.split.oneauth'`,
+  );
+
+  // The same authorization, a DIFFERENT receipt id, aimed at the other record.
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        `INSERT INTO memory_record_versions
+           (tenant_id, workspace_id, principal_id, user_id, record_id, version,
+            state, content_digest, predecessor_digest, authorization_id,
+            mutation_receipt_id, payload)
+         VALUES ($1::text,$2::text,$3::text,$4::text,'record-identity-bob',2,
+                 'active',$5::text,$6::text,$7::text,'mutation.split.second',
+                 jsonb_build_object(
+                   'recordId','record-identity-bob','version','2',
+                   'state','active','contentDigest',$5::text,
+                   'predecessorDigest',$6::text,'authorizationId',$7::text,
+                   'mutationReceiptId','mutation.split.second',
+                   'scope', jsonb_build_object('tenantId',$1::text,
+                                               'workspaceId',$2::text,
+                                               'principalId',$3::text,
+                                               'userId',$4::text)))`,
+        [
+          SCOPE.tenantId,
+          SCOPE.workspaceId,
+          SCOPE.principalId,
+          SCOPE.userId,
+          `sha256:${"c".repeat(64)}`,
+          memoryContentDigest({ name: "Bob" }),
+          spent.rows[0].authorization_id,
+        ],
+      ),
+    /no consumed authorization witnesses this record version/,
+  );
+  assert.equal(await countVersions("record-identity-bob"), 1);
+});

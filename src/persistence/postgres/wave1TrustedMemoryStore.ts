@@ -16,6 +16,12 @@ import {
 import type { Pool, PoolClient } from "pg";
 
 import {
+  identityCounterparty,
+  parseIdentityMergeOrder,
+  parseIdentitySplitOrder,
+  type MemoryIdentityEdgeKind,
+} from "../../application/memory/wave1MemoryIdentity";
+import {
   buildTombstone,
   destroyedContentFieldNames,
   parseDeletionOrder,
@@ -236,6 +242,10 @@ class MutationAborted extends Error {
 }
 
 const ABORT_REASON: Record<string, MemoryAbortReason> = {
+  identity_order_malformed: "policy_rejected",
+  identity_counterparty_invalid: "policy_rejected",
+  identity_counterparty_missing: "policy_rejected",
+  record_merged_away: "policy_rejected",
   request_malformed: "policy_rejected",
   authorization_not_found: "policy_rejected",
   authorization_malformed: "policy_rejected",
@@ -673,7 +683,13 @@ export function createPostgresTrustedMemoryStore(
   async function mutate(
     action: Extract<
       MemoryAction,
-      "create" | "correct" | "delete" | "restore" | "promote"
+      | "create"
+      | "correct"
+      | "delete"
+      | "restore"
+      | "promote"
+      | "merge_identity"
+      | "split_identity"
     >,
     request: TrustedMemoryMutationRequest,
     deletion: TrustedMemoryDeleteRequest | null = null,
@@ -710,6 +726,12 @@ export function createPostgresTrustedMemoryStore(
     // the one action that expects to find nothing.
     let priorHead: TrustedMemoryHead | null = null;
     let deletionOrder: ReturnType<typeof parseDeletionOrder> = null;
+    // The identity order and the counterparty it names, filled in only for the
+    // two graph actions. Null everywhere else, so the edge write below cannot
+    // fire for an action that never parsed one.
+    let identityEdge:
+      | { kind: MemoryIdentityEdgeKind; toRecordId: string; reason: string; evidenceRef: string }
+      | null = null;
 
     const lockKey = [
       request.actor.tenantId,
@@ -868,6 +890,27 @@ export function createPostgresTrustedMemoryStore(
         )) !== null
       ) {
         throw new MutationAborted("legal_hold_active");
+      }
+
+      // ---- A MERGED-AWAY RECORD IS CLOSED TO MUTATION -------------------
+      // Checked here, alongside the hold and BEFORE the consumption UPDATE, so
+      // a mutation aimed at an absorbed record refuses without burning the
+      // approver's authorization. Migration 041 carries the same rule as a
+      // trigger, which is what binds writers that never come through here;
+      // this is the caller's ANSWER, that is the ENFORCEMENT.
+      const mergedAway = await client.query(
+        `SELECT 1 FROM memory_identity_edges
+          WHERE tenant_id = $1 AND workspace_id = $2
+            AND from_record_id = $3 AND kind = 'merged_into'
+          LIMIT 1`,
+        [
+          stored.scope.tenantId,
+          stored.scope.workspaceId,
+          stored.targetRecordId,
+        ],
+      );
+      if (mergedAway.rowCount === 1) {
+        throw new MutationAborted("record_merged_away");
       }
 
       if (action === "delete") {
@@ -1051,6 +1094,61 @@ export function createPostgresTrustedMemoryStore(
             throw new MutationAborted("deletion_order_malformed");
           }
         }
+
+        if (action === "merge_identity" || action === "split_identity") {
+          // ---- THE GRAPH CHANGE THE APPROVER AUTHORIZED -----------------
+          // The counterparty is read out of the AUTHORIZED content, whose
+          // digest the approval is bound to, so a caller cannot redirect a
+          // merge at a record nobody approved.
+          //
+          // Parsed AFTER ownership and the compare-and-swap, for the same
+          // reason the deletion order is: an attacker aiming a merge at
+          // somebody else's record must still be told `record_owner_mismatch`
+          // rather than a shape complaint about their own payload.
+          const order =
+            action === "merge_identity"
+              ? parseIdentityMergeOrder(request.proposedContent)
+              : parseIdentitySplitOrder(request.proposedContent);
+          if (order === null) {
+            throw new MutationAborted("identity_order_malformed");
+          }
+          const counterparty = identityCounterparty(order);
+          // A self-edge would freeze the record against every future mutation
+          // while reading as a legitimate graph entry.
+          if (counterparty.recordId === stored.targetRecordId) {
+            throw new MutationAborted("identity_counterparty_invalid");
+          }
+          // BOTH ENDS MUST ALREADY EXIST, ACTIVE, IN THIS ACTOR'S SCOPE.
+          // Read on the mutating connection so it is the same transaction the
+          // edge is written in; migration 041's trigger carries the same rule
+          // for writers that never come through here.
+          const other = await client.query(
+            `SELECT ${RECORD_COLUMNS}
+               FROM memory_record_versions
+              WHERE tenant_id = $1 AND workspace_id = $2
+                AND principal_id = $3 AND user_id = $4
+                AND record_id = $5
+              ORDER BY id DESC
+              LIMIT 1`,
+            [
+              stored.scope.tenantId,
+              stored.scope.workspaceId,
+              stored.scope.principalId,
+              stored.scope.userId,
+              counterparty.recordId,
+            ],
+          );
+          const otherRow = other.rows[0] as RecordRow | undefined;
+          if (!otherRow || headFromRow(otherRow).state !== "active") {
+            throw new MutationAborted("identity_counterparty_missing");
+          }
+          identityEdge = {
+            kind: counterparty.kind,
+            toRecordId: counterparty.recordId,
+            reason: order.reason,
+            evidenceRef: order.reasonEvidenceRef,
+          };
+        }
       }
 
       // ---- 6. WRITE THE NEW VERSION -------------------------------------
@@ -1098,6 +1196,49 @@ export function createPostgresTrustedMemoryStore(
           JSON.stringify(version),
         ],
       );
+
+      // ---- 6a. THE IDENTITY EDGE, INSIDE THE SAME TRANSACTION -----------
+      // Written AFTER the record version deliberately. The freeze trigger on
+      // `memory_record_versions` refuses a version on a record that already
+      // has an outgoing merge edge, and it is a non-deferred AFTER ROW
+      // trigger — so writing the edge first would make the merge refuse its
+      // own version. Both land or neither does.
+      if (identityEdge !== null) {
+        await client.query(
+          `INSERT INTO memory_identity_edges
+             (tenant_id, workspace_id, principal_id, user_id, kind,
+              from_record_id, to_record_id, from_version, authorization_id,
+              mutation_receipt_id, reason, reason_evidence_ref, effective_at,
+              payload)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+          [
+            stored.scope.tenantId,
+            stored.scope.workspaceId,
+            stored.scope.principalId,
+            stored.scope.userId,
+            identityEdge.kind,
+            stored.targetRecordId,
+            identityEdge.toRecordId,
+            nextVersion,
+            stored.authorizationId,
+            request.mutationReceiptId,
+            identityEdge.reason,
+            identityEdge.evidenceRef,
+            committedAt,
+            JSON.stringify({
+              kind: identityEdge.kind,
+              fromRecordId: stored.targetRecordId,
+              toRecordId: identityEdge.toRecordId,
+              fromVersion: nextVersion,
+              authorizationId: stored.authorizationId,
+              mutationReceiptId: request.mutationReceiptId,
+              reason: identityEdge.reason,
+              reasonEvidenceRef: identityEdge.evidenceRef,
+              effectiveAt: committedAt,
+            }),
+          ],
+        );
+      }
 
       // ---- 6b. ERASURE, INSIDE THE SAME TRANSACTION ---------------------
       //
@@ -1648,6 +1789,8 @@ export function createPostgresTrustedMemoryStore(
     delete: deleteRecord,
     restore: (request) => mutate("restore", request),
     promote: (request) => mutate("promote", request),
+    mergeIdentity: (request) => mutate("merge_identity", request),
+    splitIdentity: (request) => mutate("split_identity", request),
     readHead,
     retrieve,
     readTombstone,
