@@ -639,3 +639,65 @@ impossible.
 
 - **Disposition:** `CLOSED`. Falsified: disabling the ordering check turns the
   suite red.
+
+---
+
+## W1BR-016 — CLOSED
+
+`POST /executive/inbound/draft` is the inbound route that enters the chain:
+
+```
+request -> authenticated principal -> authorized workspace -> memory actor
+        -> alias registry -> canonical identity -> authoritative record
+        -> EA pipeline -> draft for review
+```
+
+Proven against a LISTENING SERVER over real HTTP, with the memory service
+composed by the same function `src/server.ts` calls at boot. Not a direct call
+to `runEaPipeline` — that was the previous state and it is what "reachable only
+from a test" meant.
+
+Refusals, each proven: no credentials → 401; a bad token → 401; **a workspace
+the principal does not belong to → 403**, because the store scopes on workspace
+and a route that accepted the caller's claim would read another workspace's
+memory with a perfectly valid session; a malformed body → 400 before anything
+is read.
+
+The route SENDS NOTHING. It returns a draft as a proposal; there is no send
+path and no approval on it. Turning a draft into an outbound message is W1.6
+authority work behind its own gate, and a test asserts the response carries no
+send, approval or delivery field.
+
+`src/server.ts` mounts it only when a CEO profile and at least one model
+provider credential are already present in the environment — **no credentials
+are created** — and prints why it is not mounted otherwise. A route mounted
+without a provider would answer every message `degraded`, and one mounted
+without a profile would draft in nobody's voice; both look like a working
+endpoint, which is worse than a 404.
+
+- **Disposition:** `CLOSED`.
+
+---
+
+## W1BR-017 — The trusted-memory principal is mapped to the user
+
+- **Gate:** W1.3 · **Source:** HTTP reachability wiring · **Severity:** LOW
+  (modelling, disclosed)
+
+Trusted memory scopes on four dimensions: tenant, workspace, principal, user.
+An authenticated `Principal` carries three — there is no `principalId` anywhere
+in Core outside the memory layer.
+
+`memoryActorFor` maps `principalId` to the authenticated user's own id: in
+Wave 1 the human acts as their own memory principal. This is a DEPLOYMENT FACT,
+not a weakening — the store still compares all four dimensions independently
+and every control over them is unchanged; both simply carry the same value.
+
+Raised rather than decided quietly: a distinct assistant principal acting on a
+user's behalf is not modelled anywhere, and inventing a namespace for one
+inside an HTTP handler is the kind of identity decision that should not be made
+in an HTTP handler.
+
+- **Disposition:** `OPEN` (residual, disclosed, no control weakened)
+- **Closure path:** model the assistant principal explicitly when an agent
+  acts on a user's behalf rather than as them — W1.6 authority surface.

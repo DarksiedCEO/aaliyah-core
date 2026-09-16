@@ -2,6 +2,7 @@ import express, { type Express } from "express";
 import { internalEvalRoutes } from "./internalEvalRoutes";
 import { createAuthRouter } from "./authRoutes";
 import { createMailRouter, type MailAuthDeps, type MailRoutesDeps } from "./mailRoutes";
+import { createExecutiveRouter, type ExecutiveRoutesDeps } from "./executiveRoutes";
 import { createAuthService, type AuthService } from "../auth/authService";
 import { fetchGoogleJwks } from "../auth/googleIdentity";
 import { createInMemoryIdentityState, type IdentityBackend } from "../auth/identityState";
@@ -94,6 +95,13 @@ export function createCoreApp(
     /** Readiness probe for /ready. Defaults to trivially-ready (dev); the
      * server wires a real Postgres ping in production. */
     readinessProbe?: ReadinessProbe;
+    /**
+     * The executive inbound route. Mounted ONLY when supplied, because it
+     * needs an authoritative memory service and model routers — and a route
+     * that drafted with neither would look identical to one that met a contact
+     * it had never seen.
+     */
+    executive?: Omit<ExecutiveRoutesDeps, "auth">;
   } = {},
 ): Express {
   if (
@@ -131,6 +139,9 @@ export function createCoreApp(
   app.use(internalEvalRoutes);
   app.use(createAuthRouter({ auth: authService, googleLoginAvailable }));
   app.use(createMailRouter(mailRoutesDeps(mailAuth, mailState)));
+  if (options.executive) {
+    app.use(createExecutiveRouter({ auth: mailAuth, ...options.executive }));
+  }
 
   // Liveness: the process is up and the event loop is responsive. Deliberately
   // dependency-free — a liveness failure means "restart me", not "back off".

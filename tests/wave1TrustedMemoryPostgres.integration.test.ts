@@ -4507,7 +4507,10 @@ async function waitForBlockedBackend(): Promise<void> {
          FROM pg_stat_activity
         WHERE wait_event_type = 'Lock'
           AND state = 'active'
-          AND datname = current_database()`,
+          AND datname = current_database()
+          AND cardinality(pg_blocking_pids(pid)) > 0
+          AND query ILIKE '%memory_authorization_nonces%'
+          AND query ILIKE '%consumed_at = now()%'`,
     );
     if ((result.rows[0].n as number) > 0) return;
     await new Promise((resolve) => setTimeout(resolve, 25));
