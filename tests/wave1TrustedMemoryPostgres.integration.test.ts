@@ -4055,3 +4055,424 @@ test("the ownership continuity pin at version 2 still refuses separately", async
   );
   assert.equal(await countVersions(), 1);
 });
+
+// ---------------------------------------------------------------------------
+// GATE 4 SURVIVORS — controls that had no test until a mutation sweep said so.
+//
+// An independent mutation-discrimination sweep applied 103 mutants at this
+// candidate and 34 survived. These close the CRITICAL and HIGH ones. Each test
+// below was written because deleting the control it names left the suite
+// green, which means the control was present and unproven.
+// ---------------------------------------------------------------------------
+
+/**
+ * A receipt and a nonce that do NOT agree, written raw so the disagreement is
+ * constructible at all. `issue()` builds a consistent pair by design, which is
+ * exactly why it cannot produce these cases.
+ */
+async function issueMismatchedAuthorization(input: {
+  authorizationId: string;
+  receiptScope: MemoryScope;
+  nonceTenantId: string;
+  nonceAuthorizationId?: string;
+  action: string;
+  recordId: string;
+  mutationReceiptId: string;
+}): Promise<void> {
+  const bindingDigest = memoryContentDigest(input.authorizationId);
+  await runAs(
+    "aaliyah_memory_issuer",
+    `INSERT INTO memory_authorization_receipts
+       (tenant_id, workspace_id, principal_id, user_id, authorization_id,
+        action, target_record_id, binding_digest, issued_at, expires_at,
+        revoked_at, consumed_at, payload)
+     VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,
+             $8::text, now() - interval '1 minute', now() + interval '1 hour',
+             NULL, NULL,
+             jsonb_build_object(
+               'authorizationId',$5::text,'action',$6::text,
+               'targetRecordId',$7::text,
+               'scope', jsonb_build_object('tenantId',$1::text,
+                                           'workspaceId',$2::text,
+                                           'principalId',$3::text,
+                                           'userId',$4::text),
+               'nonce', jsonb_build_object('bindingDigest',$8::text)))`,
+    [
+      input.receiptScope.tenantId,
+      input.receiptScope.workspaceId,
+      input.receiptScope.principalId,
+      input.receiptScope.userId,
+      input.authorizationId,
+      input.action,
+      input.recordId,
+      bindingDigest,
+    ],
+  );
+  const nonceAuthorizationId =
+    input.nonceAuthorizationId ?? input.authorizationId;
+  const nonceDigest = memoryContentDigest(`nonce:${nonceAuthorizationId}`);
+  await runAs(
+    "aaliyah_memory_issuer",
+    `INSERT INTO memory_authorization_nonces
+       (tenant_id, workspace_id, binding_digest, authorization_id, action,
+        target_record_id, issued_at, expires_at)
+     VALUES ($1,$2,$3,$4,$5,$6, now() - interval '1 minute',
+             now() + interval '1 hour')`,
+    [
+      input.nonceTenantId,
+      input.receiptScope.workspaceId,
+      nonceDigest,
+      nonceAuthorizationId,
+      input.action,
+      input.recordId,
+    ],
+  );
+  await runAs(
+    "aaliyah_memory_mutator",
+    `UPDATE memory_authorization_nonces
+        SET consumed_at = now(), consumed_by_mutation_receipt_id = $2
+      WHERE binding_digest = $1 AND consumed_at IS NULL`,
+    [nonceDigest, input.mutationReceiptId],
+  );
+}
+
+async function rawGenesis(input: {
+  scope: MemoryScope;
+  recordId: string;
+  authorizationId: string;
+  mutationReceiptId: string;
+}): Promise<string | null> {
+  const digest = memoryContentDigest({ planted: "raw" });
+  try {
+    await runAs(
+      "aaliyah_memory_mutator",
+      `INSERT INTO memory_record_versions
+         (tenant_id, workspace_id, principal_id, user_id, record_id, version,
+          state, content_digest, predecessor_digest, authorization_id,
+          mutation_receipt_id, payload)
+       VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,1,'active',
+               $6::text,NULL,$7::text,$8::text,
+               jsonb_build_object(
+                 'schemaVersion',$9::text,'recordId',$5::text,
+                 'version','1','state','active',
+                 'content', jsonb_build_object('planted','raw'),
+                 'contentDigest',$6::text,'predecessorDigest',NULL,
+                 'authorizationId',$7::text,'mutationReceiptId',$8::text,
+                 'createdAt',$10::text,
+                 'scope', jsonb_build_object('tenantId',$1::text,
+                                             'workspaceId',$2::text,
+                                             'principalId',$3::text,
+                                             'userId',$4::text)))`,
+      [
+        input.scope.tenantId,
+        input.scope.workspaceId,
+        input.scope.principalId,
+        input.scope.userId,
+        input.recordId,
+        digest,
+        input.authorizationId,
+        input.mutationReceiptId,
+        MEMORY_RECORD_VERSION_SCHEMA_VERSION,
+        isoOffset(-1_000),
+      ],
+    );
+    return null;
+  } catch (error) {
+    return (error as Error).message;
+  }
+}
+
+test("a genesis cannot cite an authorization issued in another TENANT", async () => {
+  // Kills the `a.tenant_id = NEW.tenant_id` conjunct of migration 039. The
+  // nonce is minted in THIS tenant so the witness passes; only the receipt
+  // belongs elsewhere, which isolates the conjunct under test.
+  await issueMismatchedAuthorization({
+    authorizationId: "mismatch-tenant-0000001",
+    receiptScope: { ...SCOPE, tenantId: "tenant-elsewhere" },
+    nonceTenantId: SCOPE.tenantId,
+    action: "create",
+    recordId: "record-mismatch-tenant",
+    mutationReceiptId: "mutation.mismatch.tenant",
+  });
+
+  const refusal = await rawGenesis({
+    scope: SCOPE,
+    recordId: "record-mismatch-tenant",
+    authorizationId: "mismatch-tenant-0000001",
+    mutationReceiptId: "mutation.mismatch.tenant",
+  });
+
+  assert.match(
+    refusal ?? "",
+    /must begin under the scope its authorization names/,
+  );
+  assert.equal(await countVersions("record-mismatch-tenant"), 0);
+});
+
+test("a genesis cannot cite an authorization id that no stored authorization carries", async () => {
+  // Kills the `a.authorization_id = NEW.authorization_id` conjunct. A receipt
+  // with the RIGHT scope exists, so a guard that checked only the scope would
+  // be satisfied by somebody else's approval.
+  await issueMismatchedAuthorization({
+    authorizationId: "mismatch-authid-0000001",
+    receiptScope: SCOPE,
+    nonceTenantId: SCOPE.tenantId,
+    nonceAuthorizationId: "mismatch-authid-0000002",
+    action: "create",
+    recordId: "record-mismatch-authid",
+    mutationReceiptId: "mutation.mismatch.authid",
+  });
+
+  const refusal = await rawGenesis({
+    scope: SCOPE,
+    recordId: "record-mismatch-authid",
+    // The id the NONCE witnesses, for which no receipt exists.
+    authorizationId: "mismatch-authid-0000002",
+    mutationReceiptId: "mutation.mismatch.authid",
+  });
+
+  assert.match(
+    refusal ?? "",
+    /must begin under the scope its authorization names/,
+  );
+  assert.equal(await countVersions("record-mismatch-authid"), 0);
+});
+
+// ---------------------------------------------------------------------------
+// `postStateAgrees` — THE LAST GATE BEFORE `verified: true`.
+//
+// The sweep dropped each of its nine conjuncts and the suite stayed green: no
+// test built a read-back agreeing on eight fields and disagreeing on the
+// ninth. That is the precise defect class this file's header narrates — "the
+// post-commit read-back CONFIRMED the takeover".
+//
+// FIVE of the nine are reachable and are killed below. The other four are
+// UNREACHABLE, and the reason is structural rather than an omission:
+// `headFromRow` already refuses a row whose payload disagrees with its columns
+// on recordId, version, state, contentDigest, predecessorDigest, tenantId and
+// workspaceId; the read-back query filters on tenant, workspace and record id,
+// so those three can never differ from the authorization; and the version is
+// compared and rejected earlier, before this expression is reached. That
+// leaves `recordId`, `version`, `scope.tenantId` and `scope.workspaceId` with
+// no reachable input. They are reported as surviving mutants, not claimed as
+// covered.
+//
+// `scope.principalId` and `scope.userId` are the two fields `headFromRow` does
+// NOT bind to their columns, which is exactly why they are reachable here and
+// why they matter most: they are the ownership half of the takeover.
+// ---------------------------------------------------------------------------
+
+/** The row the post-commit read-back will observe, in the unchecked schema. */
+async function seedObservedHead(overrides: {
+  version?: number;
+  state?: string;
+  contentDigest?: string;
+  predecessorDigest?: string | null;
+  principalId?: string;
+  userId?: string;
+  content: unknown;
+}): Promise<void> {
+  const scope = {
+    ...SCOPE,
+    principalId: overrides.principalId ?? SCOPE.principalId,
+    userId: overrides.userId ?? SCOPE.userId,
+  };
+  const version = overrides.version ?? 2;
+  const state = overrides.state ?? "active";
+  const contentDigest =
+    overrides.contentDigest ?? memoryContentDigest(overrides.content);
+  const predecessorDigest =
+    overrides.predecessorDigest === undefined
+      ? null
+      : overrides.predecessorDigest;
+  await adminPool.query(
+    `INSERT INTO ${UNCHECKED_SCHEMA}.memory_record_versions
+       (tenant_id, workspace_id, principal_id, user_id, record_id, version,
+        state, content_digest, predecessor_digest, authorization_id,
+        mutation_receipt_id, payload)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+    [
+      SCOPE.tenantId,
+      SCOPE.workspaceId,
+      SCOPE.principalId,
+      SCOPE.userId,
+      RECORD_ID,
+      version,
+      state,
+      contentDigest,
+      predecessorDigest,
+      "genesis-000000000000000000000",
+      "mutation.observed",
+      JSON.stringify({
+        schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
+        recordId: RECORD_ID,
+        version,
+        state,
+        scope,
+        content: overrides.content,
+        contentDigest,
+        predecessorDigest,
+        authorizationId: "genesis-000000000000000000000",
+        mutationReceiptId: "mutation.observed",
+        createdAt: isoOffset(-1_000),
+      }),
+    ],
+  );
+}
+
+/** Run a correction whose post-commit read-back lands on the unchecked schema. */
+async function correctObserving(mutationReceiptId: string) {
+  const genesis = await seedGenesis({ note: "original" });
+  const next = { note: "corrected" };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, genesis),
+      proposedContent: next,
+    }),
+  );
+  return {
+    genesis,
+    next,
+    run: () =>
+      createPostgresTrustedMemoryStore(writePool, uncheckedReadPool).correct({
+        actor: SCOPE,
+        authorizationId: receipt.authorizationId,
+        recordId: RECORD_ID,
+        proposedContent: next,
+        mutationReceiptId,
+      }),
+  };
+}
+
+test("postStateAgrees POSITIVE CONTROL: an observed head that agrees on every field reports verified", async () => {
+  // Without this, all five refusals below would pass against a store that
+  // never reported success at all.
+  const c = await correctObserving("mutation.agree.ok");
+  await seedObservedHead({
+    content: c.next,
+    predecessorDigest: c.genesis,
+  });
+
+  const result = await c.run();
+
+  assert.equal(result.rejection, null);
+  assert.equal(result.verified, true);
+});
+
+test("postStateAgrees kills a read-back whose CONTENT DIGEST is not the authorized one", async () => {
+  const c = await correctObserving("mutation.agree.digest");
+  // The content still hashes to the authorized digest, so the divergence check
+  // ahead of this one passes. The stored digest column is what disagrees.
+  await seedObservedHead({
+    content: c.next,
+    contentDigest: `sha256:${"9".repeat(64)}`,
+    predecessorDigest: c.genesis,
+  });
+
+  const result = await c.run();
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "unknown_outcome");
+});
+
+test("postStateAgrees kills a read-back whose PREDECESSOR does not link to what we wrote", async () => {
+  const c = await correctObserving("mutation.agree.predecessor");
+  await seedObservedHead({
+    content: c.next,
+    predecessorDigest: `sha256:${"8".repeat(64)}`,
+  });
+
+  const result = await c.run();
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "unknown_outcome");
+});
+
+test("postStateAgrees kills a read-back whose STATE is not the state this action writes", async () => {
+  const c = await correctObserving("mutation.agree.state");
+  await seedObservedHead({
+    content: c.next,
+    predecessorDigest: c.genesis,
+    state: "deleted",
+  });
+
+  const result = await c.run();
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "unknown_outcome");
+});
+
+test("postStateAgrees kills a read-back owned by another PRINCIPAL", async () => {
+  // The ownership half of the takeover the file's header describes, and one of
+  // the two fields `headFromRow` does not bind to its column.
+  const c = await correctObserving("mutation.agree.principal");
+  await seedObservedHead({
+    content: c.next,
+    predecessorDigest: c.genesis,
+    principalId: "principal-attacker",
+  });
+
+  const result = await c.run();
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "unknown_outcome");
+});
+
+test("postStateAgrees kills a read-back owned by another USER", async () => {
+  const c = await correctObserving("mutation.agree.user");
+  await seedObservedHead({
+    content: c.next,
+    predecessorDigest: c.genesis,
+    userId: "user-attacker",
+  });
+
+  const result = await c.run();
+
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "unknown_outcome");
+});
+
+test("the head lookup is scoped to the WORKSPACE, not merely the tenant and record id", async () => {
+  // Kills the `workspace_id = $2` predicate in the compare-and-swap head
+  // lookup. Two records share a tenant and a record id across workspaces; the
+  // OTHER workspace's row is written second, so it wins `ORDER BY id DESC`
+  // once the predicate is gone, and this correction then compares against a
+  // head that is not its own.
+  const genesis = await seedGenesis({ note: "ours" });
+  await seedGenesis(
+    { note: "theirs" },
+    {
+      scope: { ...SCOPE, workspaceId: "workspace-neighbour" },
+      recordId: RECORD_ID,
+    },
+  );
+
+  const next = { note: "corrected" };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, genesis),
+      proposedContent: next,
+    }),
+  );
+
+  const result = await store().correct({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: next,
+    mutationReceiptId: "mutation.workspace.scope",
+  });
+
+  assert.equal(result.rejection, null);
+  assert.equal(result.verified, true);
+  // Our workspace advanced; the neighbour's record did not.
+  const ours = await store().readHead(SCOPE, RECORD_ID);
+  assert.equal(ours?.version, 2);
+  const theirs = await store().readHead(
+    { ...SCOPE, workspaceId: "workspace-neighbour" },
+    RECORD_ID,
+  );
+  assert.equal(theirs?.version, 1);
+});
