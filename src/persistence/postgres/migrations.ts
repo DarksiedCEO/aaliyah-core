@@ -3533,6 +3533,21 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
   },
 ];
 
+/**
+ * The numeric prefix of a migration id, as a number.
+ *
+ * Parsed rather than compared as text so a malformed id fails LOUDLY here
+ * instead of sorting somewhere arbitrary and making the ordering check answer
+ * confidently about nothing.
+ */
+function migrationOrdinal(id: string): number {
+  const match = /^(\d{3})_/.exec(id);
+  if (match === null) {
+    throw new Error(`migration id ${id} does not begin with a three-digit ordinal`);
+  }
+  return Number(match[1]);
+}
+
 export async function runMailMigrations(pool: Pool): Promise<void> {
   await pool.query(
     `CREATE TABLE IF NOT EXISTS aaliyah_mail_migrations (
@@ -3550,8 +3565,34 @@ export async function runMailMigrations(pool: Pool): Promise<void> {
         (r: { id: string }) => r.id,
       ),
     );
+    // ---- MIGRATIONS ARE NOT INDEPENDENTLY REPLAYABLE (W1BR-014) ----------
+    //
+    // Several migrations use CREATE OR REPLACE to HARDEN a definition an
+    // earlier one introduced: 033 redefines the numeric-domain helpers
+    // schema-qualified with a pinned `search_path`, where 027 defined them
+    // unqualified. Replaying 027 after 033 therefore silently reverts that
+    // hardening, and the only symptom is a search-path shadowing test going
+    // red somewhere else entirely. Encountered exactly that way.
+    //
+    // The runner already skips applied ids, so this cannot happen on an
+    // ordinary upgrade. It happens when a row is deleted and the runner is
+    // re-run, when tooling replays by id, or after a partial restore — and in
+    // every one of those cases the operator believes they are repairing
+    // something. Refusing is the only safe answer: applying an older
+    // definition over a newer one is not a repair.
+    const highestApplied = [...applied]
+      .map(migrationOrdinal)
+      .reduce((high, ordinal) => (ordinal > high ? ordinal : high), -1);
     for (const migration of MIGRATIONS) {
       if (applied.has(migration.id)) continue;
+      const ordinal = migrationOrdinal(migration.id);
+      if (ordinal < highestApplied) {
+        throw new Error(
+          `migration ${migration.id} is older than migration ordinal ` +
+            `${highestApplied}, which is already applied. Replaying it would ` +
+            `revert any definition a later migration hardened. Refusing.`,
+        );
+      }
       await client.query(migration.sql);
       await client.query("INSERT INTO aaliyah_mail_migrations (id) VALUES ($1)", [migration.id]);
     }

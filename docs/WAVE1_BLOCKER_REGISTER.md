@@ -570,3 +570,72 @@ every case in their table pass for the wrong reason:
 - **Disposition:** `CLOSED` for 77 of 81; the remaining 4 are
   `BOUNDED_AND_PROVEN_NONBLOCKING` — structurally unreachable, disclosed, with
   the property they exist to protect proven by other means.
+
+---
+
+## W1BR-008 UPDATE — the oracle, measured, and a sharper edge than first stated
+
+`tests/wave1MemoryDigestOraclePostgres.integration.test.ts` executes the
+residual rather than describing it.
+
+**THE EDGE THE ORIGINAL ENTRY DID NOT NAME: erasure does not destroy the
+digest.** `delete` nulls `payload.content` on every prior version, and leaves
+`content_digest` standing — on the erased row, and again on the tombstone
+version's `predecessor_digest`, where it is the chain link. Executed: after a
+`subject_erasure_request`, the plaintext is gone from every version, and
+`memoryContentDigest({ nationalId: "123-45-6789", status: "verified" })` still
+equals the stored digest. **The content is destroyed; the ability to confirm
+what it was is not.**
+
+That second copy is why this cannot be closed by nulling a column. The
+predecessor digest is what makes the chain verifiable, so removing it breaks
+the property the chain exists for. Closing it requires a KEYED construction,
+which is what `src/crypto/memoryIntegrity.ts` provides.
+
+**THE BOUND, PROVEN:**
+
+- The store does NOT hand the digest to another principal: `readHead` and
+  `retrieve` filter on all four scope dimensions, and an intruding principal
+  gets null from both.
+- The exposure is to a party with STORED-STATE access — a backup, a replica, a
+  log that captured a receipt — not to an ordinary API caller.
+- A wrong guess is rejected precisely, which is what makes a low-entropy guess
+  space searchable.
+
+**THE CLOSURE PATH, DEMONSTRATED:** the same correct guess against the keyed
+primitive confirms nothing, an attacker-chosen key does not reproduce the tag,
+and the holder of the real key still verifies it — so the tag stays an
+integrity control rather than becoming an opaque value.
+
+**STATUS.** A test asserts no keyed-tag column exists on
+`memory_record_versions`, so this residual cannot quietly come to be believed
+closed because a keyed primitive was merged.
+
+- **Disposition:** `BOUNDED_AND_PROVEN_NONBLOCKING` for W1.3 as gated —
+  production key infrastructure remains honestly NOT PROVEN, which the gate
+  admits. Closing requires the contracts-level digest to become keyed across
+  both repositories.
+- **FOUNDER DECISION NEEDED, and it is not mine:** whether a subject-erasure
+  guarantee is acceptable while a party with stored-state access can still
+  confirm erased low-entropy content. That is a compliance question about what
+  Aaliyah promises a data subject, not an engineering trade-off. Raising it
+  before real personal data is handled, not after.
+
+---
+
+## W1BR-014 — CLOSED
+
+`runMailMigrations` now refuses to apply a migration whose ordinal is lower
+than the highest already applied, because applying an older definition over a
+newer one is not a repair. Migration ids are parsed for a three-digit ordinal
+and a malformed id fails loudly rather than sorting arbitrarily.
+
+Proven on a database of its own: migrations apply from empty (the positive
+control), re-running is a no-op, deleting an old row and re-running is refused
+with 033's hardened definition still live, the refusal is general rather than
+specific to one migration, and **re-applying the HIGHEST migration is still
+allowed** — otherwise an ordinary re-run after an interrupted deploy would be
+impossible.
+
+- **Disposition:** `CLOSED`. Falsified: disabling the ordering check turns the
+  suite red.
