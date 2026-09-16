@@ -126,6 +126,8 @@ export const TRUSTED_MEMORY_REJECTIONS = [
   "identity_counterparty_invalid",
   /** An identity order naming a record that is not an active record here. */
   "identity_counterparty_missing",
+  /** A merge naming a record that was itself merged away: a merge into a ghost. */
+  "identity_counterparty_merged_away",
   /**
    * The target has been merged into another record. It keeps its history and
    * accepts no further versions; the survivor is where mutations go.

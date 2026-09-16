@@ -245,6 +245,7 @@ const ABORT_REASON: Record<string, MemoryAbortReason> = {
   identity_order_malformed: "policy_rejected",
   identity_counterparty_invalid: "policy_rejected",
   identity_counterparty_missing: "policy_rejected",
+  identity_counterparty_merged_away: "policy_rejected",
   record_merged_away: "policy_rejected",
   request_malformed: "policy_rejected",
   authorization_not_found: "policy_rejected",
@@ -1141,6 +1142,31 @@ export function createPostgresTrustedMemoryStore(
           const otherRow = other.rows[0] as RecordRow | undefined;
           if (!otherRow || headFromRow(otherRow).state !== "active") {
             throw new MutationAborted("identity_counterparty_missing");
+          }
+          // A MERGE MAY NOT POINT AT A RECORD THAT WAS ITSELF MERGED AWAY.
+          // Naming one is a merge into a ghost, and A-into-B followed by
+          // B-into-A closes a cycle that a read-time resolver walks forever.
+          // `state` does not catch it: a merge freezes, it does not delete, so
+          // an absorbed record's head is still `active`. Migration 042 carries
+          // the same rule as a trigger.
+          //
+          // Merges only. A `split_to` edge may name a record that is later
+          // absorbed, because a split records history rather than a redirect.
+          if (counterparty.kind === "merged_into") {
+            const counterpartyMerged = await client.query(
+              `SELECT 1 FROM memory_identity_edges
+                WHERE tenant_id = $1 AND workspace_id = $2
+                  AND from_record_id = $3 AND kind = 'merged_into'
+                LIMIT 1`,
+              [
+                stored.scope.tenantId,
+                stored.scope.workspaceId,
+                counterparty.recordId,
+              ],
+            );
+            if (counterpartyMerged.rowCount === 1) {
+              throw new MutationAborted("identity_counterparty_merged_away");
+            }
           }
           identityEdge = {
             kind: counterparty.kind,

@@ -5,6 +5,7 @@ import { createReadinessProbe } from "./http/readiness";
 import { assertProductionConfig } from "./config/productionConfig";
 import { createMailDbPool } from "./persistence/postgres/pool";
 import { runMailMigrations } from "./persistence/postgres/migrations";
+import { createPostgresWave1MemoryService } from "./persistence/postgres/wave1IdentityGraphStore";
 
 const port = Number(process.env.PORT ?? 3000);
 const SHUTDOWN_GRACE_MS = Number(process.env.AALIYAH_SHUTDOWN_GRACE_MS ?? 10_000);
@@ -21,10 +22,42 @@ async function main(): Promise<void> {
   // A long-lived pool dedicated to readiness + migrations. Kept open for the
   // process lifetime so /ready can ping it; closed on shutdown.
   const pool = databaseConfigured ? createMailDbPool() : undefined;
+  // A SECOND pool, and not a luxury: the trusted-memory store's post-commit
+  // read-back has to run on a connection that is not the mutating one, and the
+  // alias registry refuses to be constructed with a single pool for that exact
+  // reason. Closed on shutdown alongside the first.
+  const readPool = databaseConfigured ? createMailDbPool() : undefined;
 
-  if (pool) {
+  if (pool && readPool) {
     await runMailMigrations(pool);
     process.stdout.write("mail state: postgres (migrations applied)\n");
+
+    // ---- TRUSTED MEMORY, REACHED AT BOOT ---------------------------------
+    // Reconciliation is the one memory operation that belongs to the PROCESS
+    // rather than to a request: an outcome left UNKNOWN by a crash has no
+    // caller waiting on it, so nothing would ever resolve it if resolution
+    // only happened inside a request. Running it here means a restart is what
+    // settles what the crash left open.
+    //
+    // Fail-open DELIBERATELY, and only here: refusing to boot because an old
+    // ambiguous outcome could not be settled would turn a historical unknown
+    // into a total outage. The unknown stays durable and stays unknown, which
+    // is exactly what it did before this ran.
+    const memory = createPostgresWave1MemoryService(pool, readPool);
+    try {
+      const settled = await memory.reconcilePending();
+      process.stdout.write(
+        settled === 0
+          ? "trusted memory: no unresolved mutations\n"
+          : `trusted memory: reconciled ${settled} unresolved mutation(s)\n`,
+      );
+    } catch (error) {
+      process.stderr.write(
+        `trusted memory: reconciliation pass failed (${
+          error instanceof Error ? error.message : String(error)
+        }) — unresolved outcomes remain unresolved\n`,
+      );
+    }
   } else {
     process.stdout.write(
       "mail state: IN-MEMORY (dev only — set AALIYAH_DATABASE_URL for durable state)\n",
@@ -56,8 +89,7 @@ async function main(): Promise<void> {
     }, SHUTDOWN_GRACE_MS);
     force.unref();
     server.close(() => {
-      void pool
-        ?.end()
+      void Promise.all([pool?.end(), readPool?.end()])
         .catch(() => {
           // best effort — we are exiting anyway
         })

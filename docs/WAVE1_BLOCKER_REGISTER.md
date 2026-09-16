@@ -447,3 +447,80 @@ replays by id, and by a partial restore.
   033's definitions back into 027 so there is one definition, or add a
   migration-order assertion that refuses to apply an id lower than the highest
   already applied. Both are schema-tooling changes, not store changes.
+
+---
+
+## W1.3 IDENTITY SEMANTICS — FOUNDER DECISION, LOCKED
+
+Recorded here because it is a product decision, not an implementation one, and
+the code now depends on it.
+
+**MERGE.** `merge_identity` targets the ABSORBED identity. The absorbed
+record's history remains immutable and retained; it becomes frozen against
+future ordinary mutation; the merge does NOT imply deletion. Canonical
+read-time resolution may redirect an absorbed identity to its surviving
+identity without rewriting historical evidence.
+
+**SPLIT.** `split_identity` does not implicitly create another identity. The
+split-off identity must already exist through its own independently authorized
+`create`. The split then records the relationship change.
+
+**CORE LAW.** ONE AUTHORIZATION → ONE MUTATION. The nonce, receipt, CAS,
+version and witness invariants are not to be weakened to make merge or split
+more convenient.
+
+Read-time canonical resolution is implemented in
+`src/application/memory/wave1MemoryService.ts` and is strictly read-only: it
+resolves, and it never mutates or hides the absorbed record.
+
+---
+
+## W1BR-015 — A merge could name a record that was itself merged away
+
+- **Gate:** W1.3 · **Source:** Found while building the read-time canonical
+  resolver — not by a test · **Severity:** MEDIUM
+- **Location:** `src/persistence/postgres/migrations.ts` migration 041
+
+Migration 041 refuses a SECOND outgoing merge from one record and freezes a
+record once absorbed. Neither stopped an edge pointing INTO an absorbed record.
+
+Two consequences. A merge into a ghost: the named survivor no longer accepts
+mutations, so the identity resolves to something already superseded. And a
+CYCLE — A merged into B, then B merged into A. B is not frozen by its own
+outgoing edge, and A's head state is still `active` (a merge freezes, it does
+not delete), so every check in 041 passes and the graph closes a loop. A
+resolver walking that graph never terminates.
+
+- **Disposition:** `CLOSED` by migration
+  `042_memory_identity_no_merge_into_absorbed`, plus the matching
+  application-side refusal `identity_counterparty_merged_away`.
+- **Defence in depth:** the resolver carries an independent depth bound and
+  refuses rather than truncating, because a replica or a restored backup
+  carries no trigger guarantee — and a truncated walk returns a NON-canonical
+  identity indistinguishable from a canonical one.
+
+---
+
+## W1BR-016 — The executive pipeline is not reachable over HTTP
+
+- **Gate:** W1.3 · **Source:** Reachability wiring · **Severity:** MEDIUM
+  (completeness, disclosed)
+
+W1.3 item 4 asked for proof that trusted memory is reached by a real Core
+consumer rather than being dead library code. That is now true of the STORE:
+`src/server.ts` composes the memory service at boot, runs a reconciliation
+pass before opening a socket, and `runEaPipeline` reads authoritative memory
+for an email's sender through the alias registry and the identity graph.
+
+**The honest remaining gap: `runEaPipeline` itself has no HTTP route.** Its
+only callers are tests. So the chain
+`email -> alias -> identity -> canonical identity -> trusted memory -> consumer`
+is proven end to end against a live PostgreSQL, and the ENTRY to that chain
+from an actual request is not yet wired.
+
+- **Disposition:** `OPEN` (residual, disclosed). Reported rather than described
+  as "wired", because a chain that no request can enter is reachable only from
+  a test.
+- **Closure path:** an inbound route that constructs the EA deps — including
+  the memory service `src/server.ts` already builds — and calls the pipeline.
+  That is W1.4 surface, not W1.3.

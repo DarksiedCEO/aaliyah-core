@@ -3447,6 +3447,90 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
     GRANT USAGE, SELECT ON SEQUENCE memory_identity_edges_id_seq
       TO aaliyah_memory_mutator`,
   },
+  {
+    // ------------------------------------------------------------------
+    // A MERGE MAY NOT POINT AT A RECORD THAT WAS ITSELF MERGED AWAY.
+    //
+    // Found while building the read-time canonical resolver, not by a test.
+    // Migration 041 refuses a SECOND outgoing merge from one record, and it
+    // freezes a record once it has been absorbed. Neither stops an edge
+    // pointing INTO an absorbed record.
+    //
+    // Two consequences, both real. A merge into a ghost: the survivor named is
+    // a record that no longer accepts mutations, so the identity resolves to
+    // something already superseded. And a CYCLE: A merged into B, then B
+    // merged into A. B is not frozen by its own outgoing edge, and A's head
+    // state is still active — a merge freezes, it does not delete — so every
+    // check in 041 passes and the graph closes a loop. A resolver walking that
+    // graph never terminates.
+    //
+    // The resolver carries its own depth bound regardless, because a guard and
+    // a bounded walk protect against different failures: this stops the cycle
+    // being CREATED, the bound stops an existing one hanging a reader.
+    // ------------------------------------------------------------------
+    id: "042_memory_identity_no_merge_into_absorbed",
+    sql: `CREATE OR REPLACE FUNCTION public.aaliyah_memory_identity_edge_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        acted text;
+      BEGIN
+        SELECT n.action INTO acted
+          FROM public.aaliyah_memory_spent_nonce(
+                 NEW.tenant_id, NEW.authorization_id,
+                 NEW.mutation_receipt_id) AS n
+         WHERE n.target_record_id = NEW.from_record_id
+         LIMIT 1;
+        IF acted IS NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: no consumed authorization witnesses this identity edge'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.kind = 'merged_into' AND acted <> 'merge_identity' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a merge edge requires a merge_identity authorization'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.kind = 'split_to' AND acted <> 'split_identity' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a split edge requires a split_identity authorization'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        PERFORM 1 FROM public.memory_record_versions AS v
+         WHERE v.tenant_id = NEW.tenant_id
+           AND v.workspace_id = NEW.workspace_id
+           AND v.principal_id = NEW.principal_id
+           AND v.user_id = NEW.user_id
+           AND v.record_id = NEW.to_record_id
+         LIMIT 1;
+        IF NOT FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah memory: an identity edge must name a record in the same scope'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        -- THE NEW PART. Only for merges: a split_to edge may legitimately name
+        -- a record that is later absorbed, because a split records history
+        -- rather than a redirect.
+        IF NEW.kind = 'merged_into' THEN
+          PERFORM 1 FROM public.memory_identity_edges AS e
+           WHERE e.tenant_id = NEW.tenant_id
+             AND e.workspace_id = NEW.workspace_id
+             AND e.from_record_id = NEW.to_record_id
+             AND e.kind = 'merged_into'
+           LIMIT 1;
+          IF FOUND THEN
+            RAISE EXCEPTION
+              'aaliyah memory: a merge may not name a record that was itself merged away'
+              USING ERRCODE = 'check_violation';
+          END IF;
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$`,
+  },
 ];
 
 export async function runMailMigrations(pool: Pool): Promise<void> {
