@@ -245,7 +245,10 @@ beforeEach(async () => {
               memory_legal_hold_records,
               memory_legal_hold_subjects,
               memory_legal_holds,
-              memory_retention_obligations
+              memory_retention_obligations,
+              memory_key_destruction_settlements,
+              memory_key_destruction_obligations,
+              memory_pii_key_audits
      RESTART IDENTITY`,
   );
   for (const tenantId of [TENANT, TENANT_EXCLUSIVE, TENANT_OTHER]) {

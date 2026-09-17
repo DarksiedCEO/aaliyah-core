@@ -175,6 +175,12 @@ beforeEach(async () => {
               memory_alias_bindings,
               memory_alias_blind_indexes,
               memory_pii_key_erasures,
+
+              memory_key_destruction_settlements,
+
+              memory_key_destruction_obligations,
+
+              memory_pii_key_audits,
               memory_record_versions,
               memory_authorization_receipts,
               memory_authorization_nonces,

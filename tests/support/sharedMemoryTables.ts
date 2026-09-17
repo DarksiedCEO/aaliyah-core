@@ -1,5 +1,7 @@
 import type { Pool, PoolClient } from "pg";
 
+import { boundedQuery } from "../../src/persistence/postgres/pool";
+
 /**
  * A MUTUAL EXCLUSION BETWEEN TEST FILES THAT TRUNCATE THE SAME TABLES.
  *
@@ -43,10 +45,20 @@ export async function lockSharedMemoryTables(
   pool: Pool,
 ): Promise<SharedTableLock> {
   const client: PoolClient = await pool.connect();
+  // THE CLIENT'S CEILING HAS TO BE RAISED WITH THE SERVER'S.
+  //
+  // The two `SET`s below are the SERVER's bounds. Since the pools carry a
+  // client-side `query_timeout` as well (35s, K-05), a pool built by
+  // `createMailDbPool` would abandon this wait at 35 seconds with
+  // "Query read timeout" — and a file legitimately waiting for another file's
+  // 45-second suite would fail with a message about a read timeout instead of
+  // waiting. Caught exactly that way: a boot test held this lock across a real
+  // process spawn and every waiting file collapsed.
+  const bounded = boundedQuery(client, SHARED_TABLE_LOCK_WAIT_MS + 20_000);
   try {
-    await client.query(`SET lock_timeout = ${SHARED_TABLE_LOCK_WAIT_MS}`);
-    await client.query(`SET statement_timeout = ${SHARED_TABLE_LOCK_WAIT_MS}`);
-    await client.query("SELECT pg_advisory_lock($1)", [MEMORY_TABLES_LOCK_KEY]);
+    await bounded(`SET lock_timeout = ${SHARED_TABLE_LOCK_WAIT_MS}`);
+    await bounded(`SET statement_timeout = ${SHARED_TABLE_LOCK_WAIT_MS}`);
+    await bounded("SELECT pg_advisory_lock($1)", [MEMORY_TABLES_LOCK_KEY]);
   } catch (error) {
     client.release(true);
     throw new Error(
@@ -57,9 +69,7 @@ export async function lockSharedMemoryTables(
   return {
     async release() {
       try {
-        await client.query("SELECT pg_advisory_unlock($1)", [
-          MEMORY_TABLES_LOCK_KEY,
-        ]);
+        await bounded("SELECT pg_advisory_unlock($1)", [MEMORY_TABLES_LOCK_KEY]);
       } finally {
         client.release();
       }

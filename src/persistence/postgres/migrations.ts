@@ -5379,9 +5379,18 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       -- settling authority checked the evidence.
       CONSTRAINT memory_key_destruction_settlements_independent_verifier
         CHECK (settlement_authority_id <> verifier_principal_id),
-      -- A settlement always MOVES a state, and never to the state it came from.
-      CONSTRAINT memory_key_destruction_settlements_state_transition
-        CHECK (predecessor_state <> successor_state),
+      -- BOTH STATES COME FROM THE KNOWN VOCABULARY, and they are allowed to
+      -- be the SAME one. The first version of this constraint required them to
+      -- differ, which looked like rigour and was simply wrong: a settlement
+      -- whose decision is STILL_UNKNOWN records that the evidence did NOT
+      -- settle the question, so the state legitimately does not move — and
+      -- refusing to record that would leave the one outcome the founder
+      -- decision names as "remains unresolved" unrecordable. Caught by S-3.
+      CONSTRAINT memory_key_destruction_settlements_states_known
+        CHECK (predecessor_state IN ('ERASURE_REQUESTED','ERASURE_PENDING_SETTLEMENT',
+                                     'PROVEN_DESTROYED','PROVEN_NOT_DESTROYED')
+           AND successor_state IN ('ERASURE_REQUESTED','ERASURE_PENDING_SETTLEMENT',
+                                   'PROVEN_DESTROYED','PROVEN_NOT_DESTROYED')),
       -- A digest is a digest. Free text here would be a place for a subject's
       -- address to survive a settlement.
       CONSTRAINT memory_key_destruction_settlements_digest_shape

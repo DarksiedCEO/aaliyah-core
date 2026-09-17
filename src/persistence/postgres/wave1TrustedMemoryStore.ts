@@ -1310,6 +1310,7 @@ export function createPostgresTrustedMemoryStore(
           client,
           stored.scope,
           stored.targetRecordId,
+          "merged_only",
         );
         const proof = new Map(keyProof.map((a) => [a.keyRef, a.proof]));
         for (const row of inScopeNow) {
@@ -2474,9 +2475,29 @@ export function createPostgresTrustedMemoryStore(
    * (`memory_pii_key_erasures_once`), so a key is counted exactly once no
    * matter how many times its subject is erased and restored.
    */
-  const IN_SCOPE_KEYS_SQL = `
+  const inScopeKeysSql = (scope: "subject" | "merged_only") => `
     WITH RECURSIVE absorbed(record_id) AS (
-      SELECT $3::text
+      ${
+        scope === "subject"
+          ? // THE SUBJECT: the record itself AND everything absorbed into it.
+            // The accounting denominator — the record's OWN pending key is
+            // exactly what went missing at 8a0bf05 (K-03).
+            `SELECT $3::text`
+          : // MERGED-IN ONLY: the records absorbed into the target, NOT the
+            // target. This is the PRE-CHECK's scope, and the distinction
+            // matters: a record's own key being alive means "this erasure did
+            // not finish", which `deleteRecord` reports with its accounting
+            // intact; a MERGED-IN record's key being alive means "erase that
+            // record first", which is a precondition and is refused before
+            // anything is consumed. Scoping the pre-check to the subject
+            // collapsed the two and threw away the accounting the caller
+            // needs — caught by RT5-R1 when it came back with a null
+            // `aliasErasure`.
+            `SELECT e.from_record_id
+               FROM public.memory_identity_edges AS e
+              WHERE e.tenant_id = $1 AND e.workspace_id = $2
+                AND e.to_record_id = $3 AND e.kind = 'merged_into'`
+      }
       UNION
       SELECT e.from_record_id
         FROM public.memory_identity_edges AS e
@@ -2502,16 +2523,19 @@ export function createPostgresTrustedMemoryStore(
        AND c.event = 'erasure_committed'
      ORDER BY c.id`;
 
+  const SUBJECT_KEYS_SQL = inScopeKeysSql("subject");
+  const MERGED_KEYS_SQL = inScopeKeysSql("merged_only");
+
   async function readInScopeKeys(
     runner: { query: PoolClient["query"] },
     scope: { tenantId: string; workspaceId: string },
     recordId: string,
+    which: "subject" | "merged_only",
   ): Promise<InScopeKeyRow[]> {
-    const result = await runner.query(IN_SCOPE_KEYS_SQL, [
-      scope.tenantId,
-      scope.workspaceId,
-      recordId,
-    ]);
+    const result = await runner.query(
+      which === "subject" ? SUBJECT_KEYS_SQL : MERGED_KEYS_SQL,
+      [scope.tenantId, scope.workspaceId, recordId],
+    );
     return result.rows as InScopeKeyRow[];
   }
 
@@ -2654,7 +2678,7 @@ export function createPostgresTrustedMemoryStore(
     try {
       await client.query("BEGIN");
       await enterRole(client, mutationRole);
-      rows = await readInScopeKeys(client, scope, recordId);
+      rows = await readInScopeKeys(client, scope, recordId, "merged_only");
       await client.query("COMMIT");
     } catch (error) {
       ambiguous = error;
@@ -2830,6 +2854,7 @@ export function createPostgresTrustedMemoryStore(
             workspaceId: filter.workspaceId ?? "",
           },
           filter.subjectRecordId,
+          "subject",
         );
         due = rows as DueKeyRow[];
         erased = rows.length;
@@ -3486,11 +3511,24 @@ export function createPostgresTrustedMemoryStore(
         }
       }
       if (code === "23514") {
-        // Either a CHECK or one of the triggers raising `check_violation`.
+        // A CHECK, or one of the triggers raising `check_violation`. Mapped by
+        // NAME rather than defaulting: the first version returned
+        // "not evidence bound" for every 23514, and a settlement refused by
+        // an unrelated CHECK was reported as an evidence problem it did not
+        // have — which sent S-3 looking in the wrong place entirely.
+        if (constraint.endsWith("independent_verifier")) {
+          return { recorded: false, rejection: "settlement_self_verified" };
+        }
+        if (constraint !== "" && !constraint.endsWith("digest_shape")) {
+          return { recorded: false, rejection: "settlement_malformed" };
+        }
+        // No constraint name: one of the triggers, which is the evidence
+        // binding (`settlement must name a real binding` / `a key whose
+        // erasure actually committed`).
         return {
           recorded: false,
-          rejection: constraint.endsWith("independent_verifier")
-            ? "settlement_self_verified"
+          rejection: constraint.endsWith("digest_shape")
+            ? "settlement_malformed"
             : "settlement_not_evidence_bound",
         };
       }

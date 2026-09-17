@@ -281,12 +281,17 @@ test("POSITIVE CONTROL: W2/W3 — an object HIDDEN IN ANOTHER SCHEMA is reported
         assert.ok(!entry.includes("w23_probe"), `declared map already contains ${entry}`);
       }
     }
+    // Removed: the map is back to the declared one. Compared INSIDE the lock,
+    // because another memory file may be legitimately mid-privilege-change of
+    // its own — the K-10 boot test revokes and restores two grants — and a
+    // comparison outside the lock reads that window as a narrowing this test
+    // caused. Seen exactly that way in a full-suite run.
+    await pool.query(`DROP SCHEMA IF EXISTS w23_probe CASCADE`);
+    await compareDeclaredMap();
   } finally {
     await pool.query(`DROP SCHEMA IF EXISTS w23_probe CASCADE`);
     await lock.release();
   }
-  // Removed: the map is back to the declared one.
-  await compareDeclaredMap();
 });
 
 test("POSITIVE CONTROL: a widened grant IS reported as a difference, then removed", async () => {

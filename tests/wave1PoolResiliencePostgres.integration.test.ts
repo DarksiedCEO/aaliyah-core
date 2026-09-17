@@ -289,6 +289,70 @@ test("boot's recovery passes against a reachable but WEDGED database are refused
   }
 });
 
+test("K-10: a FAILING reconciliation pass does not skip the erasure completion pass, and neither failure is silent", async () => {
+  // ---- WHAT WAS OBSERVED AT 03581a3 ---------------------------------
+  // Reliability review, MEDIUM: `src/server.ts` awaited `reconcilePending()`
+  // and `completePendingErasures()` inside ONE try/catch, so a
+  // `reconcilePending` rejection skipped the erasure pass ENTIRELY — and
+  // skipped it silently, because the single catch printed a message about
+  // reconciliation and said nothing about the pass that never ran. A database
+  // briefly unreadable at boot therefore left alias data keys unconfirmed with
+  // no trace that anything had been missed.
+  //
+  // Driven as a REAL PROCESS: both passes are made to fail by privilege, and
+  // both failures must appear. At 8a0bf05 only the first could.
+  await runMailMigrations(adminPool);
+  const sharedTableLock = await lockSharedMemoryTables(adminPool);
+  try {
+    // `reconcilePending` reads mutation receipts as the reconciler;
+    // `completePendingErasures` reads key-erasure evidence as the mutator.
+    await adminPool.query(`REVOKE SELECT ON memory_mutation_receipts FROM aaliyah_memory_reconciler`);
+    await adminPool.query(`REVOKE SELECT ON memory_pii_key_erasures FROM aaliyah_memory_mutator`);
+    const boot = spawn(
+      process.execPath,
+      ["--require", "ts-node/register", path.join(ROOT, "src/server.ts")],
+      {
+        cwd: ROOT,
+        env: {
+          ...process.env,
+          AALIYAH_DATABASE_URL: DB_URL,
+          PORT: "0",
+          NODE_ENV: "test",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    let out = "";
+    boot.stdout.on("data", (chunk) => {
+      out += String(chunk);
+    });
+    boot.stderr.on("data", (chunk) => {
+      out += String(chunk);
+    });
+    try {
+      // Wait for the process to get past boot recovery: the readiness line is
+      // printed after both passes have been attempted.
+      const deadline = Date.now() + 25_000;
+      while (!/Aaliyah core running on/.test(out) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      assert.match(out, /Aaliyah core running on/, `server never finished booting:\n${out}`);
+      // BOTH failures reported, each naming its own pass.
+      assert.match(out, /trusted memory: reconciliation pass failed/, out);
+      assert.match(out, /trusted memory: alias key completion pass failed/, out);
+      // And the process is alive: a failed recovery pass is not a failed boot.
+      assert.equal(boot.exitCode, null);
+    } finally {
+      boot.kill("SIGKILL");
+      await new Promise((resolve) => boot.once("exit", resolve));
+    }
+  } finally {
+    await adminPool.query(`GRANT SELECT ON memory_mutation_receipts TO aaliyah_memory_reconciler`);
+    await adminPool.query(`GRANT SELECT ON memory_pii_key_erasures TO aaliyah_memory_mutator`);
+    await sharedTableLock.release();
+  }
+});
+
 /**
  * K-05 — EVERY BOUND ABOVE IS THE SERVER'S, SO THE CLIENT NEEDS ITS OWN.
  *

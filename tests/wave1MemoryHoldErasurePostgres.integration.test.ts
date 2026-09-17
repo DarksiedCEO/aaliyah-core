@@ -4,6 +4,7 @@ import test, { after, before, beforeEach } from "node:test";
 import { Pool } from "pg";
 
 import { enterMemoryRole } from "../src/persistence/postgres/pool";
+import { settlementEvidenceDigest } from "../src/persistence/postgres/wave1TrustedMemoryStore";
 
 import {
   MEMORY_ALIAS_NORMALIZATION_VERSION,
@@ -223,7 +224,10 @@ after(async () => {
               memory_legal_hold_records,
               memory_legal_hold_subjects,
               memory_legal_holds,
-              memory_retention_obligations
+              memory_retention_obligations,
+              memory_key_destruction_settlements,
+              memory_key_destruction_obligations,
+              memory_pii_key_audits
      RESTART IDENTITY`,
   );
   await sharedTableLock.release();
@@ -248,7 +252,10 @@ beforeEach(async () => {
               memory_legal_hold_records,
               memory_legal_hold_subjects,
               memory_legal_holds,
-              memory_retention_obligations
+              memory_retention_obligations,
+              memory_key_destruction_settlements,
+              memory_key_destruction_obligations,
+              memory_pii_key_audits
      RESTART IDENTITY`,
   );
   genesisCounter = 0;
@@ -3513,14 +3520,16 @@ async function eraseParticipant(receiptId: string, tombstoneId: string) {
 
 async function bindingState(aliasId: string) {
   const row = await adminPool.query(
-    `SELECT pii_envelope, pii_key_ref, pii_erased_at, pii_erasure_tombstone_id,
-            removed_at, mutation_receipt_id
+    `SELECT pii_envelope, pii_key_ref, pii_key_version, pii_erased_at,
+            pii_erasure_tombstone_id, removed_at, mutation_receipt_id, alias_id
        FROM memory_alias_bindings WHERE alias_id = $1`,
     [aliasId],
   );
   return row.rows[0] as {
     pii_envelope: unknown;
     pii_key_ref: string;
+    pii_key_version: number;
+    alias_id: string;
     pii_erased_at: Date | null;
     pii_erasure_tombstone_id: string | null;
     removed_at: Date | null;
@@ -3832,6 +3841,200 @@ test("P-11 RESTORING the erased record does not bring the address back", async (
   assert.equal(await aliases().resolveAlias(SCOPE, VICTIM_NORMALIZED), null);
   await assert.rejects(aliases().readAliasBinding(SCOPE, "alias-pii-001"), MemoryAliasPiiErased);
   assert.deepEqual(await plaintextSightings(VICTIM_NORMALIZED), []);
+});
+
+/**
+ * RT5-R1 / K-03 — THE BREAK, AND THE FALSIFIER FOR IT.
+ *
+ * Red team against 8a0bf05, HIGH, executed, reproduced twice and once more in
+ * a merged variant. It needs nothing privileged: an ordinary provider outage
+ * plus one `restore`.
+ *
+ *   1. bind the subject's address;
+ *   2. subject-erase it while the provider is down — the database half
+ *      commits, the key stays live, and the erasure correctly says so;
+ *   3. restore the record;
+ *   4. subject-erase it AGAIN.
+ *
+ * At 8a0bf05 step 4 answered `verified:true {0,0,0}` while the key was still
+ * `active` and a ciphertext copy taken before step 2 still decrypted to
+ * `victim.person@example.com`. The reason was arithmetic, not crypto: the
+ * alias UPDATE only touches bindings where `pii_erased_at IS NULL`, and step 2
+ * had already set it — so step 4 wrote NO new `erasure_committed` rows, and
+ * the accounting, scoped to step 4's OWN tombstone, had an empty denominator.
+ * A key nobody counted is a key nobody destroyed.
+ *
+ * The falsifier the reviewer named: count pending keys over every
+ * `erasure_committed` without `key_destroyed` for the target's bindings
+ * REGARDLESS OF TOMBSTONE. That is what `destroyCommittedAliasKeys` now does,
+ * scoped to the subject's canonical merge set.
+ */
+async function restoreRecord(recordId: string, tag: string): Promise<void> {
+  const head = await store().readHead(SCOPE, recordId);
+  assert.equal(head?.state, "deleted", "the record must be deleted before it is restored");
+  const content = { participant: recordId, restored: tag };
+  const receipt = await issue(
+    authorization({
+      action: "restore",
+      targetRecordId: recordId,
+      expectedHead: headOf(head!.version, head!.contentDigest),
+      proposedContent: content,
+    }),
+  );
+  const restored = await store().restore({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId,
+    proposedContent: content,
+    mutationReceiptId: `mutation.${tag}.restore`,
+  });
+  assert.equal(restored.verified, true, restored.rejection ?? "");
+}
+
+const decryptCopy = (copied: PiiEnvelope, mutationReceiptId: string) =>
+  TEST_PII_KEYS.decrypt({
+    scope: DATA_SCOPE,
+    envelope: copied,
+    associatedData: aliasEnvelopeAssociatedData({
+      tenantId: SCOPE.tenantId,
+      workspaceId: SCOPE.workspaceId,
+      aliasId: "alias-pii-001",
+      mutationReceiptId,
+    }),
+  });
+
+for (const first of ["subject_erasure_request", "retention_expiry"] as const) {
+  test(`RT5-R1 K-03: with the provider BACK, the second erasure after a ${first} + restore is verified ONLY because the key is really destroyed`, async () => {
+    // The reviewer's literal sequence. Its falsifier: "Re-running RT5-R1 must
+    // then show verified:false, or a refusal, WHILE THE KEY IS ACTIVE." The
+    // invariant is the conjunction — never verified over a live key — and the
+    // subject-scoped denominator satisfies it the better way: the second
+    // erasure now SEES the first tombstone's pending key, finishes destroying
+    // it, and only then reports success.
+    await bindVictimAddress();
+    const before = await bindingState("alias-pii-001");
+    const copied = before.pii_envelope as PiiEnvelope;
+    TEST_PII_KEYS.setAvailable(false);
+    try {
+      const { result } = await eraseRecordAtHead(PARTICIPANT, "mutation.rt5r1.first", "tombstone-rt5r1-first", first);
+      assert.equal(result.verified, false);
+      assert.equal(result.rejection, "key_destruction_not_proven");
+      assert.equal(result.aliasErasure?.keysPending, 1);
+    } finally {
+      TEST_PII_KEYS.setAvailable(true);
+    }
+    assert.equal(
+      await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }),
+      "active",
+      "fixture precondition: the outage must have left the key alive",
+    );
+    await restoreRecord(PARTICIPANT, "rt5r1");
+
+    const second = await eraseRecordAtHead(PARTICIPANT, "mutation.rt5r1.second", "tombstone-rt5r1-second");
+    // THE DENOMINATOR IS NOT EMPTY. At 8a0bf05 this answered
+    // `true null {0,0,0}`: the alias UPDATE touches only bindings where
+    // `pii_erased_at IS NULL`, the first attempt had already set it, so this
+    // erasure wrote no evidence of its own and the tombstone-scoped
+    // accounting had nothing to count.
+    assert.equal(second.result.aliasErasure?.bindingsErased, 1, JSON.stringify(second.result.aliasErasure));
+    assert.equal(second.result.aliasErasure?.keysPending, 0, JSON.stringify(second.result.aliasErasure));
+    // AND THE INVARIANT: verified only with the key genuinely gone, and the
+    // copy taken before any of this no longer decrypting. This is the exact
+    // assertion the break failed.
+    assert.equal(second.result.verified, true, second.result.rejection ?? "");
+    assert.equal(
+      await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }),
+      "destroyed",
+    );
+    await assert.rejects(decryptCopy(copied, before.mutation_receipt_id), MemoryPiiKeyDestroyed);
+  });
+
+  test(`RT5-R1b K-03: with the provider STILL DOWN, the second erasure after a ${first} + restore is NOT erased, and counts the first attempt's key`, async () => {
+    // The same sequence with the outage still in force at step 4 — the case
+    // that isolates the DENOMINATOR from the completion pass. Nothing can
+    // destroy the key here, so a `verified:true` would be the break itself.
+    await bindVictimAddress();
+    const before = await bindingState("alias-pii-001");
+    const copied = before.pii_envelope as PiiEnvelope;
+    TEST_PII_KEYS.setAvailable(false);
+    let second;
+    try {
+      const { result } = await eraseRecordAtHead(PARTICIPANT, "mutation.rt5r1b.first", "tombstone-rt5r1b-first", first);
+      assert.equal(result.rejection, "key_destruction_not_proven");
+      TEST_PII_KEYS.setAvailable(true);
+      await restoreRecord(PARTICIPANT, "rt5r1b");
+      TEST_PII_KEYS.setAvailable(false);
+      second = await eraseRecordAtHead(PARTICIPANT, "mutation.rt5r1b.second", "tombstone-rt5r1b-second");
+    } finally {
+      TEST_PII_KEYS.setAvailable(true);
+    }
+    assert.equal(
+      second.result.verified,
+      false,
+      `reported success over the record's OWN live key: ${JSON.stringify(second.result.aliasErasure)}`,
+    );
+    assert.equal(second.result.rejection, "key_destruction_not_proven");
+    // The first attempt's key, counted by an erasure that wrote no evidence
+    // of its own: {0,0,0} at 8a0bf05.
+    assert.equal(second.result.aliasErasure?.bindingsErased, 1, JSON.stringify(second.result.aliasErasure));
+    assert.equal(second.result.aliasErasure?.keysPending, 1, JSON.stringify(second.result.aliasErasure));
+    assert.equal(second.result.aliasErasure?.keysNotProven, 1, JSON.stringify(second.result.aliasErasure));
+    assert.equal(
+      await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }),
+      "active",
+    );
+    // The harm the `verified:true` was hiding: the copy still decrypts.
+    assert.equal(typeof (await decryptCopy(copied, before.mutation_receipt_id)), "string");
+
+    // POSITIVE CONTROL: the completion pass finishes it and the copy dies.
+    const completed = await store().completePendingAliasErasures();
+    assert.equal(completed.destroyed, 1, JSON.stringify(completed));
+    await assert.rejects(decryptCopy(copied, before.mutation_receipt_id), MemoryPiiKeyDestroyed);
+  });
+}
+
+test("RT5-R2 K-03: the merged variant — an ABSORBED record's second erasure does not report erased over its own live key", async () => {
+  // The reviewer's third reproduction. The survivor was already refused by
+  // 054; the ABSORBED record's own re-erasure was the one that answered
+  // `true null {0,0,0}`.
+  await bindVictimAddress();
+  const before = await bindingState("alias-pii-001");
+  TEST_PII_KEYS.setAvailable(false);
+  try {
+    const { result } = await eraseRecordAtHead(PARTICIPANT, "mutation.rt5r2.first", "tombstone-rt5r2-first");
+    assert.equal(result.rejection, "key_destruction_not_proven");
+  } finally {
+    TEST_PII_KEYS.setAvailable(true);
+  }
+  await restoreRecord(PARTICIPANT, "rt5r2");
+  // Merge the restored record into the survivor, then erase it again — with
+  // the provider still down, so nothing can legitimately finish the key and a
+  // `verified:true` could only be the accounting failing to count it.
+  //
+  // The merge is built here rather than through `absorbVictim`, which binds
+  // the address as part of merging: the order the reviewer's reproducer needs
+  // is bind, erase, restore, THEN merge — and an absorbed record cannot be
+  // restored, because `record_merged_away` closes it to everything but a
+  // subject erasure.
+  await seedGenesis({ participant: SURVIVOR, generation: 1 }, { recordId: SURVIVOR });
+  await mergeParticipantInto(SURVIVOR, "mutation.rt5r2.merge");
+  TEST_PII_KEYS.setAvailable(false);
+  let second;
+  try {
+    second = await eraseRecordAtHead(PARTICIPANT, "mutation.rt5r2.second", "tombstone-rt5r2-second");
+  } finally {
+    TEST_PII_KEYS.setAvailable(true);
+  }
+  assert.equal(
+    second.result.verified,
+    false,
+    `the absorbed record reported success over its own live key: ${JSON.stringify(second.result.aliasErasure)}`,
+  );
+  assert.equal(second.result.aliasErasure?.keysPending, 1, JSON.stringify(second.result.aliasErasure));
+  assert.equal(
+    await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }),
+    "active",
+  );
 });
 
 test("P-12 a REPEATED or REPLAYED erasure changes nothing and records nothing new", async () => {
@@ -4289,7 +4492,12 @@ test("C9 an index entry that matches a lookup but belongs to ANOTHER binding is 
 const SURVIVOR = "participant-survivor-001";
 
 async function mergeParticipantInto(survivor: string, receiptId: string) {
-  const head = await store().readHead(SCOPE, PARTICIPANT);
+  await mergeRecordInto(PARTICIPANT, survivor, receiptId);
+}
+
+/** `mergeParticipantInto` for any pair, so a test can build several merges. */
+async function mergeRecordInto(from: string, survivor: string, receiptId: string) {
+  const head = await store().readHead(SCOPE, from);
   assert.ok(head);
   const order = {
     schemaVersion: MEMORY_IDENTITY_MERGE_ORDER_SCHEMA_VERSION,
@@ -4300,7 +4508,7 @@ async function mergeParticipantInto(survivor: string, receiptId: string) {
   const receipt = await issue(
     authorization({
       action: "merge_identity",
-      targetRecordId: PARTICIPANT,
+      targetRecordId: from,
       expectedHead: headOf(head.version, head.contentDigest),
       proposedContent: order,
     }),
@@ -4308,7 +4516,7 @@ async function mergeParticipantInto(survivor: string, receiptId: string) {
   const merged = await store().mergeIdentity({
     actor: SCOPE,
     authorizationId: receipt.authorizationId,
-    recordId: PARTICIPANT,
+    recordId: from,
     proposedContent: order,
     mutationReceiptId: receiptId,
   });
@@ -4690,11 +4898,28 @@ test("K-6 RED TEAM RT2-K1: a key_destroyed row forged for a LIVE key does not st
 
 /** Bind `<n>.person@example.com` to its own participant, honestly. */
 async function bindNumberedParticipant(n: number) {
+  return bindNumberedParticipantAs(
+    `participant-starve-${n}`,
+    `alias-starve-${n}`,
+    `person${n}@example.com`,
+    `mutation.starve.bind.${n}`,
+  );
+}
+
+/**
+ * `bindNumberedParticipant` for any record and alias, so a test can build
+ * several independently bound participants.
+ */
+async function bindNumberedParticipantAs(
+  participant: string,
+  aliasId: string,
+  observedAlias: string,
+  bindReceiptId: string,
+) {
   await setAliasPolicy();
-  const participant = `participant-starve-${n}`;
   const genesis = await seedGenesis({ participant, generation: 1 }, { recordId: participant });
   const evidence = evidenceFor(participant);
-  const alias = aliasIdentity({ aliasId: `alias-starve-${n}`, observedAlias: `person${n}@example.com`, participantId: participant, evidence });
+  const alias = aliasIdentity({ aliasId, observedAlias, participantId: participant, evidence });
   const content = { participant, generation: 2 };
   const receipt = await issue(
     authorization({
@@ -4711,10 +4936,10 @@ async function bindNumberedParticipant(n: number) {
     alias,
     evidence,
     proposedContent: content,
-    mutationReceiptId: `mutation.starve.bind.${n}`,
+    mutationReceiptId: bindReceiptId,
   });
   assert.equal(bound.verified, true, bound.rejection ?? "");
-  const keyRef = (await bindingState(`alias-starve-${n}`)).pii_key_ref;
+  const keyRef = (await bindingState(aliasId)).pii_key_ref;
   return { participant, keyRef };
 }
 
@@ -4986,6 +5211,818 @@ test("K-07: the pinned path drops \"$user\" and pg_temp's precedence, and KEEPS 
   } finally {
     await probe.end();
   }
+});
+
+// ---------------------------------------------------------------------------
+// R — NO PROVIDER CALL HOLDS A DATABASE CONNECTION (reliability K-02)
+// ---------------------------------------------------------------------------
+
+test("R-1 K-02 (probe1): no transaction and no record lock is held ACROSS a slow provider call", async () => {
+  // ---- WHAT WAS OBSERVED AT 8a0bf05 ---------------------------------
+  // Reliability review, CRITICAL, executed. The survivor-erasure provider
+  // calls ran inside the open `mutate()` transaction, holding the record's
+  // `pg_advisory_xact_lock` and a pool connection. probe1 polled
+  // `pg_stat_activity`/`pg_locks` and saw `observedIdleInTransaction: true`
+  // and `observedAdvisoryLock: true` for the whole call, and measured
+  // `elapsed_ms: 6029` — the slot was held for the provider's full latency,
+  // FOUR SECONDS after PostgreSQL had already killed the session on
+  // `idle_in_transaction_session_timeout`, because the DB's own bound cannot
+  // release a connection the client is still awaiting.
+  await absorbVictim("mutation.r1.merge");
+  const erased = await eraseRecordAtHead(PARTICIPANT, "mutation.r1.absorbed", "tombstone-r1-absorbed");
+  assert.equal(erased.result.verified, true, erased.result.rejection ?? "");
+
+  let asked = false;
+  const slow = {
+    ...TEST_PII_KEYS,
+    dataKeyState: async (input: Parameters<typeof TEST_PII_KEYS.dataKeyState>[0]) => {
+      asked = true;
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      return TEST_PII_KEYS.dataKeyState(input);
+    },
+  } as typeof TEST_PII_KEYS;
+
+  // MEASURED AS A DURATION, NOT AS A FLAG. Every multi-statement transaction
+  // is briefly `idle in transaction` between its own statements, so the
+  // presence of one proves nothing. The finding was that a transaction stayed
+  // open FOR THE PROVIDER'S WHOLE LATENCY, so the measurement is the oldest
+  // open transaction's age, and the bound is a fraction of the hang.
+  const HANG_MS = 1_500;
+  const observed = { maxIdleTxMs: 0, maxAdvisoryMs: 0, samples: 0 };
+  const poll = setInterval(() => {
+    void adminPool
+      .query(
+        `SELECT
+           COALESCE((SELECT max(EXTRACT(EPOCH FROM (clock_timestamp() - xact_start)) * 1000)
+                       FROM pg_stat_activity
+                      WHERE datname = current_database() AND state = 'idle in transaction'
+                        AND pid <> pg_backend_pid()), 0)::float8 AS idle_tx_ms,
+           -- ALSO A DURATION, for the same reason. A record's advisory lock
+           -- is legitimately held for the few statements of an ordinary
+           -- mutation, so its PRESENCE proves nothing; what the finding was
+           -- about is the lock being held ACROSS the provider call. Excludes
+           -- this file's own shared-table lock, held for its whole run
+           -- (tests/support/sharedMemoryTables.ts, key 728133001 — classid is
+           -- the key's high word, objid its low word).
+           -- ...AND ONLY WHERE THE HOLDER IS WAITING ON SOMETHING OUTSIDE THE
+           -- DATABASE. A transaction that is actively running statements holds
+           -- the record lock for as long as its statements take, which under a
+           -- full-suite load is legitimately a second or more. probe1's
+           -- signature was the two together: the lock held WHILE the session
+           -- sat idle in transaction, because the client was awaiting a
+           -- provider. Measuring the lock alone failed this test under
+           -- concurrency for a reason that was not the finding.
+           COALESCE((SELECT max(EXTRACT(EPOCH FROM (clock_timestamp() - a.xact_start)) * 1000)
+                       FROM pg_locks AS l
+                       JOIN pg_stat_activity AS a ON a.pid = l.pid
+                      WHERE l.locktype = 'advisory'
+                        AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                        AND l.pid <> pg_backend_pid()
+                        AND a.state = 'idle in transaction'
+                        AND a.xact_start IS NOT NULL
+                        AND NOT (l.classid = 0 AND l.objid = 728133001)), 0)::float8 AS advisory_ms`,
+      )
+      .then((r) => {
+        observed.samples += 1;
+        const age = Number(r.rows[0].idle_tx_ms);
+        if (age > observed.maxIdleTxMs) observed.maxIdleTxMs = age;
+        const lockAge = Number(r.rows[0].advisory_ms);
+        if (lockAge > observed.maxAdvisoryMs) observed.maxAdvisoryMs = lockAge;
+      })
+      .catch(() => undefined);
+  }, 100);
+
+  let result;
+  try {
+    result = await eraseRecordAtHead(
+      SURVIVOR, "mutation.r1.survivor", "tombstone-r1-survivor", "subject_erasure_request",
+      createPostgresTrustedMemoryStore(writePool, readPool, { piiKeys: slow }),
+    );
+  } finally {
+    clearInterval(poll);
+  }
+  assert.equal(result.result.verified, true, result.result.rejection ?? "");
+  assert.ok(asked, "fixture precondition: the slow provider must actually have been consulted");
+  assert.ok(observed.samples >= 5, `the poller must have sampled during the wait: ${observed.samples}`);
+  // THE ASSERTIONS THAT FAILED AT 8a0bf05: no transaction stayed open across
+  // the provider call, and the record's advisory lock was never held during it.
+  assert.ok(
+    observed.maxIdleTxMs < HANG_MS / 2,
+    `a transaction stayed open ${Math.round(observed.maxIdleTxMs)}ms across a ${HANG_MS}ms provider call`,
+  );
+  assert.ok(
+    observed.maxAdvisoryMs < HANG_MS / 2,
+    `a record advisory lock was held ${Math.round(observed.maxAdvisoryMs)}ms across a ${HANG_MS}ms provider call`,
+  );
+});
+
+test("R-2 K-02 (probe2): concurrent erasures with a hung provider do NOT exhaust the pool for an unrelated mutation", async () => {
+  // ---- WHAT WAS OBSERVED AT 8a0bf05 ---------------------------------
+  // probe2: three ordinary, authorized survivor erasures against three
+  // DIFFERENT unlocked records, with a 5000ms provider hang, saturated a
+  // three-connection mutation pool. A completely unrelated `correct()` on an
+  // unlocked fourth record, fired 300ms later, FAILED OUTRIGHT with "timeout
+  // exceeded when trying to connect" at t=2805ms. Scaled to production
+  // (`pool.max: 10`) that is a full write-path outage for every tenant sharing
+  // the pool, caused by nothing worse than KMS latency and reachable by
+  // ordinary GDPR-shaped traffic.
+  //
+  // The falsifier the reviewer named: re-run probe2 — the unrelated mutation
+  // should complete despite the provider still being hung.
+  const HANG_MS = 3_000;
+  const CONCURRENCY = 3;
+  // A pool as small as the concurrency, so exhaustion is the DEFAULT outcome
+  // unless the provider call is genuinely outside the transaction.
+  const smallWrite = new Pool({ connectionString: DB_URL, max: CONCURRENCY });
+  smallWrite.on("error", () => undefined);
+  const smallRead = new Pool({ connectionString: DB_URL, max: 2 });
+  smallRead.on("error", () => undefined);
+  try {
+    const survivors: string[] = [];
+    for (let i = 0; i < CONCURRENCY; i += 1) {
+      const absorbed = `participant-r2-absorbed-${i}`;
+      const survivor = `participant-r2-survivor-${i}`;
+      await bindNumberedParticipantAs(absorbed, `alias-r2-${i}`, `person-r2-${i}@example.com`, `mutation.r2.bind.${i}`);
+      await seedGenesis({ participant: survivor, generation: 1 }, { recordId: survivor });
+      await mergeRecordInto(absorbed, survivor, `mutation.r2.merge.${i}`);
+      const e = await eraseRecordAtHead(absorbed, `mutation.r2.absorbed.${i}`, `tombstone-r2-absorbed-${i}`);
+      assert.equal(e.result.verified, true, e.result.rejection ?? "");
+      survivors.push(survivor);
+    }
+    // An unrelated record for the mutation that must NOT be starved.
+    const bystanderGenesis = await seedGenesis({ note: "bystander" }, { recordId: "participant-r2-bystander" });
+
+    const hung = {
+      ...TEST_PII_KEYS,
+      dataKeyState: async (input: Parameters<typeof TEST_PII_KEYS.dataKeyState>[0]) => {
+        await new Promise((resolve) => setTimeout(resolve, HANG_MS));
+        return TEST_PII_KEYS.dataKeyState(input);
+      },
+    } as typeof TEST_PII_KEYS;
+    const hangingStore = createPostgresTrustedMemoryStore(smallWrite, smallRead, { piiKeys: hung });
+    const bystanderStore = createPostgresTrustedMemoryStore(smallWrite, smallRead, { piiKeys: TEST_PII_KEYS });
+
+    const erasures = survivors.map((survivor, i) =>
+      eraseRecordAtHead(
+        survivor, `mutation.r2.erase.${i}`, `tombstone-r2-erase-${i}`, "subject_erasure_request", hangingStore,
+      ),
+    );
+    // Fired while every erasure is still waiting on the provider.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const startedAt = Date.now();
+    const content = { note: "bystander corrected" };
+    const receipt = await issue(
+      authorization({
+        action: "correct",
+        targetRecordId: "participant-r2-bystander",
+        expectedHead: headOf(1, bystanderGenesis),
+        proposedContent: content,
+      }),
+    );
+    const bystander = await bystanderStore.correct({
+      actor: SCOPE,
+      authorizationId: receipt.authorizationId,
+      recordId: "participant-r2-bystander",
+      proposedContent: content,
+      mutationReceiptId: "mutation.r2.bystander",
+    });
+    const bystanderMs = Date.now() - startedAt;
+    assert.equal(bystander.verified, true, bystander.rejection ?? "");
+    // It must not merely succeed — it must succeed WHILE the provider is still
+    // hung, which is what proves the slot was never held.
+    assert.ok(
+      bystanderMs < HANG_MS,
+      `the unrelated mutation waited ${bystanderMs}ms for a ${HANG_MS}ms provider hang`,
+    );
+    const settled = await Promise.all(erasures);
+    for (const e of settled) assert.equal(e.result.verified, true, e.result.rejection ?? "");
+  } finally {
+    await smallWrite.end().catch(() => undefined);
+    await smallRead.end().catch(() => undefined);
+  }
+});
+
+test("R-3 K-04 (probe3): the settled-key audit is BOUNDED per pass, and round-robins so every key is still reached", async () => {
+  // ---- WHAT WAS OBSERVED AT 8a0bf05 ---------------------------------
+  // Reliability review, HIGH, executed. The evidenced-key audit had no `LIMIT`
+  // at all: probe3 seeded 150 honestly-erased participants and a completion
+  // pass with NOTHING pending made exactly 150 `dataKeyState()` calls — and an
+  // immediate second pass made the same 150 again. Unconditional, unbounded,
+  // growing forever with the store's all-time erasure volume, and awaited by
+  // `server.ts` before `app.listen()`.
+  const SEEDED = 7;
+  const LIMIT = 2;
+  const keys: string[] = [];
+  for (let i = 0; i < SEEDED; i += 1) {
+    const bound = await bindNumberedParticipantAs(
+      `participant-r3-${i}`, `alias-r3-${i}`, `person-r3-${i}@example.com`, `mutation.r3.bind.${i}`,
+    );
+    const erased = await eraseRecordAtHead(bound.participant, `mutation.r3.erase.${i}`, `tombstone-r3-${i}`);
+    assert.equal(erased.result.verified, true, erased.result.rejection ?? "");
+    keys.push(bound.keyRef);
+  }
+  // Every key is settled: nothing is pending, so the ONLY work a pass can do
+  // is the audit — which is exactly probe3's setup.
+  const asked: string[] = [];
+  const counting = {
+    ...TEST_PII_KEYS,
+    dataKeyState: async (input: Parameters<typeof TEST_PII_KEYS.dataKeyState>[0]) => {
+      asked.push(input.keyRef);
+      return TEST_PII_KEYS.dataKeyState(input);
+    },
+  } as typeof TEST_PII_KEYS;
+  const bounded = createPostgresTrustedMemoryStore(writePool, readPool, {
+    piiKeys: counting,
+    evidencedAuditLimit: LIMIT,
+  });
+
+  const first = await bounded.completePendingAliasErasures();
+  assert.deepEqual(first, {
+    destroyed: 0, repaired: 0, contradictions: 0, pending: 0, notProven: 0, notProvenReasons: {},
+  });
+  // BOUNDED: the cost of a pass does not depend on how much was ever erased.
+  assert.equal(asked.length, LIMIT, `audited ${asked.length} keys under a limit of ${LIMIT}`);
+
+  // ROUND-ROBIN: the next pass audits DIFFERENT keys, so a bound does not turn
+  // into "the same first N keys forever" — which would be a different way of
+  // not auditing, and no better. Least-recently-audited first is also what
+  // stops a forged row hiding behind volume (security F2 of 03581a3), proven
+  // separately by K-7 and K-8.
+  const seen = new Set(asked);
+  for (let pass = 0; pass < Math.ceil(SEEDED / LIMIT); pass += 1) {
+    asked.length = 0;
+    await bounded.completePendingAliasErasures();
+    assert.ok(asked.length <= LIMIT, `pass ${pass} audited ${asked.length}`);
+    for (const keyRef of asked) seen.add(keyRef);
+  }
+  assert.equal(seen.size, SEEDED, `only ${seen.size} of ${SEEDED} keys were ever audited`);
+});
+
+test("R-4 K-04 (probe4): one hung provider call is bounded by the store's own deadline, not by the provider", async () => {
+  // probe4 at 8a0bf05: one evidenced key with a 4000ms provider hang took
+  // `elapsed_ms: 8010` — exactly the sum of the two hangs the pass performs —
+  // with nothing internal bounding it shorter. This is the call `server.ts`
+  // awaits before `app.listen()`, so a hung provider blocked startup
+  // indefinitely.
+  const bound = await bindNumberedParticipantAs(
+    "participant-r4", "alias-r4", "person-r4@example.com", "mutation.r4.bind",
+  );
+  TEST_PII_KEYS.setAvailable(false);
+  try {
+    const { result } = await eraseRecordAtHead("participant-r4", "mutation.r4.erase", "tombstone-r4");
+    assert.equal(result.rejection, "key_destruction_not_proven");
+  } finally {
+    TEST_PII_KEYS.setAvailable(true);
+  }
+  const DEADLINE_MS = 400;
+  // A provider that NEVER settles. Nothing but the store's own deadline can
+  // end these calls, which is exactly what probe4 showed was missing.
+  let calls = 0;
+  const hung = {
+    ...TEST_PII_KEYS,
+    dataKeyState: () => {
+      calls += 1;
+      return new Promise<never>(() => {});
+    },
+    destroyDataKey: () => {
+      calls += 1;
+      return new Promise<never>(() => {});
+    },
+  } as unknown as typeof TEST_PII_KEYS;
+  const store0 = createPostgresTrustedMemoryStore(writePool, readPool, {
+    piiKeys: hung,
+    providerDeadlineMs: DEADLINE_MS,
+  });
+  const startedAt = Date.now();
+  const outcome = await store0.completePendingAliasErasures();
+  const elapsed = Date.now() - startedAt;
+  assert.ok(calls >= 1, "fixture precondition: the hung provider must have been called");
+  // ABANDONED, and named. A provider that never answers cannot be proven.
+  assert.equal(outcome.notProven, 1, JSON.stringify(outcome));
+  assert.deepEqual(outcome.notProvenReasons, { PROVIDER_TIMEOUT: 1 });
+  // BOUNDED: one pending key costs at most one deadline per call it makes,
+  // and the pass returns rather than hanging the process that awaits it.
+  assert.ok(
+    elapsed < DEADLINE_MS * 6,
+    `a hung provider took ${elapsed}ms under a ${DEADLINE_MS}ms per-call deadline`,
+  );
+  assert.equal(
+    await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: bound.keyRef }),
+    "active",
+    "nothing may be recorded destroyed on an answer that never arrived",
+  );
+});
+
+test("R-5 K-11: two racing completion passes report the destructions that ACTUALLY landed, never more", async () => {
+  // Reliability review of 03581a3, MEDIUM: `destroyed` was incremented
+  // unconditionally after `ON CONFLICT DO NOTHING`, so two racing passes over
+  // ten keys reported 15 and 16 destroyed between them. The ledger was right
+  // and the number the function RETURNED was not — and that number is what a
+  // caller reads to decide whether an erasure finished.
+  const PENDING = 6;
+  for (let i = 0; i < PENDING; i += 1) {
+    await bindNumberedParticipantAs(
+      `participant-r5-${i}`, `alias-r5-${i}`, `person-r5-${i}@example.com`, `mutation.r5.bind.${i}`,
+    );
+    TEST_PII_KEYS.setAvailable(false);
+    try {
+      const { result } = await eraseRecordAtHead(`participant-r5-${i}`, `mutation.r5.erase.${i}`, `tombstone-r5-${i}`);
+      assert.equal(result.rejection, "key_destruction_not_proven");
+    } finally {
+      TEST_PII_KEYS.setAvailable(true);
+    }
+  }
+  const committed = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_pii_key_erasures WHERE event = 'erasure_committed'`,
+  );
+  assert.equal(committed.rows[0].n, PENDING, "fixture precondition: exactly this many keys are pending");
+
+  const [a, b] = await Promise.all([
+    store().completePendingAliasErasures(),
+    store().completePendingAliasErasures(),
+  ]);
+  const landed = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_pii_key_erasures WHERE event = 'key_destroyed'`,
+  );
+  assert.equal(landed.rows[0].n, PENDING, "every pending key must end up destroyed exactly once");
+  // THE ASSERTION THAT FAILED AT 8a0bf05: the two passes' reported totals sum
+  // to what the ledger actually holds, not to more.
+  assert.equal(
+    a.destroyed + b.destroyed,
+    PENDING,
+    `two racing passes reported ${a.destroyed} + ${b.destroyed} destructions over ${PENDING} keys`,
+  );
+  assert.equal(a.pending + b.pending, 0, `${JSON.stringify(a)} / ${JSON.stringify(b)}`);
+});
+
+// ---------------------------------------------------------------------------
+// S — KEY-DESTRUCTION SETTLEMENT (founder decision, OPTION B; K-01, K-09)
+// ---------------------------------------------------------------------------
+
+const NO_VAULT = () => createPostgresTrustedMemoryStore(writePool, readPool, { piiKeys: null });
+
+/** A settlement request with every field the decision requires bound. */
+function settlementFor(
+  binding: { alias_id: string; mutation_receipt_id: string; pii_key_ref: string; pii_key_version: number },
+  tombstoneId: string,
+  authorizationId: string,
+  overrides: Partial<Parameters<ReturnType<typeof NO_VAULT>["settleKeyDestruction"]>[0]> = {},
+) {
+  return {
+    settlementReceiptId: "settlement-001",
+    tenantId: SCOPE.tenantId,
+    workspaceId: SCOPE.workspaceId,
+    subjectRecordId: PARTICIPANT,
+    aliasId: binding.alias_id,
+    keyRef: binding.pii_key_ref,
+    keyVersion: binding.pii_key_version,
+    providerId: TEST_PII_KEYS.providerId,
+    bindingMutationReceiptId: binding.mutation_receipt_id,
+    erasureAuthorizationId: authorizationId,
+    erasureTombstoneId: tombstoneId,
+    destructionAttemptId: "attempt-001",
+    evidence: {
+      kind: "provider_decommission_certificate",
+      statement: "the owning key provider was decommissioned; its HSM partition was destroyed",
+      witnessedAt: "2026-09-17T00:00:00.000Z",
+    },
+    settlementAuthorityId: "principal-data-protection-officer",
+    verifierPrincipalId: "principal-independent-auditor",
+    decision: "PROVEN_DESTROYED" as const,
+    nonce: "settlement-nonce-001",
+    decidedAt: new Date("2026-09-17T01:00:00.000Z"),
+    ...overrides,
+  };
+}
+
+/**
+ * The state K-01 and K-09 describe: a merged-in key whose erasure really did
+ * commit, whose destruction this store cannot establish. Returns the binding
+ * and the absorbed record's erasure authorization, which a settlement binds.
+ */
+async function survivorWithAnUnprovableMergedKey(): Promise<{
+  binding: { alias_id: string; mutation_receipt_id: string; pii_key_ref: string; pii_key_version: number };
+  tombstoneId: string;
+  authorizationId: string;
+}> {
+  await absorbVictim("mutation.s.merge");
+  const binding = await bindingState("alias-pii-001");
+  // The absorbed record is erased HONESTLY: provider destroys the key and the
+  // evidence records it. Nothing here is forged.
+  const erased = await eraseRecordAtHead(PARTICIPANT, "mutation.s.absorbed", "tombstone-s-absorbed");
+  assert.equal(erased.result.verified, true, erased.result.rejection ?? "");
+  assert.equal(
+    await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: binding.pii_key_ref }),
+    "destroyed",
+    "fixture precondition: the merged-in key really is destroyed",
+  );
+  return {
+    binding: binding as never,
+    tombstoneId: "tombstone-s-absorbed",
+    authorizationId: erased.receipt.authorizationId,
+  };
+}
+
+test("S-1 K-01: with NO key provider, a survivor whose merged-in key was genuinely destroyed is NOT ERASED — and not silently refused either", async () => {
+  // ---- THE CRITICAL FINDING, REPRODUCED ------------------------------
+  // Integration review of 8a0bf05: `piiKeys: null` is the ACTUAL production
+  // wiring (src/server.ts, no production KMS provisioned). `state` was forced
+  // to null, null is never "destroyed", so this erasure was refused
+  // `merged_records_not_erased` FOREVER — including the survivor's own
+  // content — with no retry, no completion pass and no admin action that
+  // could change it, and no disclosure anywhere in the register.
+  const { binding } = await survivorWithAnUnprovableMergedKey();
+
+  const refused = await eraseRecordAtHead(
+    SURVIVOR, "mutation.s1.survivor", "tombstone-s1-survivor", "subject_erasure_request", NO_VAULT(),
+  );
+  assert.equal(refused.result.verified, false);
+  // NOT `merged_records_not_erased`: the merged-in record IS erased. What is
+  // missing is proof about a key, and the answer says so.
+  assert.equal(refused.result.rejection, "key_destruction_not_proven");
+  assert.equal(await nonceConsumed(refused.receipt.authorizationId), false);
+
+  // AND THE STATE IS FINDABLE. This is the part that turns a permanent,
+  // unexplained refusal into something an operator can act on.
+  const obligations = await NO_VAULT().listKeyDestructionObligations({ actor: SCOPE });
+  assert.equal(obligations.length, 1, JSON.stringify(obligations));
+  assert.equal(obligations[0]!.keyRef, binding.pii_key_ref);
+  assert.equal(obligations[0]!.state, "KEY_DESTRUCTION_NOT_PROVEN");
+  assert.equal(obligations[0]!.notProvenReason, "NO_PROVIDER_CONFIGURED");
+  assert.equal(obligations[0]!.resolvedBy, null);
+  assert.equal(obligations[0]!.settledBy, null);
+
+  // POSITIVE CONTROL: a store that CAN ask the provider erases the same
+  // survivor immediately. So the refusal is the missing provider, not the
+  // merge — which is exactly the distinction that was collapsed.
+  const allowed = await eraseRecordAtHead(SURVIVOR, "mutation.s1.survivor.ok", "tombstone-s1-ok");
+  assert.equal(allowed.result.verified, true, allowed.result.rejection ?? "");
+});
+
+test("S-2 K-01/K-09: a PROVEN_DESTROYED settlement satisfies the key-destruction contract, and the survivor then erases", async () => {
+  const { binding, tombstoneId, authorizationId } = await survivorWithAnUnprovableMergedKey();
+  const store0 = NO_VAULT();
+  const first = await eraseRecordAtHead(
+    SURVIVOR, "mutation.s2.refused", "tombstone-s2-refused", "subject_erasure_request", store0,
+  );
+  assert.equal(first.result.rejection, "key_destruction_not_proven");
+
+  const settled = await store0.settleKeyDestruction(
+    settlementFor(binding, tombstoneId, authorizationId),
+  );
+  assert.deepEqual(settled, {
+    recorded: true,
+    replay: false,
+    evidenceDigest: settlementEvidenceDigest(
+      settlementFor(binding, tombstoneId, authorizationId).evidence,
+    ),
+  });
+
+  // The obligation is CLOSED, and it names HOW — a settlement, not a provider.
+  const obligations = await store0.listKeyDestructionObligations({ actor: SCOPE });
+  assert.equal(obligations[0]!.state, "PROVEN_DESTROYED");
+  assert.equal(obligations[0]!.resolvedBy, "SETTLEMENT");
+  assert.equal(obligations[0]!.settledBy, "settlement-001");
+
+  // No NEW destruction evidence here, and that is correct: this key was
+  // destroyed honestly, so a provider-confirmed `key_destroyed` row already
+  // holds the one slot `memory_pii_key_erasures_once` allows. What the
+  // settlement supplies is the answer the STORE could not get. S-2b covers
+  // the other state, where the settlement is what writes the evidence.
+  const evidence = await adminPool.query(
+    `SELECT settlement_receipt_id FROM memory_pii_key_erasures
+      WHERE key_ref = $1 AND event = 'key_destroyed'`,
+    [binding.pii_key_ref],
+  );
+  assert.equal(evidence.rowCount, 1);
+  assert.equal(evidence.rows[0].settlement_receipt_id, null);
+
+  // AND THE ERASURE NOW PROCEEDS, on the same store that could not ask.
+  const second = await eraseRecordAtHead(
+    SURVIVOR, "mutation.s2.allowed", "tombstone-s2-allowed", "subject_erasure_request", store0,
+  );
+  assert.equal(second.result.verified, true, second.result.rejection ?? "");
+});
+
+test("S-2b K-01: the PERMANENT case — no provider AND no destruction evidence — is settleable, and the settlement writes the evidence", async () => {
+  // ---- RV5-U-7, THE INTEGRATION REVIEW'S OTHER HALF ------------------
+  // The absorbed record's erasure half-committed during a provider outage, so
+  // its key has `erasure_committed` and NO `key_destroyed`. With
+  // `piiKeys: null` the completion pass returns `{destroyed:0, pending:1}` and
+  // always will, and the survivor's erasure is refused by the DATABASE's own
+  // helper — with, at 8a0bf05, no retry, no pass and no admin action that
+  // could ever change it.
+  await absorbVictim("mutation.s2b.merge");
+  const binding = await bindingState("alias-pii-001");
+  TEST_PII_KEYS.setAvailable(false);
+  let absorbed;
+  try {
+    absorbed = await eraseRecordAtHead(PARTICIPANT, "mutation.s2b.absorbed", "tombstone-s2b-absorbed");
+    assert.equal(absorbed.result.rejection, "key_destruction_not_proven");
+  } finally {
+    TEST_PII_KEYS.setAvailable(true);
+  }
+  const store0 = NO_VAULT();
+  // With no provider, nothing completes it — for ever.
+  assert.deepEqual(await store0.completePendingAliasErasures(), {
+    destroyed: 0,
+    repaired: 0,
+    contradictions: 0,
+    pending: 1,
+    notProven: 1,
+    notProvenReasons: { NO_PROVIDER_CONFIGURED: 1 },
+  });
+  const refused = await eraseRecordAtHead(
+    SURVIVOR, "mutation.s2b.refused", "tombstone-s2b-refused", "subject_erasure_request", store0,
+  );
+  // The DATABASE's helper refuses here, before the provider question: the
+  // merged-in record really has no destruction evidence.
+  assert.equal(refused.result.rejection, "merged_records_not_erased");
+
+  // THE WAY OUT. Independently authorized, independently verified, bound to
+  // this exact binding and this exact committed erasure.
+  const settled = await store0.settleKeyDestruction(
+    settlementFor(binding, "tombstone-s2b-absorbed", absorbed.receipt.authorizationId, {
+      settlementReceiptId: "settlement-s2b",
+      nonce: "nonce-s2b",
+    }),
+  );
+  assert.equal(settled.recorded, true, JSON.stringify(settled));
+  // Here the settlement IS what writes the evidence — and it is labelled, so
+  // no auditor can mistake it for a provider confirmation.
+  const evidence = await adminPool.query(
+    `SELECT settlement_receipt_id FROM memory_pii_key_erasures
+      WHERE key_ref = $1 AND event = 'key_destroyed'`,
+    [binding.pii_key_ref],
+  );
+  assert.equal(evidence.rowCount, 1);
+  assert.equal(evidence.rows[0].settlement_receipt_id, "settlement-s2b");
+  // The completion pass now agrees, and the survivor erases.
+  const completed = await store0.completePendingAliasErasures();
+  assert.equal(completed.pending, 0, JSON.stringify(completed));
+  const allowed = await eraseRecordAtHead(
+    SURVIVOR, "mutation.s2b.allowed", "tombstone-s2b-allowed", "subject_erasure_request", store0,
+  );
+  assert.equal(allowed.result.verified, true, allowed.result.rejection ?? "");
+});
+
+test("S-3: STILL_UNKNOWN remains unresolved — it settles nothing and the erasure stays refused", async () => {
+  // "Only PROVEN_DESTROYED may satisfy the key-destruction portion of verified
+  // erasure. STILL_UNKNOWN remains unresolved." Enforced by the database: the
+  // evidence trigger refuses a settled `key_destroyed` row whose settlement is
+  // not PROVEN_DESTROYED, so there is no path from here to erased.
+  const { binding, tombstoneId, authorizationId } = await survivorWithAnUnprovableMergedKey();
+  const store0 = NO_VAULT();
+  // The refused erasure first, so the obligation this loop inspects exists:
+  // an obligation is a record of what a real attempt could not establish, not
+  // something a settlement conjures into being.
+  const opened = await eraseRecordAtHead(
+    SURVIVOR, "mutation.s3.opened", "tombstone-s3-opened", "subject_erasure_request", store0,
+  );
+  assert.equal(opened.result.rejection, "key_destruction_not_proven");
+  for (const decision of ["STILL_UNKNOWN", "PROVIDER_UNAVAILABLE", "EVIDENCE_INSUFFICIENT", "RETENTION_BLOCKED"] as const) {
+    // Each decision gets its own erasure authorization, because
+    // `scope_unique` deliberately allows only ONE settlement per key per
+    // erasure request — tested separately in S-3b.
+    const recorded = await store0.settleKeyDestruction(
+      settlementFor(binding, tombstoneId, `${authorizationId}-${decision}`, {
+        decision,
+        settlementReceiptId: `settlement-${decision}`,
+        nonce: `nonce-${decision}`,
+      }),
+    );
+    assert.deepEqual(recorded.recorded, true, `${decision}: ${JSON.stringify(recorded)}`);
+    const obligations = await store0.listKeyDestructionObligations({ actor: SCOPE });
+    assert.equal(obligations[0]!.state, "KEY_DESTRUCTION_NOT_PROVEN", decision);
+    assert.equal(obligations[0]!.settledBy, null, decision);
+    // Ids are lowercase-hyphenated: `MemoryIdSchema` refuses the enum's own
+    // spelling, and a malformed id is refused before anything under test runs.
+    const slug = decision.toLowerCase().replace(/_/g, "-");
+    const refused = await eraseRecordAtHead(
+      SURVIVOR, `mutation.s3.${slug}`, `tombstone-s3-${slug}`, "subject_erasure_request", store0,
+    );
+    assert.equal(refused.result.rejection, "key_destruction_not_proven", decision);
+    const evidence = await adminPool.query(
+      `SELECT count(*)::int AS n FROM memory_pii_key_erasures
+        WHERE key_ref = $1 AND event = 'key_destroyed' AND settlement_receipt_id IS NOT NULL`,
+      [binding.pii_key_ref],
+    );
+    assert.equal(evidence.rows[0].n, 0, `${decision} wrote destruction evidence`);
+  }
+});
+
+test("S-3b: ONE settlement per key per erasure request — a second is refused, never an overwrite", async () => {
+  // Action-specific, as the founder decision requires: an authorization that
+  // settled one key cannot be reused to settle it again with a different
+  // answer, and the refusal says so instead of silently replacing a decision.
+  const { binding, tombstoneId, authorizationId } = await survivorWithAnUnprovableMergedKey();
+  const store0 = NO_VAULT();
+  const first = await store0.settleKeyDestruction(
+    settlementFor(binding, tombstoneId, authorizationId, { decision: "STILL_UNKNOWN" }),
+  );
+  assert.equal(first.recorded, true, JSON.stringify(first));
+  const second = await store0.settleKeyDestruction(
+    settlementFor(binding, tombstoneId, authorizationId, {
+      decision: "PROVEN_DESTROYED",
+      settlementReceiptId: "settlement-second",
+      nonce: "nonce-second",
+    }),
+  );
+  assert.deepEqual(second, { recorded: false, rejection: "settlement_already_resolved" });
+  // And the first decision stands: STILL_UNKNOWN settled nothing, so the key
+  // is still unproven and the erasure is still refused.
+  const refused = await eraseRecordAtHead(
+    SURVIVOR, "mutation.s3b.survivor", "tombstone-s3b-survivor", "subject_erasure_request", store0,
+  );
+  assert.equal(refused.result.rejection, "key_destruction_not_proven");
+});
+
+test("S-4: NO SELF-VERIFICATION — a settlement whose authority is also its verifier is refused, in the store and in the database", async () => {
+  const { binding, tombstoneId, authorizationId } = await survivorWithAnUnprovableMergedKey();
+  const same = await NO_VAULT().settleKeyDestruction(
+    settlementFor(binding, tombstoneId, authorizationId, {
+      settlementAuthorityId: "principal-one",
+      verifierPrincipalId: "principal-one",
+    }),
+  );
+  assert.deepEqual(same, { recorded: false, rejection: "settlement_self_verified" });
+  // AND THE DATABASE REFUSES IT TOO, so the store's check is an answer and
+  // not the enforcement (the register's own standard).
+  await assert.rejects(
+    () =>
+      adminPool.query(
+        `INSERT INTO memory_key_destruction_settlements
+           (settlement_receipt_id, tenant_id, workspace_id, subject_record_id, alias_id,
+            key_ref, key_version, provider_id, binding_mutation_receipt_id,
+            erasure_authorization_id, erasure_tombstone_id, destruction_attempt_id,
+            evidence, evidence_digest, settlement_authority_id, verifier_principal_id,
+            decision, policy_version, nonce, predecessor_state, successor_state, decided_at)
+         VALUES ('settlement-raw',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'attempt','{}'::jsonb,
+                 $11,'principal-one','principal-one','PROVEN_DESTROYED','v1','nonce-raw',
+                 'ERASURE_PENDING_SETTLEMENT','PROVEN_DESTROYED',now())`,
+        [
+          SCOPE.tenantId, SCOPE.workspaceId, PARTICIPANT, binding.alias_id,
+          binding.pii_key_ref, binding.pii_key_version, TEST_PII_KEYS.providerId,
+          binding.mutation_receipt_id, authorizationId, tombstoneId,
+          `sha256:${"0".repeat(64)}`,
+        ],
+      ),
+    /memory_key_destruction_settlements_independent_verifier/,
+  );
+});
+
+test("S-5: a settlement nonce is spent once per tenant", async () => {
+  const { binding, tombstoneId, authorizationId } = await survivorWithAnUnprovableMergedKey();
+  const store0 = NO_VAULT();
+  const first = await store0.settleKeyDestruction(settlementFor(binding, tombstoneId, authorizationId));
+  assert.equal(first.recorded, true);
+  // A DIFFERENT key, so `scope_unique` is not what refuses this — only the
+  // reused nonce can be.
+  const replayed = await store0.settleKeyDestruction(
+    settlementFor(binding, tombstoneId, authorizationId, {
+      settlementReceiptId: "settlement-002",
+      decision: "STILL_UNKNOWN",
+      erasureAuthorizationId: `${authorizationId}-other`,
+    }),
+  );
+  assert.deepEqual(replayed, { recorded: false, rejection: "settlement_nonce_replayed" });
+});
+
+test("S-6: replaying the SAME settlement receipt is free; repointing it at another decision is refused", async () => {
+  const { binding, tombstoneId, authorizationId } = await survivorWithAnUnprovableMergedKey();
+  const store0 = NO_VAULT();
+  const request = settlementFor(binding, tombstoneId, authorizationId);
+  const first = await store0.settleKeyDestruction(request);
+  assert.equal(first.recorded, true);
+  const again = await store0.settleKeyDestruction(request);
+  assert.deepEqual(again, { recorded: true, replay: true, evidenceDigest: first.recorded ? first.evidenceDigest : "" });
+  // Exactly one row, whatever the caller does.
+  const rows = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_key_destruction_settlements WHERE settlement_receipt_id = 'settlement-001'`,
+  );
+  assert.equal(rows.rows[0].n, 1);
+  // A receipt that can mean two things is not a receipt.
+  const repointed = await store0.settleKeyDestruction(
+    settlementFor(binding, tombstoneId, authorizationId, { decision: "STILL_UNKNOWN", nonce: "nonce-other" }),
+  );
+  assert.deepEqual(repointed, { recorded: false, rejection: "settlement_receipt_conflict" });
+});
+
+test("S-7: a settlement must be EVIDENCE-BOUND — one naming a key, alias or tombstone that is not real is refused", async () => {
+  const { binding, tombstoneId, authorizationId } = await survivorWithAnUnprovableMergedKey();
+  const store0 = NO_VAULT();
+  for (const [label, overrides] of [
+    ["an unknown key", { keyRef: "pii-key:local-test/v1:00000000-0000-0000-0000-000000000000" }],
+    ["an unknown alias", { aliasId: "alias-does-not-exist" }],
+    ["another subject", { subjectRecordId: SURVIVOR }],
+    ["an unknown tombstone", { erasureTombstoneId: "tombstone-does-not-exist" }],
+  ] as const) {
+    const refused = await store0.settleKeyDestruction(
+      settlementFor(binding, tombstoneId, authorizationId, {
+        ...overrides,
+        settlementReceiptId: `settlement-${label.replace(/\s+/g, "-")}`,
+        nonce: `nonce-${label.replace(/\s+/g, "-")}`,
+      }),
+    );
+    assert.deepEqual(refused, { recorded: false, rejection: "settlement_not_evidence_bound" }, label);
+  }
+  // POSITIVE CONTROL: the correctly bound one is accepted.
+  const ok = await store0.settleKeyDestruction(settlementFor(binding, tombstoneId, authorizationId));
+  assert.equal(ok.recorded, true, JSON.stringify(ok));
+});
+
+test("S-8: a completed settlement is IMMUTABLE, and the MUTATION role cannot write one at all", async () => {
+  const { binding, tombstoneId, authorizationId } = await survivorWithAnUnprovableMergedKey();
+  const recorded = await NO_VAULT().settleKeyDestruction(settlementFor(binding, tombstoneId, authorizationId));
+  assert.equal(recorded.recorded, true);
+  for (const statement of [
+    `UPDATE memory_key_destruction_settlements SET decision = 'STILL_UNKNOWN' WHERE settlement_receipt_id = 'settlement-001'`,
+    `DELETE FROM memory_key_destruction_settlements WHERE settlement_receipt_id = 'settlement-001'`,
+  ]) {
+    await assert.rejects(() => adminPool.query(statement), /append-only|forbidden|immutable/i, statement);
+  }
+  // A settlement written by the role that can already forge erasure evidence
+  // would be a bypass with extra paperwork. Refused by PRIVILEGE.
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        `INSERT INTO memory_key_destruction_settlements
+           (settlement_receipt_id, tenant_id, workspace_id, subject_record_id, alias_id,
+            key_ref, key_version, provider_id, binding_mutation_receipt_id,
+            erasure_authorization_id, erasure_tombstone_id, destruction_attempt_id,
+            evidence, evidence_digest, settlement_authority_id, verifier_principal_id,
+            decision, policy_version, nonce, predecessor_state, successor_state, decided_at)
+         VALUES ('settlement-by-mutator','t','w','r','a','k',1,'p','b','auth','tomb','att',
+                 '{}'::jsonb,$1,'authority','verifier','PROVEN_DESTROYED','v1','n',
+                 'ERASURE_PENDING_SETTLEMENT','PROVEN_DESTROYED',now())`,
+        [`sha256:${"0".repeat(64)}`],
+      ),
+    /permission denied/,
+  );
+});
+
+test("S-9: a settlement whose digest is not the digest of its own evidence proves NOTHING", async () => {
+  // The one integrity check the database cannot make. The settler role writes
+  // the row directly here, with a digest of something else, because the store
+  // always computes it correctly — so this is the only way the state is
+  // reachable, and it must not be believed.
+  const { binding, tombstoneId, authorizationId } = await survivorWithAnUnprovableMergedKey();
+  await runAs(
+    "aaliyah_memory_settler",
+    `INSERT INTO memory_key_destruction_settlements
+       (settlement_receipt_id, tenant_id, workspace_id, subject_record_id, alias_id,
+        key_ref, key_version, provider_id, binding_mutation_receipt_id,
+        erasure_authorization_id, erasure_tombstone_id, destruction_attempt_id,
+        evidence, evidence_digest, settlement_authority_id, verifier_principal_id,
+        decision, policy_version, nonce, predecessor_state, successor_state, decided_at)
+     VALUES ('settlement-liar',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'attempt',
+             $11::jsonb,$12,'authority','verifier','PROVEN_DESTROYED','v1','nonce-liar',
+             'ERASURE_PENDING_SETTLEMENT','PROVEN_DESTROYED',now())`,
+    [
+      SCOPE.tenantId, SCOPE.workspaceId, PARTICIPANT, binding.alias_id,
+      binding.pii_key_ref, binding.pii_key_version, TEST_PII_KEYS.providerId,
+      binding.mutation_receipt_id, authorizationId, tombstoneId,
+      JSON.stringify({ kind: "certificate", statement: "trust me" }),
+      settlementEvidenceDigest({ kind: "something", else: "entirely" }),
+    ],
+  );
+  const refused = await eraseRecordAtHead(
+    SURVIVOR, "mutation.s9.survivor", "tombstone-s9-survivor", "subject_erasure_request", NO_VAULT(),
+  );
+  assert.equal(refused.result.verified, false);
+  assert.equal(refused.result.rejection, "key_destruction_not_proven");
+  const obligations = await NO_VAULT().listKeyDestructionObligations({ actor: SCOPE });
+  assert.equal(obligations[0]!.notProvenReason, "CONTRADICTORY_EVIDENCE", JSON.stringify(obligations));
+});
+
+test("S-10 K-09: a key held by ANOTHER provider is not proven, is named, and heals by PROVIDER when the owner answers", async () => {
+  // Security NEW-2's shape: the store's provider never held the key. It is
+  // counted and named rather than skipped, and when the owning provider
+  // finally destroys it the obligation closes as resolved BY PROVIDER — so
+  // the ledger does not fill up with rows that healed on their own.
+  await bindVictimAddress();
+  const binding = await bindingState("alias-pii-001");
+  const other = { ...TEST_PII_KEYS, providerId: "other-kms/v1" } as typeof TEST_PII_KEYS;
+  const otherStore = createPostgresTrustedMemoryStore(writePool, readPool, { piiKeys: other });
+  const { result } = await eraseRecordAtHead(
+    PARTICIPANT, "mutation.s10.erase", "tombstone-s10", "subject_erasure_request", otherStore,
+  );
+  assert.equal(result.rejection, "key_destruction_not_proven");
+  let obligations = await otherStore.listKeyDestructionObligations({ actor: SCOPE });
+  assert.equal(obligations.length, 1, JSON.stringify(obligations));
+  assert.equal(obligations[0]!.notProvenReason, "PROVIDER_DOES_NOT_OWN_KEY");
+
+  const completed = await store().completePendingAliasErasures();
+  assert.equal(completed.destroyed, 1, JSON.stringify(completed));
+  obligations = await otherStore.listKeyDestructionObligations({ actor: SCOPE });
+  assert.equal(obligations[0]!.state, "PROVEN_DESTROYED");
+  assert.equal(obligations[0]!.resolvedBy, "PROVIDER");
+  assert.equal(obligations[0]!.settledBy, null, "a provider answer is not a settlement");
+  assert.equal(
+    await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: binding.pii_key_ref }),
+    "destroyed",
+  );
 });
 
 test("K-9 SECURITY 03581a3 F2: forged key_destroyed evidence for another provider's key does not remove it from the pending count", async () => {
