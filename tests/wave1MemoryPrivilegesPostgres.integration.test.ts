@@ -6,6 +6,7 @@ import { Pool } from "pg";
 
 import { runMailMigrations } from "../src/persistence/postgres/migrations";
 import { memoryPrivilegeMap } from "./support/memoryPrivileges";
+import { lockSharedMemoryTables } from "./support/sharedMemoryTables";
 
 /**
  * EVERY PRIVILEGE OF EVERY MEMORY ROLE IS EXACTLY WHAT IS DECLARED.
@@ -98,6 +99,10 @@ test("the declared map itself keeps the boundaries the register relies on", () =
 });
 
 test("POSITIVE CONTROL: a widened grant IS reported as a difference, then removed", async () => {
+  // A GRANT rewrites the table's catalog row. Under the suite's shared
+  // memory-table lock, like every file that changes shared tables, so it never
+  // races another file's DDL ("tuple concurrently updated", seen at 3569122).
+  const sharedTableLock = await lockSharedMemoryTables(pool);
   await pool.query(`GRANT SELECT ON memory_alias_bindings TO aaliyah_memory_reconciler`);
   try {
     const actual = await memoryPrivilegeMap(pool);
@@ -105,6 +110,7 @@ test("POSITIVE CONTROL: a widened grant IS reported as a difference, then remove
     assert.ok(!EXPECTED.tables!.includes("aaliyah_memory_reconciler memory_alias_bindings SELECT"));
   } finally {
     await pool.query(`REVOKE SELECT ON memory_alias_bindings FROM aaliyah_memory_reconciler`);
+    await sharedTableLock.release();
   }
   assert.ok(!(await memoryPrivilegeMap(pool)).tables!.includes("aaliyah_memory_reconciler memory_alias_bindings SELECT"));
 });
