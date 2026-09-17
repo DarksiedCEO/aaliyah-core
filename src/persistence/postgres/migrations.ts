@@ -5125,9 +5125,14 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
     //
     // A merge is now refused when the chain through it — the longest chain
     // already merged into the absorbed record, this edge, and any chain beyond
-    // the survivor — would exceed 16 hops. Merges within a workspace take one
-    // graph lock first, so two merges at opposite ends of a chain cannot each
-    // pass the bound alone and exceed it together.
+    // the survivor — would exceed 16 hops.
+    //
+    // NO GRAPH LOCK IS NEEDED, and none is taken. Migration 042 refuses a merge
+    // into an absorbed record, so a survivor is always canonical (nothing
+    // beyond it) and a chain can only grow at its canonical end. The chain
+    // into the absorbed record therefore changes only through an edge INTO
+    // that record, and every such edge takes that record's lock (043), which
+    // this edge's own guard already holds when this trigger runs.
     // ------------------------------------------------------------------
     id: "053_memory_merge_chain_bounded",
     sql: `CREATE OR REPLACE FUNCTION public.aaliyah_memory_merge_chain_hops(
@@ -5173,8 +5178,6 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
         IF NEW.kind <> 'merged_into' THEN
           RETURN NULL;
         END IF;
-        PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(
-          'aaliyah-identity-graph' || chr(31) || NEW.tenant_id || chr(31) || NEW.workspace_id, 0));
         -- This edge is already visible to its own AFTER trigger, so the walk
         -- from the absorbed record forward counts it: measure from its two
         -- ends with the edge itself excluded by construction (incoming stops
