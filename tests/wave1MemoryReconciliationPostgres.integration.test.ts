@@ -780,3 +780,48 @@ test("the trusted-memory store and the reconciler agree on a normal mutation: no
   assert.equal((await reconciler().findUnresolved()).length, 0);
   assert.equal(await countReconciliations(), 0);
 });
+
+test("R-2 a reconciliation lock held elsewhere fails within the bound instead of waiting forever", async () => {
+  // Boot runs a reconciliation pass BEFORE the server listens. An unbounded
+  // wait here is a process that never opens its socket.
+  const authorizationId = await authorizeAndSpend({
+    action: "create",
+    recordId: RECORD_ID,
+    proposedContentDigest: memoryContentDigest({ note: "busy" }),
+    mutationReceiptId: "mutation.recon.busy",
+  });
+  await seedReceipt({
+    phase: "pending",
+    mutationReceiptId: "mutation.recon.busy",
+    authorizationId,
+    action: "create",
+    recordId: RECORD_ID,
+  });
+  const [unresolved] = await reconciler().findUnresolved();
+  assert.ok(unresolved);
+  const holder = await adminPool.connect();
+  try {
+    await holder.query("BEGIN");
+    await holder.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      [SCOPE.tenantId, SCOPE.workspaceId, "mutation.recon.busy"].join(String.fromCharCode(0x1f)),
+    ]);
+    const started = Date.now();
+    await assert.rejects(
+      createPostgresMemoryReconciler(adminPool, { lockWaitMs: 400 }).reconcile(unresolved),
+      (error: { code?: string }) => error.code === "55P03",
+    );
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= 350 && elapsed < 4_000, `elapsed ${elapsed}ms`);
+    assert.equal(await countReconciliations(), 0);
+  } finally {
+    await holder.query("ROLLBACK").catch(() => undefined);
+    holder.release();
+  }
+  assert.throws(
+    () => createPostgresMemoryReconciler(adminPool, { lockWaitMs: 0 }),
+    /lockWaitMs must be a positive integer/,
+  );
+  // Positive control: released, it reconciles.
+  const settled = await reconciler().reconcile(unresolved);
+  assert.equal(settled.alreadyReconciled, false);
+});

@@ -141,6 +141,11 @@ export const TRUSTED_MEMORY_REJECTIONS = [
    * deletion, and the transaction is unwound.
    */
   "erasure_incomplete",
+  /**
+   * Another transaction held a lock this mutation needed for longer than the
+   * store's lock wait. Nothing was consumed and nothing was written.
+   */
+  "record_busy",
 ] as const;
 export type TrustedMemoryRejection = (typeof TRUSTED_MEMORY_REJECTIONS)[number];
 

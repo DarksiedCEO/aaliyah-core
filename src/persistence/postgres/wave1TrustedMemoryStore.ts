@@ -273,6 +273,9 @@ const ABORT_REASON: Record<string, MemoryAbortReason> = {
   restore_head_not_deleted: "policy_rejected",
   record_deleted: "policy_rejected",
   erasure_incomplete: "storage_rejected",
+  // The contract's abort vocabulary has no "busy"; a lock that could not be
+  // taken is a refusal by storage, and nothing was mutated or consumed.
+  record_busy: "storage_rejected",
 };
 
 /**
@@ -293,7 +296,19 @@ export type TrustedMemoryStoreOptions = {
   mutationRole?: string | null;
   /** Role the independent post-commit read-back runs as. SELECT only. */
   readBackRole?: string | null;
+  /**
+   * How long a mutation waits for ANY lock — the record's advisory lock, a
+   * row lock on the nonce — before refusing with `record_busy`. Set on the
+   * transaction itself, so it holds whatever pool the store was handed.
+   */
+  lockWaitMs?: number;
 };
+
+/** Default bound on a mutation's lock waits. */
+export const TRUSTED_MEMORY_LOCK_WAIT_MS = 5_000;
+
+/** SQLSTATE `lock_not_available`: a `lock_timeout` expired. */
+const LOCK_NOT_AVAILABLE = "55P03";
 
 function assertRole(
   name: string | null,
@@ -336,6 +351,12 @@ export function createPostgresTrustedMemoryStore(
       : options.readBackRole,
     "readBackRole",
   );
+  const lockWaitMs = options.lockWaitMs ?? TRUSTED_MEMORY_LOCK_WAIT_MS;
+  if (!Number.isSafeInteger(lockWaitMs) || lockWaitMs <= 0) {
+    // Zero is PostgreSQL's "wait forever". Refused at construction so it can
+    // never be configured by accident.
+    throw new Error("trusted memory: lockWaitMs must be a positive integer");
+  }
 
   async function enterRole(
     client: PoolClient,
@@ -743,6 +764,13 @@ export function createPostgresTrustedMemoryStore(
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      // BOUNDED. Found by the b3efc82 reliability review: with the record's
+      // advisory lock held elsewhere, `create()` was still pending after 8s
+      // with no error, holding a pool slot, and nothing anywhere bounded it.
+      // Transaction-local, so it cannot leak onto the pooled connection.
+      await client.query("SELECT set_config('lock_timeout', $1, true)", [
+        `${lockWaitMs}ms`,
+      ]);
       await enterRole(client, mutationRole);
       // Single-flight on the record. Two writers racing the same head
       // serialize here, so the loser reads the winner's head and fails its
@@ -1462,6 +1490,15 @@ export function createPostgresTrustedMemoryStore(
       }
       if (error instanceof MutationAborted) {
         failure = { kind: "abort", rejection: error.rejection };
+      } else if (
+        !commitIssued &&
+        (error as { code?: unknown } | null)?.code === LOCK_NOT_AVAILABLE
+      ) {
+        // Somebody else holds this record. Nothing was consumed — the
+        // ROLLBACK above undid everything — and the answer says so
+        // specifically, rather than as a generic storage failure a caller
+        // cannot distinguish from a broken database.
+        failure = { kind: "abort", rejection: "record_busy" };
       } else if (!commitIssued) {
         failure = { kind: "abort", rejection: "storage_rejected" };
       } else {

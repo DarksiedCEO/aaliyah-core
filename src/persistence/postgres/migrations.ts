@@ -3558,6 +3558,12 @@ export async function runMailMigrations(pool: Pool): Promise<void> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    // BOUNDED, AND WIDER THAN THE POOL'S DEFAULTS ON PURPOSE. A second instance
+    // booting during a rolling deploy legitimately waits here for the first
+    // one's migrations; DDL over populated tables legitimately takes longer
+    // than an ordinary statement. Neither is allowed to wait forever.
+    await client.query("SET LOCAL lock_timeout = '120s'");
+    await client.query("SET LOCAL statement_timeout = '300s'");
     // Serialize concurrent migrators.
     await client.query("LOCK TABLE aaliyah_mail_migrations IN ACCESS EXCLUSIVE MODE");
     const applied = new Set(

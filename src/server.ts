@@ -67,12 +67,12 @@ async function main(): Promise<void> {
   let memoryService: Wave1MemoryService | null = null;
   // A long-lived pool dedicated to readiness + migrations. Kept open for the
   // process lifetime so /ready can ping it; closed on shutdown.
-  const pool = databaseConfigured ? createMailDbPool() : undefined;
+  const pool = databaseConfigured ? createMailDbPool(process.env, { name: "write" }) : undefined;
   // A SECOND pool, and not a luxury: the trusted-memory store's post-commit
   // read-back has to run on a connection that is not the mutating one, and the
   // alias registry refuses to be constructed with a single pool for that exact
   // reason. Closed on shutdown alongside the first.
-  const readPool = databaseConfigured ? createMailDbPool() : undefined;
+  const readPool = databaseConfigured ? createMailDbPool(process.env, { name: "read" }) : undefined;
 
   if (pool && readPool) {
     await runMailMigrations(pool);
@@ -128,6 +128,10 @@ async function main(): Promise<void> {
     readinessProbe: createReadinessProbe({
       databaseConfigured,
       ...(pool ? { pool } : {}),
+      // The read pool is not optional to readiness: every trusted-memory
+      // mutation's post-commit read-back runs on it, so an outage isolated to
+      // it starves every mutation while the write pool still answers.
+      ...(readPool ? { readPool } : {}),
     }),
   });
 

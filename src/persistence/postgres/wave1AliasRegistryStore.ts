@@ -233,7 +233,12 @@ export type AliasRegistryStoreOptions = {
   mutationRole?: string | null;
   /** Role the independent post-commit read-back runs as. SELECT only. */
   readBackRole?: string | null;
+  /** How long a binding mutation waits for any lock before refusing. */
+  lockWaitMs?: number;
 };
+
+/** Default bound on a binding mutation's lock waits. */
+export const ALIAS_REGISTRY_LOCK_WAIT_MS = 5_000;
 
 function assertRole(name: string | null, label: string): string | null {
   if (name === null) return null;
@@ -281,6 +286,10 @@ export function createPostgresAliasRegistryStore(
       : options.readBackRole,
     "readBackRole",
   );
+  const lockWaitMs = options.lockWaitMs ?? ALIAS_REGISTRY_LOCK_WAIT_MS;
+  if (!Number.isSafeInteger(lockWaitMs) || lockWaitMs <= 0) {
+    throw new Error("alias registry: lockWaitMs must be a positive integer");
+  }
 
   async function enterRole(
     client: PoolClient,
@@ -784,6 +793,10 @@ export function createPostgresAliasRegistryStore(
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      // Bounded: a held participant lock refuses rather than waiting forever.
+      await client.query("SELECT set_config('lock_timeout', $1, true)", [
+        `${lockWaitMs}ms`,
+      ]);
       await enterRole(client, mutationRole);
       // Single-flight on the PARTICIPANT RECORD only. Never on the alias: see
       // the header — locking the alias would let application code decide a
@@ -1118,6 +1131,10 @@ export function createPostgresAliasRegistryStore(
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      // Bounded: a held participant lock refuses rather than waiting forever.
+      await client.query("SELECT set_config('lock_timeout', $1, true)", [
+        `${lockWaitMs}ms`,
+      ]);
       await enterRole(client, mutationRole);
       await client.query(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",

@@ -4833,3 +4833,71 @@ test("the database refuses an inexact jsonb number in a TOMBSTONE", async () => 
     /outside the exact numeric domain/,
   );
 });
+
+// ---------------------------------------------------------------------------
+// R-1 — a held record lock is a bounded refusal, not an unbounded wait.
+// ---------------------------------------------------------------------------
+
+test("R-1 a record lock held elsewhere refuses with record_busy within the bound, and spends nothing", async () => {
+  // EXECUTED against b3efc82 by the reliability review: with this record's
+  // advisory lock held from another connection, `store.create()` was still
+  // pending after 8s with no error, and completed only when the lock was
+  // released. Nothing anywhere bounded it.
+  const genesis = await seedGenesis({ n: 0 });
+  const next = { n: 1 };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, genesis),
+      proposedContent: next,
+    }),
+  );
+  const holder = await adminPool.connect();
+  try {
+    await holder.query("BEGIN");
+    await holder.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      [SCOPE.tenantId, SCOPE.workspaceId, RECORD_ID].join(String.fromCharCode(0x1f)),
+    ]);
+    const started = Date.now();
+    const result = await createPostgresTrustedMemoryStore(writePool, readPool, {
+      lockWaitMs: 400,
+    }).correct({
+      actor: SCOPE,
+      authorizationId: receipt.authorizationId,
+      recordId: RECORD_ID,
+      proposedContent: next,
+      mutationReceiptId: "mutation.busy.1",
+    });
+    const elapsed = Date.now() - started;
+    assert.equal(result.verified, false);
+    assert.equal(result.rejection, "record_busy");
+    assert.ok(elapsed >= 350, `refused before the bound: ${elapsed}ms`);
+    assert.ok(elapsed < 4_000, `the bound was not applied: ${elapsed}ms`);
+    // The ROLLBACK undid the consumption and nothing was written.
+    assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
+    assert.equal(await countVersions(), 1);
+  } finally {
+    await holder.query("ROLLBACK").catch(() => undefined);
+    holder.release();
+  }
+  // Positive control: the same, unspent authorization succeeds once the lock
+  // is gone, so the refusal above was the lock and nothing else.
+  const retried = await store().correct({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: next,
+    mutationReceiptId: "mutation.busy.2",
+  });
+  assert.equal(retried.verified, true, retried.rejection ?? "");
+  assert.equal(await countVersions(), 2);
+});
+
+test("R-1 a lock wait of zero (PostgreSQL's 'forever') cannot be configured", () => {
+  for (const lockWaitMs of [0, -1, 1.5, Number.NaN]) {
+    assert.throws(
+      () => createPostgresTrustedMemoryStore(writePool, readPool, { lockWaitMs }),
+      /lockWaitMs must be a positive integer/,
+    );
+  }
+});

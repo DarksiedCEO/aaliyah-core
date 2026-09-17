@@ -121,13 +121,22 @@ function fromRow(row: ReconciliationRow, alreadyReconciled: boolean): MemoryReco
 export type MemoryReconcilerOptions = {
   /** Overridable so a test can prove the role is what confines this. */
   reconcilerRole?: string;
+  /** How long one reconciliation waits for a lock before failing. */
+  lockWaitMs?: number;
 };
+
+/** Default bound on a reconciliation's lock waits. */
+export const RECONCILER_LOCK_WAIT_MS = 5_000;
 
 export function createPostgresMemoryReconciler(
   pool: Pool,
   options: MemoryReconcilerOptions = {},
 ) {
   const role = options.reconcilerRole ?? RECONCILER_ROLE;
+  const lockWaitMs = options.lockWaitMs ?? RECONCILER_LOCK_WAIT_MS;
+  if (!Number.isSafeInteger(lockWaitMs) || lockWaitMs <= 0) {
+    throw new Error("memory reconciler: lockWaitMs must be a positive integer");
+  }
 
   async function enterRole(client: PoolClient): Promise<void> {
     // Quoted and validated: a role name is an identifier and cannot be bound
@@ -223,6 +232,11 @@ export function createPostgresMemoryReconciler(
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      // Bounded, for the same reason the mutation path is: a reconciliation
+      // that waits forever on a wedged holder is a boot that never listens.
+      await client.query("SELECT set_config('lock_timeout', $1, true)", [
+        `${lockWaitMs}ms`,
+      ]);
       await enterRole(client);
       await client.query(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",

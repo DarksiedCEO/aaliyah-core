@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { Pool } from "pg";
 
 import { scopedKey, type TenantScope } from "./tenantScopedStore";
+import { guardPoolErrors, MAIL_DB_POOL_BOUNDS } from "./postgres/pool";
 import {
   ExecutionResultSchema,
   parseVerifiedExecutionRecordV1,
@@ -27,9 +28,17 @@ const STALE_IN_PROGRESS_MS = 5 * 60 * 1000;
 
 export const idempotencyStoreInternals = {
   buildPool: () =>
-    new Pool({
-      connectionString: process.env.DATABASE_URL,
-    }),
+    guardPoolErrors(
+      new Pool({
+        connectionString: process.env.DATABASE_URL,
+        connectionTimeoutMillis: MAIL_DB_POOL_BOUNDS.connectionTimeoutMillis,
+        statement_timeout: MAIL_DB_POOL_BOUNDS.statementTimeoutMs,
+        lock_timeout: MAIL_DB_POOL_BOUNDS.lockTimeoutMs,
+        idle_in_transaction_session_timeout:
+          MAIL_DB_POOL_BOUNDS.idleInTransactionSessionTimeoutMs,
+      }),
+      "idempotency",
+    ),
   resetInMemory: () => fallbackStore.clear(),
 };
 

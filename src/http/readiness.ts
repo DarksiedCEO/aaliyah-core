@@ -20,6 +20,13 @@ export type ReadinessProbe = () => Promise<ReadinessResult>;
  */
 export function createReadinessProbe(opts: {
   pool?: Pool;
+  /**
+   * The independent read-back pool. When present it is probed separately:
+   * found by the b3efc82 integration review, `/ready` pinged only the write
+   * pool, so exhausting the read pool left `ready: true` while every
+   * trusted-memory read-back starved.
+   */
+  readPool?: Pool;
   databaseConfigured: boolean;
 }): ReadinessProbe {
   return async () => {
@@ -30,6 +37,14 @@ export function createReadinessProbe(opts: {
         checks.database = "ok";
       } catch {
         checks.database = "unavailable";
+      }
+      if (opts.readPool !== undefined) {
+        try {
+          await opts.readPool.query("SELECT 1");
+          checks.readDatabase = "ok";
+        } catch {
+          checks.readDatabase = "unavailable";
+        }
       }
     }
     const ready = Object.values(checks).every((state) => state === "ok");
