@@ -1913,6 +1913,7 @@ test("C8 every CHECK on memory_identity_edges refuses the one row it exists for 
     table: "memory_identity_edges",
     where: "mutation_receipt_id = $1",
     params: ["mutation.checks.edge"],
+    nonObjectColumn: "payload",
     fresh: () => ({
       mutation_receipt_id: "mutation.checks.edge.fresh",
       from_record_id: "record-identity-fresh",
@@ -1928,4 +1929,34 @@ test("C8 every CHECK on memory_identity_edges refuses the one row it exists for 
       { constraint: "memory_identity_edges_authorization_binding", violate: () => ({ payload: { authorizationId: "someone-else-0000000000001" } }) },
     ],
   });
+});
+
+test("C9 the numeric-domain trigger guards identity-edge payloads: fractional refused, integer accepted", async () => {
+  // P6 survivor TRG memory_identity_edges_exact_numbers: no test ever sent an
+  // edge payload carrying a number JavaScript cannot represent exactly.
+  const bob = "record-identity-bob";
+  const alice = await createRecord(ALICE, { name: "Alice" });
+  await createRecord(bob, { name: "Bob" });
+  const authorizationId = await spendAuthorization({
+    action: "merge_identity",
+    targetRecordId: ALICE,
+    expectedHead: { kind: "version", version: 1, contentDigest: alice },
+    proposedContent: mergeOrder(bob),
+    mutationReceiptId: "mutation.c9.numeric",
+  });
+  const insert = (extra: Record<string, unknown>) =>
+    runAs(
+      "aaliyah_memory_mutator",
+      `INSERT INTO memory_identity_edges
+         (tenant_id, workspace_id, principal_id, user_id, kind, from_record_id, to_record_id,
+          from_version, authorization_id, mutation_receipt_id, reason, reason_evidence_ref,
+          effective_at, payload)
+       VALUES ($1,$2,$3,$4,'merged_into',$5,$6,2,$7,'mutation.c9.numeric',
+               'duplicate_participant','matter:identity-merge/0009', now(), $8)`,
+      [SCOPE.tenantId, SCOPE.workspaceId, SCOPE.principalId, SCOPE.userId, ALICE, bob, authorizationId,
+       JSON.stringify({ kind: "merged_into", fromRecordId: ALICE, toRecordId: bob, authorizationId, ...extra })],
+    );
+  await assert.rejects(() => insert({ weight: 0.5 }), /outside the exact numeric domain/);
+  await insert({ weight: 2 });
+  assert.equal((await edgesFor(ALICE)).length, 1);
 });

@@ -668,7 +668,9 @@ test("the reconciler role cannot write a record version, so it cannot duplicate 
     (error: unknown) => {
       // Pinned to the privilege, not to any error: a schema complaint would
       // pass a bare rejects() while the role still held the grant.
-      assert.match(String(error), /permission denied/i);
+      // Pinned to the TABLE: a bare /permission denied/ also matches the
+      // sequence refusal, which let a widened table grant go unnoticed (P6).
+      assert.match(String(error), /permission denied for table memory_record_versions/);
       return true;
     },
   );
@@ -688,7 +690,9 @@ test("the reconciler role cannot append a mutation receipt either", async () => 
         [EVIDENCE_DIGEST],
       ),
     (error: unknown) => {
-      assert.match(String(error), /permission denied/i);
+      // Pinned to the TABLE: a bare /permission denied/ also matches the
+      // sequence refusal, which let a widened table grant go unnoticed (P6).
+      assert.match(String(error), /permission denied for table memory_mutation_receipts/);
       return true;
     },
   );
@@ -702,7 +706,9 @@ test("the reconciler role cannot spend or un-spend an authorization", async () =
         `UPDATE memory_authorization_nonces SET consumed_at = NULL`,
       ),
     (error: unknown) => {
-      assert.match(String(error), /permission denied/i);
+      // Pinned to the TABLE: a bare /permission denied/ also matches the
+      // sequence refusal, which let a widened table grant go unnoticed (P6).
+      assert.match(String(error), /permission denied for table memory_authorization_nonces/);
       return true;
     },
   );
@@ -1022,6 +1028,7 @@ test("C8 every CHECK on memory_reconciliations refuses the one row it exists for
     table: "memory_reconciliations",
     where: "mutation_receipt_id = $1",
     params: ["mutation.checks.recon"],
+    nonObjectColumn: "evidence",
     fresh: () => fresh,
     cases: [
       // Observing nothing, so `committed_observes` (which sorts first) holds.
@@ -1036,4 +1043,18 @@ test("C8 every CHECK on memory_reconciliations refuses the one row it exists for
     ],
   });
   assert.ok(authorizationId.length > 0);
+});
+
+test("C9 the reconciler role cannot rewrite or delete a reconciliation — refused by PRIVILEGE, before any trigger", async () => {
+  // P6 survivor G-06: the append-only test runs as the owner, so granting the
+  // reconciler UPDATE/DELETE was masked by the trigger and nothing noticed.
+  for (const sql of [
+    `UPDATE memory_reconciliations SET verdict = 'COMMITTED_CONFIRMED'`,
+    `DELETE FROM memory_reconciliations`,
+  ]) {
+    await assert.rejects(
+      () => runAs("aaliyah_memory_reconciler", sql),
+      /permission denied for table memory_reconciliations/,
+    );
+  }
 });

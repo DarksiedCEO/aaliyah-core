@@ -4033,6 +4033,7 @@ test("C8 every CHECK on the legal-hold and retention tables refuses the one row 
     table: "memory_legal_holds",
     where: "hold_id = $1",
     params: ["hold-checks-records"],
+    nonObjectColumn: "payload",
     fresh: () => freshHold,
     cases: [
       { constraint: "memory_legal_holds_coverage_domain", violate: () => ({ coverage_kind: "everything", payload: { coverage: { kind: "everything" } } }) },
@@ -4094,4 +4095,121 @@ test("C8 every CHECK on the legal-hold and retention tables refuses the one row 
     fresh: () => ({ obligation_id: "retention-checks-fresh" }),
     cases: [{ constraint: "memory_retention_obligations_window", violate: (r) => ({ retain_until: r.imposed_at }) }],
   });
+});
+
+// ---------------------------------------------------------------------------
+// C9 — survivors of the Priority 6 sweep at 7825b89, closed.
+// ---------------------------------------------------------------------------
+
+test("C9 the mutation role is refused by PRIVILEGE on tombstones, key-erasure evidence and index entries it may not rewrite", async () => {
+  // P6 survivors G-11, G-12, G-14: every existing test of these tables ran as
+  // the OWNER, so widening the mutator's grants was masked by the append-only
+  // and guard triggers and nothing noticed.
+  await bindVictimAddress();
+  const { result } = await eraseParticipant("mutation.c9.grants", "tombstone-c9-grants");
+  assert.equal(result.verified, true);
+  const receipt = (await bindingState("alias-pii-001")).mutation_receipt_id;
+  for (const [sql, table] of [
+    [`UPDATE memory_tombstones SET reason = 'erroneous_record'`, "memory_tombstones"],
+    [`DELETE FROM memory_tombstones`, "memory_tombstones"],
+    [`UPDATE memory_pii_key_erasures SET event = 'key_destroyed'`, "memory_pii_key_erasures"],
+    [`DELETE FROM memory_pii_key_erasures`, "memory_pii_key_erasures"],
+    [`DELETE FROM memory_alias_blind_indexes`, "memory_alias_blind_indexes"],
+    [`UPDATE memory_alias_blind_indexes SET purpose = 'alias.skeleton'`, "memory_alias_blind_indexes"],
+  ] as const) {
+    await assert.rejects(() => runAs("aaliyah_memory_mutator", sql), new RegExp(`permission denied for table ${table}`));
+  }
+  // Positive control: the columns the mutator IS granted on index entries
+  // reach the guard trigger, which refuses on its own terms.
+  await assert.rejects(
+    () => runAs("aaliyah_memory_mutator", `UPDATE memory_alias_blind_indexes SET active = true WHERE binding_mutation_receipt_id = $1`, [receipt]),
+    /an erased index entry is immutable/,
+  );
+});
+
+test("C9 every legal-hold child row must belong to a real hold of its coverage kind (the three foreign keys)", async () => {
+  // P6 survivors: FK carve_outs/records/subjects, and memory_legal_holds_fk_target
+  // which two of them reference. No test ever wrote an orphan child row.
+  await placeHold(legalHold({ coverage: { kind: "records", recordIds: [FREE_RECORD_ID] }, holdId: "hold-c9-records" }));
+  await placeHold(legalHold({ coverage: { kind: "subjects", canonicalParticipantIds: ["participant-c9"] }, holdId: "hold-c9-subjects" }));
+  const insert = (sql: string, params: unknown[]) => adminPool.query(sql, params);
+  const records = `INSERT INTO memory_legal_hold_records (tenant_id, workspace_id, hold_id, coverage_kind, record_id) VALUES ($1,$2,$3,'records',$4)`;
+  const subjects = `INSERT INTO memory_legal_hold_subjects (tenant_id, workspace_id, hold_id, coverage_kind, canonical_participant_id) VALUES ($1,$2,$3,'subjects',$4)`;
+  const carveOuts = `INSERT INTO memory_legal_hold_carve_outs (tenant_id, workspace_id, hold_id, action, order_ref, granting_authority_id, granted_at) VALUES ($1,$2,$3,'promote','order:court/2026-0999','authority.court', now())`;
+  const expectFk = async (sql: string, params: unknown[], constraint: string) => {
+    await assert.rejects(() => insert(sql, params), (error: unknown) => {
+      const e = error as { code?: string; constraint?: string };
+      assert.equal(e.code, "23503", String(error));
+      assert.equal(e.constraint, constraint);
+      return true;
+    });
+  };
+  // A hold that does not exist.
+  await expectFk(records, [SCOPE.tenantId, SCOPE.workspaceId, "hold-never-placed", "record-c9-a"], "memory_legal_hold_records_hold_fk");
+  await expectFk(subjects, [SCOPE.tenantId, SCOPE.workspaceId, "hold-never-placed", "participant-c9-a"], "memory_legal_hold_subjects_hold_fk");
+  await expectFk(carveOuts, [SCOPE.tenantId, SCOPE.workspaceId, "hold-never-placed"], "memory_legal_hold_carve_outs_hold_fk");
+  // A real hold of the WRONG coverage kind: records under a subjects hold, subjects under a records hold.
+  await expectFk(records, [SCOPE.tenantId, SCOPE.workspaceId, "hold-c9-subjects", "record-c9-b"], "memory_legal_hold_records_hold_fk");
+  await expectFk(subjects, [SCOPE.tenantId, SCOPE.workspaceId, "hold-c9-records", "participant-c9-b"], "memory_legal_hold_subjects_hold_fk");
+  // Positive controls: the matching rows land.
+  await insert(records, [SCOPE.tenantId, SCOPE.workspaceId, "hold-c9-records", "record-c9-c"]);
+  await insert(subjects, [SCOPE.tenantId, SCOPE.workspaceId, "hold-c9-subjects", "participant-c9-c"]);
+  await insert(carveOuts, [SCOPE.tenantId, SCOPE.workspaceId, "hold-c9-records"]);
+});
+
+test("C9 a provider that CLAIMS destruction without destroying is caught: the deletion stays incomplete and nothing is recorded destroyed", async () => {
+  // P6 survivor P3-04: the store re-reads key state after `destroyDataKey`, and
+  // removing that confirmation went unnoticed because the local provider never
+  // lies. This one does.
+  await bindVictimAddress();
+  const before = await bindingState("alias-pii-001");
+  const liar = {
+    ...TEST_PII_KEYS,
+    destroyDataKey: async () => ({ state: "destroyed" as const, destroyedAt: new Date().toISOString() }),
+  };
+  const head = await store().readHead(SCOPE, PARTICIPANT);
+  const order = deletionOrder("subject_erasure_request");
+  const receipt = await issue(
+    authorization({ action: "delete", targetRecordId: PARTICIPANT, expectedHead: headOf(head!.version, head!.contentDigest), proposedContent: order }),
+  );
+  const result = await createPostgresTrustedMemoryStore(writePool, readPool, { piiKeys: liar }).delete({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: PARTICIPANT,
+    proposedContent: order,
+    mutationReceiptId: "mutation.c9.liar",
+    tombstoneId: "tombstone-c9-liar",
+  });
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "erasure_incomplete");
+  assert.deepEqual(result.aliasErasure, { bindingsErased: 1, keysDestroyed: 0, keysPending: 1 });
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "active");
+  const destroyed = await adminPool.query(`SELECT count(*)::int AS n FROM memory_pii_key_erasures WHERE event = 'key_destroyed'`);
+  assert.equal(destroyed.rows[0].n, 0);
+  // Positive control: the honest provider finishes the same erasure.
+  assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 1, pending: 0 });
+});
+
+test("C9 an index entry that matches a lookup but belongs to ANOTHER binding is refused, never resolved", async () => {
+  // P6 survivor P3-05: removing the check that the matched binding decrypts
+  // to the requested address changed nothing any test observed.
+  await bindVictimAddress2();
+  const other = await bindingState("alias-pii-002");
+  const indexScope = { tenantId: SCOPE.tenantId, scopeKey: SCOPE.workspaceId };
+  // A new key version, so the planted entry cannot collide with binding 002's
+  // own version-1 entry on (binding, purpose, version).
+  TEST_PII_KEYS.rotateBlindIndexKey(indexScope, "alias.normalized");
+  const [ghostIndex] = await TEST_PII_KEYS.blindIndexesForLookup({ scope: indexScope, purpose: "alias.normalized", value: "ghost.person@example.com" });
+  await adminPool.query(
+    `INSERT INTO memory_alias_blind_indexes
+       (tenant_id, workspace_id, scope_key, alias_id, binding_mutation_receipt_id, purpose, key_version, index_value)
+     VALUES ($1,$2,$3,'alias-pii-002',$4,'alias.normalized',$5,$6)`,
+    [SCOPE.tenantId, SCOPE.workspaceId, SCOPE.workspaceId, other.mutation_receipt_id, Number(ghostIndex!.split(".")[1]), ghostIndex],
+  );
+  await assert.rejects(
+    aliases().resolveAlias(SCOPE, "ghost.person@example.com"),
+    /a blind index matched a binding that is not this alias/,
+  );
+  // Positive control: the binding's own address still resolves.
+  assert.equal((await aliases().resolveAlias(SCOPE, "other.person@example.com"))?.binding.aliasId, "alias-pii-002");
 });

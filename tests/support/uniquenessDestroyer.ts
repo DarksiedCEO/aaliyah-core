@@ -156,6 +156,13 @@ export async function assertCheckConstraintsKill(
     params: unknown[];
     fresh: (row: Json) => Json;
     cases: readonly CheckDestroyerCase[];
+    /**
+     * A jsonb column whose `_object` CHECK is a MASKED backstop (every binding
+     * on it sorts earlier and fails on a non-object first). The constraint
+     * cannot be named, so what is proven instead is the property: a
+     * non-object value is refused by SOME CHECK of this table.
+     */
+    nonObjectColumn?: string;
   },
 ): Promise<void> {
   if (!/^memory_[a-z_]+$/.test(spec.table)) {
@@ -201,6 +208,19 @@ export async function assertCheckConstraintsKill(
       assert.ok(refused !== null, `${testCase.constraint}: the violating row was ACCEPTED`);
       assert.equal(refused.code, "23514", `${testCase.constraint}: refused, but not by a CHECK: ${String(refused)}`);
       assert.equal(refused.constraint, testCase.constraint, `${testCase.constraint}: refused by a different CHECK`);
+    }
+    if (spec.nonObjectColumn !== undefined) {
+      await client.query("SAVEPOINT non_object");
+      let refused: { code?: string; constraint?: string } | null = null;
+      try {
+        await client.query(insert, [JSON.stringify({ ...freshRow, [spec.nonObjectColumn]: ["not", "an", "object"] })]);
+      } catch (error) {
+        refused = error as { code?: string; constraint?: string };
+      }
+      await client.query("ROLLBACK TO SAVEPOINT non_object");
+      assert.ok(refused !== null, `${spec.table}: a non-object ${spec.nonObjectColumn} was ACCEPTED`);
+      assert.equal(refused.code, "23514", `${spec.table}: non-object refused, but not by a CHECK`);
+      assert.ok(String(refused.constraint).startsWith(`${spec.table}_`), `${spec.table}: refused by ${refused.constraint}`);
     }
   } finally {
     await client.query("ROLLBACK").catch(() => undefined);

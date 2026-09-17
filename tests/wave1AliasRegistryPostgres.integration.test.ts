@@ -4002,3 +4002,34 @@ test("C8 the alias policy and protected-domain CHECKs each refuse the one row th
     cases: [{ constraint: "memory_alias_protected_domains_host_form", violate: () => ({ registrable_domain: "NOT A DOMAIN" }) }],
   });
 });
+
+test("C9 a binding cannot COMMIT without blind-index entries for both purposes — it would escape the uniqueness race", async () => {
+  // P6 survivor TRG memory_alias_bindings_indexed: every raw fixture carried
+  // its entries, so no test ever tried to commit a binding without them.
+  await witnessAppend({
+    authorizationId: "auth-alias-00000000000000000000",
+    mutationReceiptId: "mutation.raw",
+    targetRecordId: VICTIM,
+  });
+  const row = rawBindingRow();
+  const placeholders = BINDING_INSERT_COLUMNS.map((_c, i) => `$${i + 1}`).join(",");
+  const client = await adminPool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO memory_alias_bindings (${BINDING_INSERT_COLUMNS.join(", ")}) VALUES (${placeholders})`,
+      row.columns,
+    );
+    await assert.rejects(
+      client.query("COMMIT"),
+      /a binding must commit with blind index entries for both purposes/,
+    );
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
+  assert.equal(await activeBindings(), 0);
+  // Positive control: the same binding WITH both entries commits.
+  await insertRawBinding();
+  assert.equal(await activeBindings(), 1);
+});

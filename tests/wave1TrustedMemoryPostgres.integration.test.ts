@@ -5479,6 +5479,7 @@ test("C8 every CHECK on memory_mutation_receipts refuses the one row it exists f
     table: "memory_mutation_receipts",
     where: "mutation_receipt_id = $1 AND phase = 'terminal'",
     params: ["mutation.checks.receipt"],
+    nonObjectColumn: "payload",
     fresh: () => ({ mutation_receipt_id: "mutation.checks.fresh", payload: { mutationReceiptId: "mutation.checks.fresh" } }),
     cases: [
       { constraint: "memory_mutation_receipts_action_binding", violate: () => ({ payload: { action: "delete" } }) },
@@ -5501,5 +5502,82 @@ test("C8 every CHECK on memory_mutation_receipts refuses the one row it exists f
       { constraint: "memory_mutation_receipts_user_binding", violate: () => ({ payload: { scope: { userId: "user-elsewhere" } } }) },
       { constraint: "memory_mutation_receipts_workspace_binding", violate: () => ({ payload: { scope: { workspaceId: "workspace-elsewhere" } } }) },
     ],
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C9 — survivors of the Priority 6 sweep at 7825b89, closed.
+// ---------------------------------------------------------------------------
+
+test("C9 the mutation role may update ONLY the erasure columns of a version; any other column is refused by PRIVILEGE", async () => {
+  // P6 survivor G-01: widening the mutator to table-wide UPDATE was masked by
+  // the rewrite guard, so the column-level grant had no test of its own.
+  await seedGenesis({ note: "original" });
+  for (const column of ["content_digest", "state", "principal_id", "payload"]) {
+    const value = column === "payload" ? `'{}'::jsonb` : `'x'`;
+    const sql = `UPDATE memory_record_versions SET ${column} = ${value} WHERE record_id = '${RECORD_ID}'`;
+    if (column === "payload") {
+      // Positive control: payload IS granted (erasure writes it), so the
+      // refusal comes from the rewrite guard, not from privilege.
+      await assert.rejects(() => asMutator(sql), (error: unknown) => {
+        assert.doesNotMatch(String(error), /permission denied/);
+        return true;
+      });
+    } else {
+      await assert.rejects(() => asMutator(sql), /permission denied for table memory_record_versions/);
+    }
+  }
+});
+
+test("C9 the SELECT-only reader cannot write a record version — refused on the TABLE, not merely the sequence", async () => {
+  // P6 survivor G-15: a bare /permission denied/ elsewhere, and no reader test.
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_reader",
+        FORGED_VERSION_SQL,
+        [SCOPE.tenantId, SCOPE.workspaceId, SCOPE.principalId, SCOPE.userId, RECORD_ID, 1, "active",
+         memoryContentDigest({ n: 1 }), null, "reader-000000000000000000001", "mutation.reader",
+         versionPayload({ recordId: RECORD_ID, version: 1, contentDigest: memoryContentDigest({ n: 1 }), predecessorDigest: null, authorizationId: "reader-000000000000000000001", mutationReceiptId: "mutation.reader" })],
+      ),
+    /permission denied for table memory_record_versions/,
+  );
+});
+
+test("C9 the numeric-domain trigger and the payload CHECKs guard memory_mutation_attempts (from a real attempt)", async () => {
+  // P6 survivors: TRG memory_mutation_attempts_exact_numbers, and the masked
+  // `_payload_object` backstop whose property had no proof on this table.
+  await seedGenesis({ note: "original" });
+  const refused = await store().correct({
+    actor: SCOPE,
+    authorizationId: nextAuthorizationId(),
+    recordId: RECORD_ID,
+    proposedContent: { note: "x" },
+    mutationReceiptId: "mutation.attempt.numeric",
+  });
+  assert.equal(refused.rejection, "authorization_not_found");
+  const row = await adminPool.query(
+    `SELECT payload FROM memory_mutation_attempts WHERE mutation_receipt_id = 'mutation.attempt.numeric'`,
+  );
+  const payload = row.rows[0].payload as Record<string, unknown>;
+  const insert = (body: unknown, receipt: string) =>
+    asMutator(
+      `INSERT INTO memory_mutation_attempts
+         (tenant_id, workspace_id, principal_id, user_id, mutation_receipt_id, authorization_id,
+          action, target_record_id, rejection, abort_reason, attempted_at, payload)
+       VALUES ($1,$2,$3,$4,$5,$6,'correct',$7,'authorization_not_found','policy_rejected', now(), $8)`,
+      [SCOPE.tenantId, SCOPE.workspaceId, SCOPE.principalId, SCOPE.userId, receipt, payload.authorizationId,
+       RECORD_ID, JSON.stringify({ ...payload, mutationReceiptId: receipt, ...body as object })],
+    );
+  await assert.rejects(() => insert({ ratio: 0.1 }, "mutation.attempt.inexact"), /outside the exact numeric domain/);
+  // Positive control: an exact integer lands.
+  await insert({ ratio: 1 }, "mutation.attempt.exact");
+  await assertCheckConstraintsKill(adminPool, {
+    table: "memory_mutation_attempts",
+    where: "mutation_receipt_id = $1",
+    params: ["mutation.attempt.numeric"],
+    fresh: () => ({ mutation_receipt_id: "mutation.attempt.fresh", payload: { mutationReceiptId: "mutation.attempt.fresh" } }),
+    cases: [],
+    nonObjectColumn: "payload",
   });
 });

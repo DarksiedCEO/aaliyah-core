@@ -166,3 +166,79 @@ test("a migration id without a three-digit ordinal fails loudly rather than sort
     `DELETE FROM aaliyah_mail_migrations WHERE id = 'hotfix_manual_patch'`,
   );
 });
+
+test("047 REFUSES to run over an existing plaintext alias binding, and the plaintext row survives the refusal", async () => {
+  // P6 survivor P3-13: disabling this refusal left the suite green, because no
+  // test ever built a database that still held a plaintext binding when 047
+  // arrived. Built here: a migrated database is walked back to its pre-047
+  // shape — the plaintext column restored, one binding in it, and 047..049
+  // unrecorded — and the runner is asked to go forward again.
+  await runMailMigrations(replayPool);
+  const client = await replayPool.connect();
+  try {
+    await client.query(`ALTER TABLE memory_alias_bindings ADD COLUMN normalized_alias text`);
+    await client.query(
+      `INSERT INTO memory_alias_tenant_policy (tenant_id, cross_workspace_policy, set_by_actor_id, policy_version)
+       VALUES ('tenant-replay','workspace_isolated','actor.replay','alias-policy/v1')`,
+    );
+    await client.query("BEGIN");
+    await client.query(`ALTER TABLE memory_alias_bindings DISABLE TRIGGER USER`);
+    await client.query(
+      `INSERT INTO memory_alias_bindings
+         (tenant_id, workspace_id, principal_id, user_id, cross_workspace_policy, scope_key,
+          alias_id, skeleton_algorithm, normalization_profile, canonical_participant_id,
+          script_code, restriction_level, subject_participant_id, source_evidence_ref,
+          source_evidence_digest, observed_at, fresh_until, authorization_id,
+          mutation_receipt_id, bound_at, payload, pii_envelope, pii_key_ref, pii_key_version,
+          normalized_alias)
+       VALUES ('tenant-replay','workspace-replay','p','u','workspace_isolated','workspace-replay',
+               'alias-replay','sk','np','participant-replay','Latn','ascii_only','participant-replay',
+               'identity:x/y',$1, now(), now() + interval '1 hour','auth-replay','mutation.replay',
+               now(), $2::jsonb, '{"keyRef":"k","keyVersion":1}'::jsonb,'k',1,
+               'plaintext.person@example.com')`,
+      [
+        `sha256:${"a".repeat(64)}`,
+        JSON.stringify({
+          scope: { tenantId: "tenant-replay", workspaceId: "workspace-replay", principalId: "p", userId: "u" },
+          aliasId: "alias-replay",
+          canonicalParticipantId: "participant-replay",
+          subjectParticipantId: "participant-replay",
+          crossWorkspacePolicy: "workspace_isolated",
+          scopeKey: "workspace-replay",
+          authorizationId: "auth-replay",
+          mutationReceiptId: "mutation.replay",
+        }),
+      ],
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+  await replayPool.query(
+    `DELETE FROM aaliyah_mail_migrations WHERE id IN (
+       SELECT id FROM aaliyah_mail_migrations WHERE substring(id from 1 for 3)::int >= 47)`,
+  );
+
+  await assert.rejects(
+    () => runMailMigrations(replayPool),
+    /1 plaintext alias binding\(s\) exist; migration 047 will not drop personal identifiers it cannot first re-encrypt/,
+  );
+  const survived = await replayPool.query(
+    `SELECT normalized_alias FROM memory_alias_bindings WHERE alias_id = 'alias-replay'`,
+  );
+  assert.equal(survived.rows[0]?.normalized_alias, "plaintext.person@example.com");
+
+  // Positive control: with the plaintext gone, the same forward run succeeds.
+  await replayPool.query(`ALTER TABLE memory_alias_bindings DISABLE TRIGGER USER`);
+  await replayPool.query(`DELETE FROM memory_alias_bindings`);
+  await replayPool.query(`ALTER TABLE memory_alias_bindings ENABLE TRIGGER USER`);
+  await runMailMigrations(replayPool);
+  const column = await replayPool.query(
+    `SELECT count(*)::int AS n FROM information_schema.columns
+      WHERE table_name = 'memory_alias_bindings' AND column_name = 'normalized_alias'`,
+  );
+  assert.equal(column.rows[0].n, 0);
+});
