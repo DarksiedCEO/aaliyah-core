@@ -2,6 +2,8 @@ node_modules
 dist
 coverage
 *.log
+.test-evidence/
+.test-evidence-run-*/
 .idea
 
 # Filled deploy config (identifiers; never secrets) — not committed

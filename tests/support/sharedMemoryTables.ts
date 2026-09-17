@@ -25,6 +25,17 @@ import type { Pool, PoolClient } from "pg";
  */
 const MEMORY_TABLES_LOCK_KEY = 728_133_001;
 
+/**
+ * THE WAIT IS BOUNDED. A file that died holding this lock on a connection the
+ * server has not yet noticed is gone would otherwise block every other memory
+ * file forever — a hang with no verdict. The bound is set explicitly on this
+ * session, overriding the suite-wide `lock_timeout` / `statement_timeout`
+ * (scripts/test-watchdog.mjs), because waiting for another FILE is legitimately
+ * longer than waiting for another statement. It stays below the watchdog's
+ * per-file timeout so this refusal, with its reason, is what gets reported.
+ */
+export const SHARED_TABLE_LOCK_WAIT_MS = 200_000;
+
 export type SharedTableLock = { release(): Promise<void> };
 
 /** Acquire the lock, blocking until the other file's suite has finished. */
@@ -33,10 +44,15 @@ export async function lockSharedMemoryTables(
 ): Promise<SharedTableLock> {
   const client: PoolClient = await pool.connect();
   try {
+    await client.query(`SET lock_timeout = ${SHARED_TABLE_LOCK_WAIT_MS}`);
+    await client.query(`SET statement_timeout = ${SHARED_TABLE_LOCK_WAIT_MS}`);
     await client.query("SELECT pg_advisory_lock($1)", [MEMORY_TABLES_LOCK_KEY]);
   } catch (error) {
-    client.release();
-    throw error;
+    client.release(true);
+    throw new Error(
+      `shared memory-table lock not acquired within ${SHARED_TABLE_LOCK_WAIT_MS}ms: ` +
+        String((error as Error).message),
+    );
   }
   return {
     async release() {

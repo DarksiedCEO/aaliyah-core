@@ -3032,6 +3032,7 @@ test("M-3 an append landing between COMMIT and read-back is not reported as dive
   // concurrent append instead of racing it.
   const singleReadBack = new Pool({ connectionString: DB_URL, max: 1 });
   const held = await singleReadBack.connect();
+  let heldReleased = false;
   try {
     const pending = createPostgresTrustedMemoryStore(
       writePool,
@@ -3088,6 +3089,7 @@ test("M-3 an append landing between COMMIT and read-back is not reported as dive
       ],
     );
     held.release();
+    heldReleased = true;
     const result = await pending;
     assert.equal(result.verified, false);
     assert.notEqual(
@@ -3105,6 +3107,12 @@ test("M-3 an append landing between COMMIT and read-back is not reported as dive
       { phase: "terminal", status: "UNKNOWN_PENDING_RECONCILIATION" },
     ]);
   } finally {
+    // RELEASE BEFORE END. `pool.end()` waits for every checked-out client, so
+    // an assertion that threw while `held` was still out made this `finally`
+    // wait forever — the unbounded hang the b3efc82 mutation sweep reported
+    // as "no verdict" (mutant A09). Destroying the client rather than
+    // returning it: whatever the failed test left on it is not reusable.
+    if (!heldReleased) held.release(true);
     await singleReadBack.end();
   }
 });
