@@ -1,49 +1,85 @@
 import type { Pool } from "pg";
 
 /**
- * EVERY PRIVILEGE A MEMORY ROLE HOLDS, READ FROM THE CATALOG.
+ * EVERY PRIVILEGE THAT REACHES A MEMORY ROLE, READ FROM THE ACLS THEMSELVES.
  *
- * Tables and views, columns, sequences, the aaliyah_* functions (including
- * what PUBLIC may execute) and role membership, in public only — shadow
- * schemas that tests create are not part of the deployed surface.
+ * Read from pg_class / pg_attribute / pg_namespace / pg_proc / pg_default_acl
+ * with aclexplode, not from information_schema, so a grant to PUBLIC — which
+ * every memory role inherits — is an entry like any other, and WITH GRANT
+ * OPTION is recorded (a trailing `*`). The test-falsifiability and security
+ * reviews of 03581a3 showed the information_schema version, filtered to
+ * `aaliyah_*` grantees, blind to five widenings: table and column grants to
+ * PUBLIC, schema CREATE, default privileges, and a grant option re-granted to
+ * PUBLIC. Role attributes and SECURITY DEFINER functions of any name in
+ * public are included for the same reason.
+ *
+ * Only grantees that reach a memory role are listed: PUBLIC and aaliyah_*.
+ * The owner's own implicit privileges are not.
  */
 export async function memoryPrivilegeMap(pool: Pool): Promise<Record<string, string[]>> {
   const q = async (sql: string) => (await pool.query(sql)).rows.map((r) => r.entry as string);
+  const grantee = `COALESCE((SELECT rolname FROM pg_roles WHERE oid = acl.grantee), 'PUBLIC')`;
+  const reaches = `(acl.grantee = 0 OR (SELECT rolname FROM pg_roles WHERE oid = acl.grantee) LIKE 'aaliyah\\_%')`;
   return {
     tables: await q(`
-      SELECT grantee || ' ' || table_name || ' ' || string_agg(privilege_type, ',' ORDER BY privilege_type) AS entry
-        FROM information_schema.role_table_grants
-       WHERE grantee LIKE 'aaliyah\\_%' AND table_schema = 'public'
-       GROUP BY grantee, table_name ORDER BY 1`),
+      SELECT ${grantee} || ' ' || c.relname || ' ' ||
+             string_agg(acl.privilege_type || CASE WHEN acl.is_grantable THEN '*' ELSE '' END, ',' ORDER BY acl.privilege_type) AS entry
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace AND n.nspname = 'public'
+        CROSS JOIN LATERAL aclexplode(c.relacl) AS acl
+       WHERE c.relkind IN ('r', 'v', 'm', 'p', 'f') AND ${reaches}
+       GROUP BY acl.grantee, c.relname ORDER BY 1`),
     columns: await q(`
-      SELECT c.grantee || ' ' || c.table_name || '.' || c.column_name || ' ' || c.privilege_type AS entry
-        FROM information_schema.column_privileges AS c
-       WHERE c.grantee LIKE 'aaliyah\\_%' AND c.table_schema = 'public'
-         AND NOT EXISTS (
-           SELECT 1 FROM information_schema.role_table_grants AS t
-            WHERE t.grantee = c.grantee AND t.table_schema = c.table_schema
-              AND t.table_name = c.table_name AND t.privilege_type = c.privilege_type)
+      SELECT ${grantee} || ' ' || c.relname || '.' || a.attname || ' ' ||
+             acl.privilege_type || CASE WHEN acl.is_grantable THEN '*' ELSE '' END AS entry
+        FROM pg_attribute AS a
+        JOIN pg_class AS c ON c.oid = a.attrelid
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace AND n.nspname = 'public'
+        CROSS JOIN LATERAL aclexplode(a.attacl) AS acl
+       WHERE a.attnum > 0 AND NOT a.attisdropped AND ${reaches}
        ORDER BY 1`),
     sequences: await q(`
-      SELECT r.rolname || ' ' || s.relname || ' ' ||
-             concat_ws(',', CASE WHEN has_sequence_privilege(r.oid, s.oid, 'USAGE') THEN 'USAGE' END,
-                            CASE WHEN has_sequence_privilege(r.oid, s.oid, 'UPDATE') THEN 'UPDATE' END) AS entry
-        FROM pg_class AS s
-        JOIN pg_namespace AS n ON n.oid = s.relnamespace AND n.nspname = 'public'
-        CROSS JOIN pg_roles AS r
-       WHERE s.relkind = 'S' AND s.relname LIKE 'memory\\_%' AND r.rolname LIKE 'aaliyah\\_memory\\_%'
-         AND (has_sequence_privilege(r.oid, s.oid, 'USAGE') OR has_sequence_privilege(r.oid, s.oid, 'UPDATE'))
-         AND NOT r.rolsuper
+      SELECT ${grantee} || ' ' || c.relname || ' ' ||
+             string_agg(acl.privilege_type || CASE WHEN acl.is_grantable THEN '*' ELSE '' END, ',' ORDER BY acl.privilege_type) AS entry
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace AND n.nspname = 'public'
+        CROSS JOIN LATERAL aclexplode(c.relacl) AS acl
+       WHERE c.relkind = 'S' AND ${reaches}
+       GROUP BY acl.grantee, c.relname ORDER BY 1`),
+    schemas: await q(`
+      SELECT ${grantee} || ' ' || n.nspname || ' ' ||
+             string_agg(acl.privilege_type || CASE WHEN acl.is_grantable THEN '*' ELSE '' END, ',' ORDER BY acl.privilege_type) AS entry
+        FROM pg_namespace AS n
+        CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) AS acl
+       WHERE n.nspname = 'public' AND ${reaches}
+       GROUP BY acl.grantee, n.nspname ORDER BY 1`),
+    defaultPrivileges: await q(`
+      SELECT COALESCE((SELECT rolname FROM pg_roles WHERE oid = d.defaclrole), '?') || ' ' ||
+             COALESCE((SELECT nspname FROM pg_namespace WHERE oid = d.defaclnamespace), '*') || ' ' ||
+             d.defaclobjtype::text || ' ' || ${grantee} || ' ' || acl.privilege_type AS entry
+        FROM pg_default_acl AS d
+        CROSS JOIN LATERAL aclexplode(d.defaclacl) AS acl
        ORDER BY 1`),
     functions: await q(`
-      SELECT COALESCE(grantee.rolname, 'PUBLIC') || ' ' || p.oid::regprocedure::text AS entry
+      SELECT ${grantee} || ' ' || p.oid::regprocedure::text AS entry
         FROM pg_proc AS p
         JOIN pg_namespace AS n ON n.oid = p.pronamespace AND n.nspname = 'public'
         CROSS JOIN LATERAL aclexplode(COALESCE(p.proacl, acldefault('f', p.proowner))) AS acl
-        LEFT JOIN pg_roles AS grantee ON grantee.oid = acl.grantee
-       WHERE p.proname LIKE 'aaliyah\\_%' AND acl.privilege_type = 'EXECUTE'
-         AND (acl.grantee = 0 OR grantee.rolname LIKE 'aaliyah\\_%')
+       WHERE acl.privilege_type = 'EXECUTE' AND ${reaches}
        ORDER BY 1`),
+    securityDefiner: await q(`
+      SELECT p.oid::regprocedure::text AS entry
+        FROM pg_proc AS p
+        JOIN pg_namespace AS n ON n.oid = p.pronamespace AND n.nspname = 'public'
+       WHERE p.prosecdef
+       ORDER BY 1`),
+    roleAttributes: await q(`
+      SELECT rolname || ' ' || concat_ws(',',
+               CASE WHEN rolsuper THEN 'SUPERUSER' END, CASE WHEN rolcreaterole THEN 'CREATEROLE' END,
+               CASE WHEN rolcreatedb THEN 'CREATEDB' END, CASE WHEN rolcanlogin THEN 'LOGIN' END,
+               CASE WHEN rolreplication THEN 'REPLICATION' END, CASE WHEN rolbypassrls THEN 'BYPASSRLS' END,
+               CASE WHEN rolinherit THEN 'INHERIT' END) AS entry
+        FROM pg_roles WHERE rolname LIKE 'aaliyah\\_%' ORDER BY 1`),
     memberships: await q(`
       SELECT m.rolname || ' IN ' || r.rolname AS entry
         FROM pg_auth_members AS am

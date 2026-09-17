@@ -90,12 +90,62 @@ test("the declared map itself keeps the boundaries the register relies on", () =
   }
   // No memory role is a member of another.
   assert.deepEqual(EXPECTED.memberships, []);
+  // Test-falsifiability and security reviews of 03581a3: the boundaries below
+  // were invisible to the first map.
+  for (const section of ["tables", "columns", "sequences"]) {
+    for (const entry of EXPECTED[section]!) {
+      assert.ok(!entry.startsWith("PUBLIC "), `PUBLIC holds ${entry}`);
+    }
+  }
+  for (const section of Object.keys(EXPECTED)) {
+    for (const entry of EXPECTED[section]!) assert.ok(!entry.includes("*"), `grant option: ${entry}`);
+  }
+  assert.deepEqual(EXPECTED.schemas, ["PUBLIC public USAGE"]);
+  assert.deepEqual(EXPECTED.defaultPrivileges, []);
+  for (const entry of EXPECTED.roleAttributes!) {
+    assert.doesNotMatch(entry, /SUPERUSER|CREATEROLE|CREATEDB|LOGIN|REPLICATION|BYPASSRLS/, entry);
+  }
+  for (const fn of EXPECTED.securityDefiner!) assert.match(fn, /^aaliyah_/, fn);
   // Each new helper is executable only by the one role that needs it.
   const executes = (fn: string) =>
     EXPECTED.functions!.filter((entry) => entry.endsWith(` ${fn}`)).map((entry) => entry.split(" ")[0]).sort();
   assert.deepEqual(executes("aaliyah_memory_alias_effect_present(text,text,text,text,text,text)"), ["aaliyah_memory_reconciler"]);
   assert.deepEqual(executes("aaliyah_memory_unerased_merged_records(text,text,text)"), ["aaliyah_memory_mutator"]);
   assert.deepEqual(executes("aaliyah_memory_merge_chain_hops(text,text,text,text)"), ["aaliyah_memory_mutator"]);
+});
+
+test("POSITIVE CONTROL: each widening the first map could not see IS reported, then removed", async () => {
+  // The five widenings the test-falsifiability review of 03581a3 left
+  // surviving, plus the grant option and role attribute from the security
+  // review. Each is applied, must change the map, and is reverted.
+  const widenings: Array<{ apply: string; revert: string; section: string; entry: string }> = [
+    { apply: `GRANT SELECT ON memory_authorization_receipts TO PUBLIC`, revert: `REVOKE SELECT ON memory_authorization_receipts FROM PUBLIC`, section: "tables", entry: "PUBLIC memory_authorization_receipts SELECT" },
+    { apply: `GRANT INSERT ON memory_tombstones TO PUBLIC`, revert: `REVOKE INSERT ON memory_tombstones FROM PUBLIC`, section: "tables", entry: "PUBLIC memory_tombstones INSERT" },
+    { apply: `GRANT UPDATE (state) ON memory_record_versions TO PUBLIC`, revert: `REVOKE UPDATE (state) ON memory_record_versions FROM PUBLIC`, section: "columns", entry: "PUBLIC memory_record_versions.state UPDATE" },
+    { apply: `GRANT CREATE ON SCHEMA public TO aaliyah_memory_reader`, revert: `REVOKE CREATE ON SCHEMA public FROM aaliyah_memory_reader`, section: "schemas", entry: "aaliyah_memory_reader public CREATE" },
+    { apply: `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO aaliyah_memory_mutator`, revert: `ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE SELECT ON TABLES FROM aaliyah_memory_mutator`, section: "defaultPrivileges", entry: "postgres public r aaliyah_memory_mutator SELECT" },
+    { apply: `GRANT SELECT ON memory_alias_bindings TO aaliyah_memory_issuer WITH GRANT OPTION`, revert: `REVOKE GRANT OPTION FOR SELECT ON memory_alias_bindings FROM aaliyah_memory_issuer`, section: "tables", entry: "aaliyah_memory_issuer memory_alias_bindings SELECT*" },
+    { apply: `ALTER ROLE aaliyah_memory_reconciler BYPASSRLS`, revert: `ALTER ROLE aaliyah_memory_reconciler NOBYPASSRLS`, section: "roleAttributes", entry: "aaliyah_memory_reconciler BYPASSRLS,INHERIT" },
+  ];
+  const sharedTableLock = await lockSharedMemoryTables(pool);
+  try {
+    for (const widening of widenings) {
+      await pool.query(widening.apply);
+      try {
+        const actual = await memoryPrivilegeMap(pool);
+        assert.ok(actual[widening.section]!.includes(widening.entry), `${widening.apply}: ${JSON.stringify(actual[widening.section])}`);
+        assert.ok(!EXPECTED[widening.section]!.includes(widening.entry), widening.entry);
+      } finally {
+        await pool.query(widening.revert);
+      }
+    }
+  } finally {
+    await sharedTableLock.release();
+  }
+  const restored = await memoryPrivilegeMap(pool);
+  for (const section of Object.keys(EXPECTED)) {
+    assert.deepEqual([...restored[section]!].sort(), [...EXPECTED[section]!].sort(), section);
+  }
 });
 
 test("POSITIVE CONTROL: a widened grant IS reported as a difference, then removed", async () => {

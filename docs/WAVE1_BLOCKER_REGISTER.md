@@ -1050,3 +1050,16 @@ Reports are at `aaliyah-w13-evidence/03581a3/reviews/`.
 - **Security F6 (LOW): audit cost grows with erasure history.** DISCLOSED.
 - **Red Team C1: TCB boundary.** An attacker who owns the watchdog process can forge PASS, via its own NODE_OPTIONS preload, GIT_DIR, or a gitignored node_modules shim. That is outside what an in-process verdict can defend. DISCLOSED; not a claim this repository makes.
 - **Integration LOW:** both `ABORT_REASON` maps are typed `Record<string, …>`, so exhaustiveness is not compile-checked. **OPEN.**
+
+**Test Falsifiability of `03581a3`: BLOCK.**
+- **Five surviving mutants.** The privilege map missed a table grant to PUBLIC, `INSERT` on tombstones to PUBLIC, a column grant to PUBLIC, schema `CREATE`, and a default privilege. This is Security F3, now shown by survivors.
+- **One surviving source mutant: the evidenced-audit provider filter.** It is removed at `7f10e19`, so the finding is moot there.
+- **Discrimination proof:** no independent mutation-fuzz proof exists at that SHA.
+
+| Entry | Finding | Remediation | Proven by |
+| --- | --- | --- | --- |
+| W1BR-050 | Test Falsifiability BLOCK and Security F3: the privilege map was blind to PUBLIC, grant options, schemas, default privileges, role attributes, and SECURITY DEFINER functions of other names | The map is read from the ACLs themselves (`aclexplode` over `pg_class`, `pg_attribute`, `pg_namespace`, `pg_proc`, `pg_default_acl`). PUBLIC is an entry, and grant options are marked. New sections: `schemas`, `defaultPrivileges`, `securityDefiner`, `roleAttributes`. Named assertions: no PUBLIC table/column/sequence privilege, no grant option anywhere, schema `public` is PUBLIC USAGE only, no default privileges, no dangerous role attribute, every SECURITY DEFINER function is `aaliyah_*`. | A positive control for each of the seven widenings the reviews used: applied, reported by name, reverted, map restored |
+
+**Freeze of `7f10e19`: superseded before review.**
+- Suite passed twice, 1018/1018. Release guards PASS. 26/27 targeted mutants KILLED.
+- The one survivor, M54-03, was MIS-SPECIFIED: it filtered on the literal `local-test/v1`, which K-9's rows carry anyway. The regression it meant to model is a filter on the store's OWN provider id, and that corrected mutant is run at the next freeze.
