@@ -34,6 +34,7 @@ type Evidence = {
   timedOut: Array<{ name: string; message: string | null }>;
   processGroup: { killedSurvivors: boolean; survivedSigkill: boolean } | null;
   database: { before: { reachable: boolean } | null };
+  discovery?: { boundToCommit: boolean; ignored: string[]; untracked: string[] };
 };
 
 function runWatchdog(
@@ -301,4 +302,87 @@ test("an inherited TS_NODE_PROJECT cannot preload code into the workers: it is d
       .tsNodeIgnored,
     { TS_NODE_PROJECT: hostile },
   );
+});
+
+/**
+ * THE EXECUTED SET IS THE COMMIT'S SET.
+ *
+ * Red team K-19 against 8a0bf05: `.gitignore` excludes `coverage`, and the
+ * full-suite glob walks the filesystem, so `tests/coverage/*.test.ts` was
+ * discovered and EXECUTED while `git status --porcelain` stayed empty and the
+ * evidence recorded `git.dirty: false`. Reproduced at that SHA: 84 files
+ * discovered where the commit contains 83. A PASS was a claim about a file set
+ * nobody could rebuild from the SHA.
+ *
+ * Both cases below run the REAL entrypoint at FULL_SUITE scope, not a helper,
+ * because the refusal has to happen in the path `npm test` actually takes. The
+ * refusal is decided before anything is spawned, so the negative control costs
+ * well under a second — and that is asserted, because a mutant that removes the
+ * refusal would instead start the whole suite from inside it.
+ */
+function runFullSuiteDiscovery(flags: string[]): {
+  status: number | null;
+  evidence: Evidence & {
+    discovery: { boundToCommit: boolean; ignored: string[]; untracked: string[] };
+  };
+  elapsedMs: number;
+} {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "watchdog-discovery-"));
+  const evidencePath = path.join(dir, "evidence.json");
+  const started = Date.now();
+  const result = spawnSync(process.execPath, [WATCHDOG, "--evidence", evidencePath, ...flags], {
+    cwd: ROOT,
+    encoding: "utf8",
+    timeout: 60_000,
+    killSignal: "SIGKILL",
+    env: { ...process.env, AALIYAH_TEST_DATABASE_URL: DB_URL },
+  });
+  const elapsedMs = Date.now() - started;
+  assert.equal(result.error, undefined, `watchdog did not complete: ${result.error}`);
+  const evidence = JSON.parse(fs.readFileSync(evidencePath, "utf8"));
+  fs.rmSync(dir, { recursive: true, force: true });
+  return { status: result.status, evidence, elapsedMs };
+}
+
+test("POSITIVE CONTROL: on a clean tree the full suite is bound to the commit, so the refusal below is specific", () => {
+  const run = runFullSuiteDiscovery(["--verify-discovery"]);
+  assert.equal(run.evidence.verdict, "PASS", JSON.stringify(run.evidence.reasons));
+  assert.equal(run.status, 0);
+  assert.equal(run.evidence.discovery.boundToCommit, true);
+  assert.deepEqual(run.evidence.discovery.ignored, []);
+});
+
+test("a git-ignored test file in tests/ is FAIL: it would execute while git status stays clean", () => {
+  const dir = path.join(ROOT, "tests/coverage");
+  const probe = path.join(dir, "discoveryBinding.probe.test.ts");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(probe, 'import { test } from "node:test";\ntest("invisible", () => {});\n');
+  try {
+    // The file really is invisible to git — that is the whole defect.
+    const ignored = spawnSync("git", ["check-ignore", "tests/coverage/discoveryBinding.probe.test.ts"], {
+      cwd: ROOT,
+      encoding: "utf8",
+    });
+    assert.equal(ignored.status, 0, "fixture precondition: the probe must be git-ignored");
+    const status = spawnSync("git", ["status", "--porcelain"], { cwd: ROOT, encoding: "utf8" });
+    assert.ok(
+      !status.stdout.includes("tests/coverage"),
+      `fixture precondition: git status must not mention the probe; got ${status.stdout}`,
+    );
+
+    const run = runFullSuiteDiscovery(["--no-db", "--deadline-ms", "20000"]);
+    assert.equal(run.evidence.verdict, "FAIL", JSON.stringify(run.evidence.reasons));
+    assert.equal(run.status, 1);
+    assert.ok(
+      run.evidence.reasons.some((r) => /^DISCOVERY_NOT_BOUND_TO_COMMIT:/.test(r)),
+      `expected a discovery refusal; got ${JSON.stringify(run.evidence.reasons)}`,
+    );
+    assert.deepEqual(run.evidence.discovery.ignored, ["tests/coverage/discoveryBinding.probe.test.ts"]);
+    assert.equal(run.evidence.discovery.boundToCommit, false);
+    // Refused BEFORE the suite was spawned: no counts, no exit, and fast.
+    assert.equal(run.evidence.counts, null);
+    assert.ok(run.elapsedMs < 10_000, `refusal took ${run.elapsedMs}ms — it did not short-circuit`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

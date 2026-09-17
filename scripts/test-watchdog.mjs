@@ -69,7 +69,13 @@ function usage(message) {
 }
 
 function parseArgs(argv) {
-  const options = { ...DEFAULTS, requireDb: true, evidence: null, files: [] };
+  const options = {
+    ...DEFAULTS,
+    requireDb: true,
+    evidence: null,
+    verifyDiscoveryOnly: false,
+    files: [],
+  };
   const numeric = {
     "--test-timeout-ms": "testTimeoutMs",
     "--deadline-ms": "deadlineMs",
@@ -87,6 +93,10 @@ function parseArgs(argv) {
     }
     if (arg === "--no-db") {
       options.requireDb = false;
+    } else if (arg === "--verify-discovery") {
+      // Answers ONE question — is the full suite the commit's suite? — and
+      // runs nothing. A release guard can ask it without paying for a suite.
+      options.verifyDiscoveryOnly = true;
     } else if (arg === "--evidence") {
       options.evidence = argv[++i] ?? usage("--evidence needs a path");
     } else if (arg in numeric) {
@@ -122,6 +132,88 @@ function fullSuiteFiles() {
     }
   }
   return found.sort();
+}
+
+/**
+ * THE EXECUTED SET IS BOUND TO THE COMMIT, NOT TO THE FILESYSTEM.
+ *
+ * Found by the red team against 8a0bf05 (K-19): `fullSuiteFiles()` walks the
+ * filesystem, and `.gitignore` excludes `coverage`, so a `tests/coverage/
+ * *.test.ts` file is DISCOVERED AND EXECUTED while `git status --porcelain`
+ * stays empty and the evidence records `git.dirty: false`. Reproduced: 84
+ * files discovered where the commit has 83, dirty=false. A PASS was therefore
+ * a claim about a set of files nobody could reconstruct from the SHA — the
+ * evidence named a commit it did not actually describe.
+ *
+ * Nothing here decides which tests run. It decides whether the set that ran
+ * is the set the SHA contains, and refuses the verdict when it is not:
+ *
+ *   - an IGNORED discovered file is refused outright. It cannot appear in
+ *     `git status`, so it is invisible in exactly the way that matters;
+ *   - an UNTRACKED-but-not-ignored file is allowed, because `git status`
+ *     already reports it and `git.dirty` then honestly reads true;
+ *   - if git cannot answer at all, a FULL_SUITE verdict is refused: the
+ *     binding is the whole point of the scope, and an unverifiable binding is
+ *     not a weaker binding, it is none.
+ *
+ * FOCUSED runs are exempt: their files are named on argv, by a human or a
+ * probe, and routinely live outside the repository.
+ */
+function discoveryBinding(files) {
+  const relative = files.filter((file) => !path.isAbsolute(file));
+  if (relative.length === 0) {
+    return { verified: true, ignored: [], untracked: [], reason: null };
+  }
+  let ignored = [];
+  let untracked = [];
+  try {
+    // `check-ignore --stdin` exits 1 when nothing matches, which is the
+    // ordinary, healthy case — so the exit code is not the answer, stdout is.
+    const answer = execFileSync("git", ["check-ignore", "--stdin"], {
+      cwd: ROOT,
+      encoding: "utf8",
+      input: `${relative.join("\n")}\n`,
+    });
+    ignored = answer.split("\n").filter((line) => line.trim() !== "");
+  } catch (error) {
+    if (error?.status === 1 && typeof error.stdout === "string") {
+      ignored = error.stdout.split("\n").filter((line) => line.trim() !== "");
+    } else {
+      return {
+        verified: false,
+        ignored: [],
+        untracked: [],
+        reason: `DISCOVERY_UNVERIFIABLE: git could not be asked which discovered files the commit contains: ${String(error?.message ?? error).slice(0, 200)}`,
+      };
+    }
+  }
+  try {
+    const tracked = new Set(
+      execFileSync("git", ["ls-files", "-z", "--", "tests"], {
+        cwd: ROOT,
+        encoding: "utf8",
+      })
+        .split("\0")
+        .filter((line) => line !== ""),
+    );
+    untracked = relative.filter((file) => !tracked.has(file));
+  } catch (error) {
+    return {
+      verified: false,
+      ignored,
+      untracked: [],
+      reason: `DISCOVERY_UNVERIFIABLE: git could not list the commit's test files: ${String(error?.message ?? error).slice(0, 200)}`,
+    };
+  }
+  return {
+    verified: true,
+    ignored,
+    untracked,
+    reason:
+      ignored.length > 0
+        ? `DISCOVERY_NOT_BOUND_TO_COMMIT: ${ignored.length} discovered test file(s) are git-ignored, so they executed without ever appearing in git status: ${ignored.join(", ")}`
+        : null,
+  };
 }
 
 function pgOptions(options) {
@@ -255,6 +347,13 @@ async function main() {
     if (!fs.existsSync(path.resolve(ROOT, file))) usage(`no such test file: ${file}`);
   }
   const absoluteFiles = new Set(files.map((file) => path.resolve(ROOT, file)));
+  // FULL_SUITE only: a verdict over "the suite" must name the suite the commit
+  // contains. FOCUSED files are named on argv and routinely sit outside the
+  // repository, so there is nothing to bind them to.
+  const discovery =
+    scope === "FULL_SUITE"
+      ? discoveryBinding(files)
+      : { verified: true, ignored: [], untracked: [], reason: null };
 
   const startedAt = new Date();
   const runDir = fs.mkdtempSync(path.join(ROOT, ".test-evidence-run-"));
@@ -286,6 +385,12 @@ async function main() {
       pgOptions: pgOptions(options),
     },
     files: files.length,
+    discovery: {
+      scope,
+      boundToCommit: discovery.verified && discovery.ignored.length === 0,
+      ignored: discovery.ignored,
+      untracked: discovery.untracked,
+    },
     verdict: null,
     reasons: [],
     counts: null,
@@ -319,6 +424,19 @@ async function main() {
     );
     process.exit(verdict === "PASS" ? 0 : verdict === "BLOCKED_BY_ENVIRONMENT" ? 3 : 1);
   };
+
+  // REFUSED BEFORE ANYTHING RUNS. A verdict whose executed set is not the
+  // commit's set is not a weaker verdict, it is not a verdict — so this is
+  // decided before a single test file is spawned, not weighed afterwards.
+  if (discovery.reason !== null) {
+    evidence.reasons.push(discovery.reason);
+    finish("FAIL");
+    return;
+  }
+  if (options.verifyDiscoveryOnly) {
+    finish("PASS");
+    return;
+  }
 
   if (options.requireDb) {
     evidence.database.before = await probeDatabase(dbUrl, options.dbProbeTimeoutMs);
