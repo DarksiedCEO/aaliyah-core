@@ -4310,6 +4310,24 @@ test("X-1 erasing a SURVIVOR is refused while a record merged into it still hold
   assert.equal(tombstones.rows[0].n, 0);
 });
 
+test("X-1b erasing a SURVIVOR is refused while a record merged into it keeps CONTENT, even with no alias at all", async () => {
+  // Sweep survivor FX-04 at f59a6f7: X-1 always gave the absorbed record an
+  // alias, so the binding branch alone refused and dropping the live-head
+  // check changed nothing. Here there is no binding anywhere.
+  await seedGenesis({ participant: PARTICIPANT, generation: 1, note: SENSITIVE }, { recordId: PARTICIPANT });
+  await seedGenesis({ participant: SURVIVOR, generation: 1 }, { recordId: SURVIVOR });
+  await mergeParticipantInto(SURVIVOR, "mutation.x1b.merge");
+  assert.equal((await adminPool.query(`SELECT count(*)::int AS n FROM memory_alias_bindings`)).rows[0].n, 0);
+  const { receipt, result } = await eraseRecordAtHead(SURVIVOR, "mutation.x1b.erase", "tombstone-x1b");
+  assert.equal(result.rejection, "merged_records_not_erased");
+  assert.equal(await nonceConsumed(receipt.authorizationId), false);
+  // Positive control: erase the absorbed record's content first, then the survivor.
+  const { result: absorbed } = await eraseRecordAtHead(PARTICIPANT, "mutation.x1b.erase.absorbed", "tombstone-x1b-absorbed");
+  assert.equal(absorbed.verified, true, absorbed.rejection ?? "");
+  const { result: survivor } = await eraseRecordAtHead(SURVIVOR, "mutation.x1b.erase.survivor", "tombstone-x1b-survivor");
+  assert.equal(survivor.verified, true, survivor.rejection ?? "");
+});
+
 test("X-2 the ABSORBED record accepts a subject erasure that destroys its content, address and key; then the survivor erases", async () => {
   await absorbVictim("mutation.x2.merge");
   const before = await bindingState("alias-pii-001");
