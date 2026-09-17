@@ -746,3 +746,117 @@ W1.4 surface is added to it. Remediation of any reviewer finding produces a
 DESCENDANT SHA, and every applicable reviewer re-inspects that new subject —
 a candidate does not become GREEN because six reviewers passed while one found
 a real Critical or Important defect.
+
+---
+
+## W1.3 REMEDIATION OF b3efc82 — SESSION 3
+
+`b3efc82` was independently BLOCKED (Security, Reliability, Red Team BLOCK;
+Test Falsifiability and Mutation NOT_VERIFIED; Integration GREEN with three
+non-blocking findings). It is preserved unmodified, tagged
+`w13-candidate-b3efc82-BLOCKED`. The six reviewer reports are preserved
+verbatim, with SHA-256 sums, outside the repository at
+`aaliyah-w13-evidence/b3efc82/reviews/`.
+
+Every entry below was produced by the implementer. Per this register's rule,
+none is CLOSED here: each is **REMEDIATED — PENDING INDEPENDENT VERIFICATION**
+against the next frozen candidate, and each names the control, the regression
+tests, and the mutation evidence gathered in a disposable worktree against a
+fresh database.
+
+| Entry | Finding (reviewer, severity) | Remediation | Proven by |
+| --- | --- | --- | --- |
+| W1BR-018 | Suite hangs rather than fails; 20 mutants with no verdict (Mutation, gate-blocking) | `b094151` — `npm test` is `scripts/test-watchdog.mjs`: per-test/per-file timeout, whole-run deadline, process-group kill, suite-wide `statement_timeout`/`lock_timeout`/`idle_in_transaction_session_timeout`, hook sentinel, strict accounting; root cause (`pool.end()` awaiting an unreleased client in M-3) fixed | 19 watchdog attack tests; P1 sweep 17/21 killed, 4 disclosed (2 redundant accounting checks, 1 masked lock bound, 1 unreachable grace path); A09 — the original hang — KILLED in 35s, and in 74s with the M-3 fix reverted |
+| W1BR-019 | No pool `'error'` listener: an idle-connection blip kills the process (Reliability, CRITICAL) | `2285e8b` — `guardPoolErrors` on the mail and idempotency pools | child-process probe: bare pool dies (positive control), guarded pools survive 57P01 and serve; C2 mutants killed |
+| W1BR-020 | No statement/lock/connection bound anywhere (Reliability, HIGH) | `2285e8b` — pool startup bounds; transaction-local `lock_timeout` in both stores and the reconciler (`record_busy`); explicit migration bounds; `/ready` probes the read pool | R-1, R-2, pool bound read back from the server, readiness; C2 mutants killed, alias-store bound killed after `aa5f424` |
+| W1BR-015 (REOPENED) | Recorded CLOSED; a merge cycle was reachable on the primary (Red Team BREAK 2, HIGH) | `eb123f3` — store locks both endpoints in sorted order; migration 043 locks both endpoints in the edge guard and the record in the freeze trigger | S-1, S-3, S-7 (driven interleavings, not sampled); C3 mutants killed |
+| W1BR-021 | Merge racing delete merged into a destroyed record; resolution answered "no memory" (Red Team BREAK 3, HIGH) | `eb123f3` — same serialization; counterparty head must be ACTIVE (043); a redirect to an unretrievable survivor throws instead of returning null | S-2, S-4, S-5, S-6; C3 mutants killed |
+| W1BR-022 | Identity edge scope never bound to its authorization (Security, HIGH, introduced) | `08228c3` — migration 044: every mutated table's row must carry its authorization's (tenant, workspace, principal, user); an edge may only leave a record its owner holds. Also closed the wider gap: versions after genesis were bound by continuity only | C4-1 (PoC B), C4-2 (PoC A + mirror), C4-3, C4-5/6 one dimension at a time, C4-A alias binding and retirement; C4 mutants killed per table and per dimension |
+| W1BR-011 (WIDENED, REMEDIATED) | The `create` audit path was also a receipt-id squatting primitive (Red Team BREAK 1, HIGH) | `b5892b8` — see W1BR-023 | N-2 |
+| W1BR-023 | A committed, read-back-verified mutation filed as ABORTED/UNKNOWN; reconciler barred forever (Red Team BREAK 1, HIGH) | `b5892b8` — migration 045: attempts in their own append-only table; ABORTED refused in receipts; a receipt id on record is spent; terminal must match pending; receipts bound to authorization scope | N-1 (the ordinary retry now verifies), N-2..N-6; C5 mutants killed; alias store routing and reuse killed after `aa5f424`. `findUnresolved`'s predicate is structurally masked by the ABORTED refusal — disclosed |
+| W1BR-024 | Reconciler role could file COMMITTED with no record version (Security, MEDIUM) and verdicts derived from a caller-supplied authorization (Red Team M2) | `b5892b8` — migration 045 derives every verdict in the database; `reconcile()` reads the stored unknown receipt | V-1..V-4; C5 mutants killed |
+| W1BR-025 | 14 unique constraints droppable with the suite green, including the CAS index (Mutation, CRITICAL) | `a9b6ec7` — uniqueness destroyers from real rows, one index at a time, with positive controls | U-1..U-5; every targeted index killed by drop. Two indexes structurally redundant (a superset of another unique key), premise pinned |
+| W1BR-026 | Four identity-edge payload bindings vacuous against NULL (Red Team M4) | `a9b6ec7` — migration 046 | absent and null member refused per binding |
+| W1BR-027 | Subject erasure left the email address in cleartext, indestructible (Red Team BREAK 4, HIGH) | `6188c7e` — the alias PII vault (migration 047, `src/crypto/memoryPiiKeys.ts`), under the founder's locked erasure decision | P-1..P-19 against real flows; provider unit attacks; see W1BR-008 below |
+| W1BR-029 | CHECKs outside the original 81 were never reachable by any test (Red Team M3; measured by the P6 sweep) | `7825b89` — `assertCheckConstraintsKill` from real rows for identity edges, legal holds and children, retention, mutation receipts, reconciliations, alias policy and protected domains; migration 049 re-creates the vacuous reconciliation evidence bindings | C8; P6 |
+| W1BR-030 | P6 survivors: loose privilege matchers, owner-only privilege tests, untested legal-hold FKs, unconfirmed key destruction, index/binding mismatch, 047 over plaintext, index-less binding commit, two exact-number triggers | `dcc4a5d` — C9 | re-run at `dcc4a5d`: 18/18 KILLED |
+| W1BR-028 | `pg_temp` searched first by every guard's search_path (found by the implementer while building the Priority 6 matrix; not exploitable at `6188c7e` because every relation reference was qualified) | `1cff471` — migration 048 | T-1 pins every function; T-2 attacks with a forged temp receipt |
+
+Mediums also remediated: `/ready` ignored the read pool (Integration); the
+`postStateAgrees` unreachable conjuncts are disclosed beside the code; the
+nonce/receipt target conjunct (A14) has a killing test; loose error regexes are
+pinned to exact messages.
+
+---
+
+## W1BR-008 — RE-EVALUATED, DIMENSION BY DIMENSION
+
+The previous founder question was aimed at the wrong residual (red team): the
+larger one was that the address itself could not be erased. With the alias
+vault built, the seven things W1BR-008 had been conflating are dispositioned
+separately. No single primitive is claimed to settle more than one of them.
+
+| | Dimension | Disposition | Basis |
+| --- | --- | --- | --- |
+| A | Content integrity | **BOUNDED_AND_PROVEN_NONBLOCKING** | The chain is an unkeyed canonical digest. Against every non-superuser writer it is enforced by the database — witnesses, continuity, genesis and scope binding (039, 044), uniqueness (W1BR-025). Against a superuser, AUTHENTICITY is NOT PROVEN: that needs a keyed signature under production key management, which is not provisioned. |
+| B | Content confidentiality | **BOUNDED_AND_PROVEN_NONBLOCKING** | Record content is not application-encrypted. Reads are scoped on four dimensions and proven; erasure nulls content (037) and the database refuses a half-erased chain. Encryption at rest is an infrastructure property and is NOT PROVEN here. |
+| C | Offline confirmation / oracle resistance | **ALIASES: PROPOSED CLOSED (local). RECORD CONTENT: BOUNDED_AND_PROVEN_NONBLOCKING.** | Aliases: the authorization digest covers a KEYED commitment (P-16), lookup is keyed (P-3), and no unkeyed hash of an alias is stored anywhere. Record content: the unkeyed `content_digest` remains, in several copies (versions, receipts, predecessor links — red team M1), so a party with STORED-STATE access and a guess can still confirm erased low-entropy CONTENT. Not reachable through the store (four-dimension scoping). Closing it is the coordinated keyed-digest migration across both repositories. Recorded as the one remaining erasure-adjacent residual, not hidden inside the alias closure. |
+| D | Alias confidentiality | **PROPOSED CLOSED for the local architecture** | No plaintext alias column exists (047); the payload may not carry the alias; AES-256-GCM envelope under a per-binding key with scope-binding associated data; the address appears in no text or jsonb column of any table, before or after erasure (P-1). |
+| E | Alias lookup | **PROPOSED CLOSED for the local architecture** | HMAC-SHA256 blind index, per tenant/scope/purpose/version, domain-separated; not a raw hash (unit); rotation keeps old and new versions findable and colliding (P-17); a match that does not decrypt to the requested address is refused. |
+| F | Alias erasure | **PROPOSED CLOSED for the local architecture; production key management NOT PROVEN** | Deletion erases every binding naming the participant in the same transaction; the database refuses a tombstone that leaves one (P-8) and an erasure without a tombstone (P-9); keys are destroyed and confirmed; a ciphertext copy dies (P-2); holds and retention refuse and nothing is reported erased (P-4, P-5); crash and outage are recoverable and never reported complete (P-6, P-7); restore, replay and races do not resurrect (P-11, P-12, P-18). |
+| G | Audit evidence | **PROPOSED CLOSED, with one bounded residual** | Non-PII evidence survives: tombstone, `memory_pii_key_erasures` (committed and destroyed, append-only), attempts, receipts, reconciliations — none holds the address (P-1). Residual, BOUNDED: the tombstone's `destroyedFieldNames` retains the erased content's FIELD NAMES (red team M1) — names, never values. |
+
+Production KMS/HSM: **NOT PROVEN.** No production PII key provider is
+provisioned; `src/server.ts` states the vault as not configured, and the alias
+registry neither stores nor resolves an alias there. Nothing here is a claim of
+GDPR, CCPA or other legal compliance: these are engineering controls, and
+whether they satisfy a regulation is not decided by this code.
+
+## W1BR-014 AND W1BR-016 — REVERIFIED, NOT REBUILT
+
+Both CLOSED entries were re-tested after remediation: their suites run in every
+full-suite pass, and the Priority 6 sweep mutates each control (the migration
+ordinal guard; the route's memory dependency) against a fresh database.
+
+## THE W1.3 RESIDUALS STILL MARKED OPEN — EXPLICIT GATE DISPOSITION
+
+This register says a gate may not be GREEN while an entry bound to it is OPEN.
+Five W1.3 entries were recorded "OPEN (residual, disclosed)", which is
+ambiguous against that rule. Each is dispositioned explicitly here, for the
+independent gate to confirm or reject. None is claimed CLOSED.
+
+| Entry | Proposed disposition | Why it does not block W1.3 as scoped |
+| --- | --- | --- |
+| W1BR-006 fractional numeric digest collision | BOUNDED_AND_PROVEN_NONBLOCKING | The collision needs a stored decimal JavaScript cannot represent exactly. Every memory table with a digested jsonb payload carries the exact-numeric trigger — record versions, authorization receipts, mutation receipts, tombstones, alias bindings, identity edges and attempts — so no writer can place one (tests per table, incl. U-1 for mutation receipts). |
+| W1BR-007 the mutation role can burn a pending approval | BOUNDED_AND_PROVEN_NONBLOCKING | Denial of service against one approval, not forgery: a burned nonce cannot become a version, a committed outcome or an edge (034, 038, 044, 045), and the burn is permanent and attributable. Closure (a reservation or second factor) changes the transaction shape and is recorded, not attempted. |
+| W1BR-010 `create` as a record-id existence oracle | BOUNDED_AND_PROVEN_NONBLOCKING | No content, digest or owner leaks; nothing is mutated; the equivalent oracle already exists on `correct`. |
+| W1BR-011 unresolved attempts as an unbounded durable write | BOUNDED_AND_PROVEN_NONBLOCKING (DoS side); squatting side REMEDIATED (W1BR-023) | Attempts are filed under the authenticated actor and cannot be forged onto another party; they can no longer collide with a real mutation. The ceiling belongs to an upstream per-actor rate limit. |
+| W1BR-017 memory principal mapped to the user | BOUNDED_AND_PROVEN_NONBLOCKING | A modelling fact of Wave 1, not a weakened control: all four dimensions are still compared independently in the store and bound in the database (034, 039, 044). |
+
+W1BR-001..005 are W1.6 gate entries and are unchanged.
+
+## PRIORITY 6 — THE HOSTILE DATABASE MATRIX
+
+Generated from the LIVE catalog, not from a list of what the implementer
+remembered: every CHECK (151), trigger (50), unique index (28) and foreign key
+(4) on the memory tables; `RESET search_path` on every aaliyah_* function (37);
+fifteen grant widenings across the mutator, reader and reconciler roles
+(including role membership); and source mutants for the alias vault, the
+W1BR-014 ordinal guard, the W1BR-016 route's memory dependency and migration
+048. Each mutant ran against a freshly migrated database in a disposable
+worktree, through the watchdog.
+
+At `7825b89`: 301 mutants, 273 KILLED, 28 SURVIVED, 0 invalid, 0 without a
+verdict. Survivors were classified and the 18 reachable ones closed by C9
+(`dcc4a5d`); re-run at `dcc4a5d`: those 18 KILLED, 10 survive, all disclosed:
+
+| Survivor | Disposition | Proof |
+| --- | --- | --- |
+| `_payload_object` on record versions, authorization receipts, tombstones, alias bindings, identity edges, legal holds, mutation receipts, attempts; `_evidence_object` on reconciliations (9) | MASKED BACKSTOP | Every binding CHECK on the table sorts earlier by name and also fails on a non-object value (`->>` is NULL), so the backstop cannot be the reported violation. The property is proven per table: a non-object value is refused by a CHECK of that table. |
+| `memory_authorization_receipts_tenant_id_workspace_id_author_key` (1) | STRUCTURALLY REDUNDANT | A duplicate on (tenant, workspace, authorization) is a duplicate on authorization, refused first by the unique global id; premise pinned in U-1. |
+
+The sweep also surfaced two defects of the M4 class, both closed: vacuous
+reconciliation evidence bindings (migration 049, C8) and the implementer-found
+`pg_temp` search order (migration 048, W1BR-028).
+
+Critical surviving behavioural mutants: **0.**
