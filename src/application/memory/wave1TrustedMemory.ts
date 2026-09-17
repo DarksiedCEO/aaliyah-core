@@ -133,6 +133,13 @@ export const TRUSTED_MEMORY_REJECTIONS = [
    * accepts no further versions; the survivor is where mutations go.
    */
   "record_merged_away",
+  /**
+   * A subject erasure of a record that other records were merged into, while
+   * one of them still holds content or an unerased address. Erase those
+   * first, each under its own authorization: a merge is not a way around
+   * erasure, and one authorization is one mutation.
+   */
+  "merged_records_not_erased",
   /** A mutation on a record whose head is deleted, other than a restore. */
   "record_deleted",
   /**

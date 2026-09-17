@@ -1480,12 +1480,19 @@ export function createPostgresAliasRegistryStore(
       // RETURNED, so the participant it belongs to is checked against the
       // authorization AFTER the guard has fired, in its own statement, and
       // the mismatch rolls the retirement back with everything else.
+      //
+      // Migration 050 made the DATABASE refuse a retirement whose
+      // authorization targets another participant, inside this UPDATE. So a
+      // binding of a different participant is excluded here instead of being
+      // updated, and only when nothing was retired is the binding looked up —
+      // to NAME the refusal, never to decide whether retirement may happen.
       const retired = await client.query(
         `UPDATE memory_alias_bindings
             SET removed_at = now(),
                 removed_by_mutation_receipt_id = $4,
                 removed_authorization_id = $5
           WHERE tenant_id = $1 AND scope_key = $2 AND alias_id = $3
+            AND canonical_participant_id = $6
             AND removed_at IS NULL
         RETURNING ${BINDING_COLUMNS}`,
         [
@@ -1494,13 +1501,26 @@ export function createPostgresAliasRegistryStore(
           request.aliasId,
           request.mutationReceiptId,
           stored.authorizationId,
+          stored.targetRecordId,
         ],
       );
       if (retired.rowCount !== 1) {
-        throw new AliasMutationAborted("alias_not_bound");
+        const other = await client.query(
+          `SELECT 1 FROM memory_alias_bindings
+            WHERE tenant_id = $1 AND scope_key = $2 AND alias_id = $3
+              AND canonical_participant_id <> $4
+              AND removed_at IS NULL
+            LIMIT 1`,
+          [stored.scope.tenantId, scopeKey, request.aliasId, stored.targetRecordId],
+        );
+        throw new AliasMutationAborted(
+          other.rowCount === 1 ? "alias_participant_mismatch" : "alias_not_bound",
+        );
       }
       const existing = storedFromRow(retired.rows[0] as BindingRow);
       if (existing.canonicalParticipantId !== stored.targetRecordId) {
+        // Unreachable by construction (the WHERE clause above); kept as the
+        // statement of the property. Disclosed as a redundant backstop.
         throw new AliasMutationAborted("alias_participant_mismatch");
       }
 

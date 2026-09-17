@@ -57,6 +57,7 @@ import {
 } from "../src/application/memory/wave1TrustedMemory";
 import { runMailMigrations } from "../src/persistence/postgres/migrations";
 import { createMailDbPool } from "../src/persistence/postgres/pool";
+import { MEMORY_IDENTITY_MERGE_ORDER_SCHEMA_VERSION } from "../src/application/memory/wave1MemoryIdentity";
 import { createPostgresAliasRegistryStore } from "../src/persistence/postgres/wave1AliasRegistryStore";
 import { createPostgresWave1MemoryService } from "../src/persistence/postgres/wave1IdentityGraphStore";
 import { createPostgresLegalHoldStore } from "../src/persistence/postgres/wave1LegalHoldStore";
@@ -215,6 +216,7 @@ after(async () => {
               memory_alias_tenant_policy,
               memory_alias_protected_domains,
               memory_tombstones,
+              memory_identity_edges,
               memory_legal_hold_carve_outs,
               memory_legal_hold_records,
               memory_legal_hold_subjects,
@@ -239,6 +241,7 @@ beforeEach(async () => {
               memory_alias_tenant_policy,
               memory_alias_protected_domains,
               memory_tombstones,
+              memory_identity_edges,
               memory_legal_hold_carve_outs,
               memory_legal_hold_records,
               memory_legal_hold_subjects,
@@ -273,7 +276,8 @@ type HeldAction =
   | "restore"
   | "promote"
   | "assign_alias"
-  | "remove_alias";
+  | "remove_alias"
+  | "merge_identity";
 
 function authorization(input: {
   action: HeldAction;
@@ -4212,4 +4216,258 @@ test("C9 an index entry that matches a lookup but belongs to ANOTHER binding is 
   );
   // Positive control: the binding's own address still resolves.
   assert.equal((await aliases().resolveAlias(SCOPE, "other.person@example.com"))?.binding.aliasId, "alias-pii-002");
+});
+
+// ---------------------------------------------------------------------------
+// X — A MERGE DOES NOT PUT A SUBJECT BEYOND ERASURE (red team BREAK A, 2b2e554)
+//
+// P's address is bound; P is merged into S. Before: erasing S reported
+// verified with nothing erased, P could not be erased by anyone, and the
+// address stayed resolvable under a live key.
+// ---------------------------------------------------------------------------
+
+const SURVIVOR = "participant-survivor-001";
+
+async function mergeParticipantInto(survivor: string, receiptId: string) {
+  const head = await store().readHead(SCOPE, PARTICIPANT);
+  assert.ok(head);
+  const order = {
+    schemaVersion: MEMORY_IDENTITY_MERGE_ORDER_SCHEMA_VERSION,
+    reason: "duplicate_participant",
+    reasonEvidenceRef: "matter:identity-merge/0001",
+    survivorRecordId: survivor,
+  };
+  const receipt = await issue(
+    authorization({
+      action: "merge_identity",
+      targetRecordId: PARTICIPANT,
+      expectedHead: headOf(head.version, head.contentDigest),
+      proposedContent: order,
+    }),
+  );
+  const merged = await store().mergeIdentity({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: PARTICIPANT,
+    proposedContent: order,
+    mutationReceiptId: receiptId,
+  });
+  assert.equal(merged.verified, true, merged.rejection ?? "");
+}
+
+async function eraseRecordAtHead(
+  recordId: string,
+  receiptId: string,
+  tombstoneId: string,
+  reason: Parameters<typeof deletionOrder>[0] = "subject_erasure_request",
+  deleting = store(),
+) {
+  const head = await store().readHead(SCOPE, recordId);
+  assert.ok(head);
+  const order = deletionOrder(reason);
+  const receipt = await issue(
+    authorization({
+      action: "delete",
+      targetRecordId: recordId,
+      expectedHead: headOf(head.version, head.contentDigest),
+      proposedContent: order,
+    }),
+  );
+  const result = await deleting.delete({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId,
+    proposedContent: order,
+    mutationReceiptId: receiptId,
+    tombstoneId,
+  });
+  return { receipt, result };
+}
+
+async function nonceConsumed(authorizationId: string): Promise<boolean> {
+  const row = await adminPool.query(
+    `SELECT consumed_at FROM memory_authorization_nonces WHERE authorization_id = $1`,
+    [authorizationId],
+  );
+  return row.rows[0].consumed_at !== null;
+}
+
+/** Merge PARTICIPANT (carrying VICTIM_ADDRESS) into SURVIVOR. */
+async function absorbVictim(receiptId: string) {
+  await bindVictimAddress();
+  await seedGenesis({ participant: SURVIVOR, generation: 1 }, { recordId: SURVIVOR });
+  await mergeParticipantInto(SURVIVOR, receiptId);
+}
+
+test("X-1 erasing a SURVIVOR is refused while a record merged into it still holds the subject's address; nothing is consumed", async () => {
+  await absorbVictim("mutation.x1.merge");
+  const { receipt, result } = await eraseRecordAtHead(SURVIVOR, "mutation.x1.erase", "tombstone-x1");
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "merged_records_not_erased");
+  assert.equal(await nonceConsumed(receipt.authorizationId), false);
+  assert.equal((await store().readHead(SCOPE, SURVIVOR))?.state, "active");
+  const tombstones = await adminPool.query(`SELECT count(*)::int AS n FROM memory_tombstones`);
+  assert.equal(tombstones.rows[0].n, 0);
+});
+
+test("X-2 the ABSORBED record accepts a subject erasure that destroys its content, address and key; then the survivor erases", async () => {
+  await absorbVictim("mutation.x2.merge");
+  const before = await bindingState("alias-pii-001");
+  const { result } = await eraseRecordAtHead(PARTICIPANT, "mutation.x2.erase.absorbed", "tombstone-x2-absorbed");
+  assert.equal(result.verified, true, result.rejection ?? "");
+  assert.deepEqual(result.aliasErasure, { bindingsErased: 1, keysDestroyed: 1, keysPending: 0 });
+  const after = await bindingState("alias-pii-001");
+  assert.equal(after.pii_envelope, null);
+  assert.equal(after.pii_erasure_tombstone_id, "tombstone-x2-absorbed");
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "destroyed");
+  assert.equal(await aliases().resolveAlias(SCOPE, VICTIM_NORMALIZED), null);
+  const content = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_record_versions
+      WHERE record_id = $1 AND state <> 'deleted' AND content_erased_at IS NULL`,
+    [PARTICIPANT],
+  );
+  assert.equal(content.rows[0].n, 0);
+  assert.deepEqual(await plaintextSightings(VICTIM_NORMALIZED), []);
+  // Merge is not deletion, and erasure is not un-merging: the edge stays.
+  const edges = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_identity_edges WHERE from_record_id = $1 AND kind = 'merged_into'`,
+    [PARTICIPANT],
+  );
+  assert.equal(edges.rows[0].n, 1);
+  // Positive control for X-1: with the absorbed record erased, the survivor erases.
+  const { result: survivor } = await eraseRecordAtHead(SURVIVOR, "mutation.x2.erase.survivor", "tombstone-x2-survivor");
+  assert.equal(survivor.verified, true, survivor.rejection ?? "");
+});
+
+test("X-3 the absorbed record stays frozen to every OTHER deletion reason, refused before consumption", async () => {
+  await absorbVictim("mutation.x3.merge");
+  const { receipt, result } = await eraseRecordAtHead(
+    PARTICIPANT,
+    "mutation.x3.erase",
+    "tombstone-x3",
+    "erroneous_record",
+  );
+  assert.equal(result.rejection, "record_merged_away");
+  assert.equal(await nonceConsumed(receipt.authorizationId), false);
+  assert.notEqual((await bindingState("alias-pii-001")).pii_envelope, null);
+});
+
+test("X-4 the DATABASE freeze admits a deletion on an absorbed record only when its order is a subject erasure", async () => {
+  await absorbVictim("mutation.x4.merge");
+  const head = await store().readHead(SCOPE, PARTICIPANT);
+  assert.ok(head);
+  const append = (reason: Parameters<typeof deletionOrder>[0], label: string) =>
+    hostileAppend({
+      action: "delete",
+      state: "deleted",
+      version: head.version + 1,
+      predecessorDigest: head.contentDigest,
+      content: deletionOrder(reason),
+      recordId: PARTICIPANT,
+      label,
+    });
+  await assert.rejects(() => append("erroneous_record", "x4-erroneous"), /a record merged into another accepts no further versions/);
+  // Positive control: the subject erasure passes the freeze and meets the
+  // ordinary deletion guards instead — a bare deleted label is still refused.
+  await assert.rejects(() => append("subject_erasure_request", "x4-subject"), (error: unknown) => {
+    assert.doesNotMatch(String(error), /accepts no further versions/);
+    assert.match(String(error), /a deletion must erase every prior version of the record/);
+    return true;
+  });
+});
+
+test("X-5 the DATABASE refuses a survivor's subject-erasure tombstone while a record merged into it is unerased, even past the store's check", async () => {
+  // The store is pointed at an EMPTY shadow of memory_identity_edges, so its
+  // own pre-check sees no merge. The SECURITY DEFINER trigger reads public.
+  await absorbVictim("mutation.x5.merge");
+  await adminPool.query(`DROP SCHEMA IF EXISTS x5_shadow CASCADE`);
+  await adminPool.query(`CREATE SCHEMA x5_shadow`);
+  await adminPool.query(`CREATE TABLE x5_shadow.memory_identity_edges (LIKE public.memory_identity_edges)`);
+  await adminPool.query(`GRANT USAGE ON SCHEMA x5_shadow TO aaliyah_memory_mutator, aaliyah_memory_reader`);
+  await adminPool.query(`GRANT SELECT ON x5_shadow.memory_identity_edges TO aaliyah_memory_mutator, aaliyah_memory_reader`);
+  await adminPool.query(
+    `CREATE FUNCTION x5_shadow.aaliyah_memory_unerased_merged_records(text, text, text)
+       RETURNS SETOF text LANGUAGE sql AS $$ SELECT NULL::text WHERE false $$`,
+  );
+  await adminPool.query(`GRANT EXECUTE ON FUNCTION x5_shadow.aaliyah_memory_unerased_merged_records(text, text, text) TO aaliyah_memory_mutator`);
+  const blind = new Pool({
+    connectionString: DB_URL,
+    max: 2,
+    options: `${process.env.PGOPTIONS ?? ""} -c search_path=x5_shadow,public`,
+  });
+  try {
+    const { receipt, result } = await eraseRecordAtHead(
+      SURVIVOR,
+      "mutation.x5.erase",
+      "tombstone-x5",
+      "subject_erasure_request",
+      createPostgresTrustedMemoryStore(blind, readPool, { piiKeys: TEST_PII_KEYS }),
+    );
+    assert.equal(result.verified, false);
+    assert.equal(result.rejection, "storage_rejected");
+    assert.equal(await nonceConsumed(receipt.authorizationId), false);
+    assert.equal((await store().readHead(SCOPE, SURVIVOR))?.state, "active");
+  } finally {
+    await blind.end();
+    await adminPool.query(`DROP SCHEMA IF EXISTS x5_shadow CASCADE`);
+  }
+});
+
+test("K-5 RED TEAM RT2-H1: a spent CORRECT authorization cannot also witness a binding that resurrects an ERASED participant's address", async () => {
+  await bindVictimAddress();
+  const original = (await adminPool.query(`SELECT * FROM memory_alias_bindings WHERE alias_id = 'alias-pii-001'`)).rows[0];
+  const originalIndexes = (
+    await adminPool.query(
+      `SELECT purpose, key_version, index_value, scope_key FROM memory_alias_blind_indexes
+        WHERE alias_id = 'alias-pii-001' ORDER BY id`,
+    )
+  ).rows;
+  const { result: erased } = await eraseParticipant("mutation.k5.erase", "tombstone-k5");
+  assert.equal(erased.verified, true, erased.rejection ?? "");
+
+  const genesis = await seedGenesis({ note: "another record" });
+  const content = { note: "another record, corrected" };
+  const receipt = await issue(authorization({ action: "correct", expectedHead: headOf(1, genesis), proposedContent: content }));
+  const corrected = await store().correct({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: content,
+    mutationReceiptId: "mutation.k5",
+  });
+  assert.equal(corrected.verified, true, corrected.rejection ?? "");
+
+  const o = original;
+  const steps = [
+    {
+      sql: `INSERT INTO memory_alias_bindings
+              (tenant_id, workspace_id, principal_id, user_id, cross_workspace_policy, scope_key, alias_id,
+               skeleton_algorithm, normalization_profile, canonical_participant_id, script_code,
+               restriction_level, subject_participant_id, source_evidence_ref, source_evidence_digest,
+               observed_at, fresh_until, authorization_id, mutation_receipt_id, bound_at, payload,
+               pii_envelope, pii_key_ref, pii_key_version)
+            VALUES ($1,$2,$3,$4,$5,$6,'alias-k5',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'mutation.k5',$18,$19,$20,$21,$22)`,
+      params: [
+        o.tenant_id, o.workspace_id, o.principal_id, o.user_id, o.cross_workspace_policy, o.scope_key,
+        o.skeleton_algorithm, o.normalization_profile, o.canonical_participant_id, o.script_code,
+        o.restriction_level, o.subject_participant_id, o.source_evidence_ref, o.source_evidence_digest,
+        o.observed_at, o.fresh_until, receipt.authorizationId, o.bound_at,
+        JSON.stringify({ ...o.payload, aliasId: "alias-k5", mutationReceiptId: "mutation.k5", authorizationId: receipt.authorizationId }),
+        JSON.stringify(o.pii_envelope), o.pii_key_ref, o.pii_key_version,
+      ],
+    },
+    ...originalIndexes.map((index) => ({
+      sql: `INSERT INTO memory_alias_blind_indexes
+              (tenant_id, workspace_id, scope_key, alias_id, binding_mutation_receipt_id, purpose, key_version, index_value)
+            VALUES ($1,$2,$3,'alias-k5','mutation.k5',$4,$5,$6)`,
+      params: [o.tenant_id, o.workspace_id, index.scope_key, index.purpose, index.key_version, index.index_value],
+    })),
+  ];
+  await assert.rejects(
+    () => runAsTransaction("aaliyah_memory_mutator", steps),
+    /an alias binding must be witnessed by a spent assign_alias authorization for its own participant/,
+  );
+  const unerased = await adminPool.query(`SELECT count(*)::int AS n FROM memory_alias_bindings WHERE pii_erased_at IS NULL`);
+  assert.equal(unerased.rows[0].n, 0);
+  assert.equal(await aliases().resolveAlias(SCOPE, VICTIM_NORMALIZED), null);
 });

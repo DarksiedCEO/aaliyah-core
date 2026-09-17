@@ -249,6 +249,7 @@ const ABORT_REASON: Record<string, MemoryAbortReason> = {
   identity_counterparty_missing: "policy_rejected",
   identity_counterparty_merged_away: "policy_rejected",
   record_merged_away: "policy_rejected",
+  merged_records_not_erased: "policy_rejected",
   request_malformed: "policy_rejected",
   authorization_not_found: "policy_rejected",
   authorization_malformed: "policy_rejected",
@@ -1004,6 +1005,15 @@ export function createPostgresTrustedMemoryStore(
       // approver's authorization. Migration 041 carries the same rule as a
       // trigger, which is what binds writers that never come through here;
       // this is the caller's ANSWER, that is the ENFORCEMENT.
+      //
+      // One exception, and only one: a SUBJECT ERASURE of the absorbed record
+      // (red team BREAK A against 2b2e554). Without it a merge put the
+      // subject's address beyond erasure for good. Migration 051 admits the
+      // same single exception in the freeze trigger.
+      const subjectErasure =
+        action === "delete" &&
+        parseDeletionOrder(request.proposedContent)?.reason ===
+          "subject_erasure_request";
       const mergedAway = await client.query(
         `SELECT 1 FROM memory_identity_edges
           WHERE tenant_id = $1 AND workspace_id = $2
@@ -1015,8 +1025,24 @@ export function createPostgresTrustedMemoryStore(
           stored.targetRecordId,
         ],
       );
-      if (mergedAway.rowCount === 1) {
+      if (mergedAway.rowCount === 1 && !subjectErasure) {
         throw new MutationAborted("record_merged_away");
+      }
+      if (subjectErasure) {
+        // A survivor's erasure does not reach the records merged into it, and
+        // must not report success over them. Refused before consumption; the
+        // database refuses the tombstone on the same terms.
+        const unerased = await client.query(
+          `SELECT r FROM aaliyah_memory_unerased_merged_records($1, $2, $3) AS r LIMIT 1`,
+          [
+            stored.scope.tenantId,
+            stored.scope.workspaceId,
+            stored.targetRecordId,
+          ],
+        );
+        if (unerased.rowCount !== 0) {
+          throw new MutationAborted("merged_records_not_erased");
+        }
       }
 
       if (action === "delete") {

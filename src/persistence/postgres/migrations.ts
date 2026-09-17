@@ -4756,6 +4756,206 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
         CHECK (evidence ->> 'authorizationId' IS NOT NULL
                AND evidence ->> 'authorizationId' = authorization_id)`,
   },
+  {
+    // ------------------------------------------------------------------
+    // AN ALIAS BINDING OR RETIREMENT IS THE MUTATION ITS AUTHORIZATION NAMED.
+    //
+    // Red team BREAK C against 2b2e554. The binding guard asked only that SOME
+    // spent nonce matched (authorization id, receipt id). It never asked what
+    // that authorization was FOR. Run as the mutation role, a consumed
+    // `correct` authorization for one record also witnessed a binding for a
+    // different, already-erased participant: one authorization, two
+    // mutations, and a blind index that answered "exists" for an address that
+    // had been erased. Tombstones (B3) and identity edges already bind the
+    // witness's action and target; bindings did not.
+    //
+    // Now a binding requires: a spent `assign_alias` authorization whose
+    // target IS the binding's participant, and the record version that same
+    // mutation appended to that participant. The version carries every
+    // record-level guard with it — owner scope, head continuity, the merge
+    // freeze, and no append after a deletion — so a binding cannot outlive
+    // the participant it names. A retirement requires the same of
+    // `remove_alias`.
+    //
+    // A separate AFTER trigger, named `zy_` to fire after the existing guards
+    // (so each of their refusals is still reachable by its own killing test)
+    // and before the `zz_` scope binding, which migration 044 keeps last.
+    // ------------------------------------------------------------------
+    id: "050_memory_alias_authorization_action_bound",
+    sql: `CREATE OR REPLACE FUNCTION public.aaliyah_alias_binding_action_bound()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public, pg_temp
+      AS $fn$
+      DECLARE
+        v_authorization text;
+        v_receipt text;
+        v_action text;
+      BEGIN
+        IF TG_OP = 'INSERT' THEN
+          v_authorization := NEW.authorization_id;
+          v_receipt := NEW.mutation_receipt_id;
+          v_action := 'assign_alias';
+        ELSE
+          IF NEW.removed_authorization_id IS NULL
+             OR NEW.removed_authorization_id IS NOT DISTINCT FROM OLD.removed_authorization_id THEN
+            RETURN NULL;
+          END IF;
+          v_authorization := NEW.removed_authorization_id;
+          v_receipt := NEW.removed_by_mutation_receipt_id;
+          v_action := 'remove_alias';
+        END IF;
+        PERFORM 1
+          FROM public.aaliyah_memory_spent_nonce(NEW.tenant_id, v_authorization, v_receipt) AS n
+         WHERE n.workspace_id = NEW.workspace_id
+           AND n.action = v_action
+           AND n.target_record_id = NEW.canonical_participant_id;
+        IF NOT FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: an alias % must be witnessed by a spent % authorization for its own participant',
+            CASE WHEN TG_OP = 'INSERT' THEN 'binding' ELSE 'retirement' END, v_action
+            USING ERRCODE = 'check_violation';
+        END IF;
+        PERFORM 1
+          FROM public.memory_record_versions AS v
+         WHERE v.tenant_id = NEW.tenant_id
+           AND v.workspace_id = NEW.workspace_id
+           AND v.record_id = NEW.canonical_participant_id
+           AND v.mutation_receipt_id = v_receipt
+           AND v.authorization_id = v_authorization
+           AND v.state = 'active';
+        IF NOT FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: an alias % must be accompanied by the participant record version its mutation appended',
+            CASE WHEN TG_OP = 'INSERT' THEN 'binding' ELSE 'retirement' END
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_alias_bindings_zy_authorization_action
+      ON memory_alias_bindings;
+    CREATE TRIGGER memory_alias_bindings_zy_authorization_action
+      AFTER INSERT OR UPDATE OF removed_authorization_id ON memory_alias_bindings
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_alias_binding_action_bound();`,
+  },
+  {
+    // ------------------------------------------------------------------
+    // A MERGE DOES NOT PUT A SUBJECT BEYOND ERASURE.
+    //
+    // Red team BREAK A against 2b2e554. After P merged into S, the subject
+    // erasure of S reported verified with nothing erased, because only
+    // bindings naming S were reached; and P — frozen by migration 043 — could
+    // not be erased by anyone. The address bound to P stayed encrypted under a
+    // live key, resolvable, forever.
+    //
+    // Founder-locked semantics hold: merge freezes the absorbed record against
+    // ordinary mutation and is not deletion; ONE AUTHORIZATION → ONE MUTATION.
+    // So erasure does not cascade from S. Instead:
+    //
+    //   1. The freeze admits exactly one further version on an absorbed
+    //      record: a deletion whose order is a subject_erasure_request. Every
+    //      deletion guard (content erasure, tombstone, alias erasure, hold,
+    //      retention) applies to it unchanged.
+    //   2. A subject_erasure_request tombstone is refused while ANY record
+    //      merged into its target, transitively, still has a head that is not
+    //      deleted or a binding whose address is not erased. Erasure proceeds
+    //      absorbed-first, each under its own authorization, and a survivor's
+    //      erasure can no longer report success over a subject's address that
+    //      survives in a record merged into it.
+    // ------------------------------------------------------------------
+    id: "051_memory_erasure_reaches_merged_records",
+    sql: `CREATE OR REPLACE FUNCTION public.aaliyah_memory_merged_record_frozen()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public, pg_temp
+      AS $fn$
+      BEGIN
+        PERFORM public.aaliyah_memory_record_lock(NEW.tenant_id, NEW.workspace_id, NEW.record_id);
+        PERFORM 1 FROM public.memory_identity_edges AS e
+         WHERE e.tenant_id = NEW.tenant_id
+           AND e.workspace_id = NEW.workspace_id
+           AND e.from_record_id = NEW.record_id
+           AND e.kind = 'merged_into'
+         LIMIT 1;
+        IF FOUND AND NOT (NEW.state = 'deleted'
+                          AND NEW.payload -> 'content' ->> 'reason' = 'subject_erasure_request') THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a record merged into another accepts no further versions'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_unerased_merged_records(
+      p_tenant text, p_workspace text, p_record text)
+      RETURNS SETOF text
+      LANGUAGE sql
+      STABLE
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public, pg_temp
+      AS $fn$
+        WITH RECURSIVE absorbed(record_id) AS (
+          SELECT e.from_record_id
+            FROM public.memory_identity_edges AS e
+           WHERE e.tenant_id = p_tenant AND e.workspace_id = p_workspace
+             AND e.to_record_id = p_record AND e.kind = 'merged_into'
+          UNION
+          SELECT e.from_record_id
+            FROM public.memory_identity_edges AS e
+            JOIN absorbed AS a ON e.to_record_id = a.record_id
+           WHERE e.tenant_id = p_tenant AND e.workspace_id = p_workspace
+             AND e.kind = 'merged_into'
+        )
+        SELECT a.record_id
+          FROM absorbed AS a
+         WHERE COALESCE((SELECT v.state
+                           FROM public.memory_record_versions AS v
+                          WHERE v.tenant_id = p_tenant AND v.workspace_id = p_workspace
+                            AND v.record_id = a.record_id
+                          ORDER BY v.version DESC LIMIT 1), 'active') <> 'deleted'
+            OR EXISTS (SELECT 1 FROM public.memory_alias_bindings AS b
+                        WHERE b.tenant_id = p_tenant AND b.workspace_id = p_workspace
+                          AND b.canonical_participant_id = a.record_id
+                          AND b.pii_erased_at IS NULL)
+         ORDER BY a.record_id COLLATE "C";
+      $fn$;
+    REVOKE ALL ON FUNCTION public.aaliyah_memory_unerased_merged_records(text, text, text) FROM PUBLIC;
+    GRANT EXECUTE ON FUNCTION public.aaliyah_memory_unerased_merged_records(text, text, text)
+      TO aaliyah_memory_mutator;
+
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_erasure_reaches_merged()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public, pg_temp
+      AS $fn$
+      DECLARE
+        remaining text;
+      BEGIN
+        IF NEW.reason <> 'subject_erasure_request' THEN
+          RETURN NULL;
+        END IF;
+        SELECT string_agg(r, ', ') INTO remaining
+          FROM public.aaliyah_memory_unerased_merged_records(
+                 NEW.tenant_id, NEW.workspace_id, NEW.target_record_id) AS r;
+        IF remaining IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a subject erasure may not complete while a record merged into it is not erased (%)',
+            remaining
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_tombstones_zy_erasure_reaches_merged ON memory_tombstones;
+    CREATE TRIGGER memory_tombstones_zy_erasure_reaches_merged
+      AFTER INSERT ON memory_tombstones
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_erasure_reaches_merged();`,
+  },
 ];
 
 /**

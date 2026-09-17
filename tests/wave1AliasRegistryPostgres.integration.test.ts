@@ -614,6 +614,76 @@ async function witnessAppend(input: {
   );
 }
 
+/**
+ * The participant version an alias mutation appends, for raw fixtures.
+ *
+ * Migration 050: a binding or retirement must be accompanied by the record
+ * version its own mutation appended to the participant. A raw fixture that
+ * writes the binding row writes that version too, rather than a row the
+ * protocol could not have written.
+ */
+async function appendAliasVersion(input: {
+  authorizationId: string;
+  mutationReceiptId: string;
+  targetRecordId: string;
+  scope?: MemoryScope;
+  action?: string;
+}): Promise<void> {
+  const scope = input.scope ?? SCOPE;
+  let head = await adminPool.query(
+    `SELECT version, content_digest FROM memory_record_versions
+      WHERE tenant_id = $1 AND workspace_id = $2 AND record_id = $3
+      ORDER BY version DESC LIMIT 1`,
+    [scope.tenantId, scope.workspaceId, input.targetRecordId],
+  );
+  if (head.rowCount === 0) {
+    await seedGenesis(input.targetRecordId, scope);
+    head = await adminPool.query(
+      `SELECT version, content_digest FROM memory_record_versions
+        WHERE tenant_id = $1 AND workspace_id = $2 AND record_id = $3
+        ORDER BY version DESC LIMIT 1`,
+      [scope.tenantId, scope.workspaceId, input.targetRecordId],
+    );
+  }
+  const version = (head.rows[0].version as number) + 1;
+  const content = successorContent(input.targetRecordId, version);
+  const digest = memoryContentDigest(content);
+  const payload = {
+    schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
+    recordId: input.targetRecordId,
+    version,
+    state: "active",
+    scope,
+    content,
+    contentDigest: digest,
+    predecessorDigest: head.rows[0].content_digest as string,
+    authorizationId: input.authorizationId,
+    mutationReceiptId: input.mutationReceiptId,
+    createdAt: isoOffset(-60_000),
+  };
+  await runAs(
+    "aaliyah_memory_mutator",
+    `INSERT INTO memory_record_versions
+       (tenant_id, workspace_id, principal_id, user_id, record_id, version,
+        state, content_digest, predecessor_digest, authorization_id,
+        mutation_receipt_id, payload)
+     VALUES ($1,$2,$3,$4,$5,$6,'active',$7,$8,$9,$10,$11)`,
+    [
+      scope.tenantId,
+      scope.workspaceId,
+      scope.principalId,
+      scope.userId,
+      input.targetRecordId,
+      version,
+      digest,
+      payload.predecessorDigest,
+      input.authorizationId,
+      input.mutationReceiptId,
+      JSON.stringify(payload),
+    ],
+  );
+}
+
 let genesisCounter = 0;
 
 /** Seed version 1 of a participant identity record. */
@@ -3467,6 +3537,11 @@ test("Part D a WITNESSED raw binding is accepted, so the guard is not a blanket 
     mutationReceiptId: "mutation.raw",
     targetRecordId: VICTIM,
   });
+  await appendAliasVersion({
+    authorizationId: "auth-alias-00000000000000000000",
+    mutationReceiptId: "mutation.raw",
+    targetRecordId: VICTIM,
+  });
   await insertRawBinding();
   assert.equal(await activeBindings(), 1);
 });
@@ -3574,6 +3649,11 @@ test("B3 one consumed authorization binds exactly ONE alias", async () => {
     mutationReceiptId: "mutation.b3.bind",
     targetRecordId: VICTIM,
   });
+  await appendAliasVersion({
+    authorizationId: "b3-bind-00000000000000000001",
+    mutationReceiptId: "mutation.b3.bind",
+    targetRecordId: VICTIM,
+  });
   // The FIRST binding under this approval is legitimate and must land, or the
   // refusal below would be indistinguishable from a blanket one.
   await rawBindUnder({
@@ -3606,6 +3686,11 @@ test("B3 one consumed authorization retires exactly ONE binding", async () => {
       mutationReceiptId: `mutation.b3.retire.bind.${index}`,
       targetRecordId: VICTIM,
     });
+    await appendAliasVersion({
+      authorizationId: `b3-retire-bind-${index}`.padEnd(28, "0"),
+      mutationReceiptId: `mutation.b3.retire.bind.${index}`,
+      targetRecordId: VICTIM,
+    });
     await rawBindUnder({
       aliasId: `alias-b3-retire-${index}`,
       alias,
@@ -3615,6 +3700,12 @@ test("B3 one consumed authorization retires exactly ONE binding", async () => {
   }
   assert.equal(await activeBindings(), 2);
   await witnessAppend({
+    authorizationId: "b3-retire-0000000000000000001",
+    mutationReceiptId: "mutation.b3.retire",
+    targetRecordId: VICTIM,
+    action: "remove_alias",
+  });
+  await appendAliasVersion({
     authorizationId: "b3-retire-0000000000000000001",
     mutationReceiptId: "mutation.b3.retire",
     targetRecordId: VICTIM,
@@ -3647,6 +3738,11 @@ test("B3 one consumed authorization cannot both bind one alias and retire anothe
     mutationReceiptId: "mutation.b3.cross.existing",
     targetRecordId: VICTIM,
   });
+  await appendAliasVersion({
+    authorizationId: "b3-cross-existing-000000000001",
+    mutationReceiptId: "mutation.b3.cross.existing",
+    targetRecordId: VICTIM,
+  });
   await rawBindUnder({
     aliasId: "alias-b3-cross-existing",
     alias: "chair@example.com",
@@ -3654,6 +3750,11 @@ test("B3 one consumed authorization cannot both bind one alias and retire anothe
     mutationReceiptId: "mutation.b3.cross.existing",
   });
   await witnessAppend({
+    authorizationId: "b3-cross-0000000000000000001",
+    mutationReceiptId: "mutation.b3.cross",
+    targetRecordId: VICTIM,
+  });
+  await appendAliasVersion({
     authorizationId: "b3-cross-0000000000000000001",
     mutationReceiptId: "mutation.b3.cross",
     targetRecordId: VICTIM,
@@ -3687,6 +3788,11 @@ test("B3 one consumed authorization cannot both retire one alias and bind anothe
     mutationReceiptId: "mutation.b3.mirror.bound",
     targetRecordId: VICTIM,
   });
+  await appendAliasVersion({
+    authorizationId: "b3-mirror-bound-00000000001",
+    mutationReceiptId: "mutation.b3.mirror.bound",
+    targetRecordId: VICTIM,
+  });
   await rawBindUnder({
     aliasId: "alias-b3-mirror-bound",
     alias: "chair@example.com",
@@ -3694,6 +3800,12 @@ test("B3 one consumed authorization cannot both retire one alias and bind anothe
     mutationReceiptId: "mutation.b3.mirror.bound",
   });
   await witnessAppend({
+    authorizationId: "b3-mirror-000000000000000001",
+    mutationReceiptId: "mutation.b3.mirror",
+    targetRecordId: VICTIM,
+    action: "remove_alias",
+  });
+  await appendAliasVersion({
     authorizationId: "b3-mirror-000000000000000001",
     mutationReceiptId: "mutation.b3.mirror",
     targetRecordId: VICTIM,
@@ -3763,6 +3875,14 @@ test("C4-A a binding witnessed by an authorization issued to ANOTHER principal i
     targetRecordId: VICTIM,
     scope: { ...SCOPE, principalId: "principal-alias-other" },
   });
+  // The mutation's own participant version, filed under the authorization's
+  // scope, so the refusal below is the scope binding and not migration 050.
+  await appendAliasVersion({
+    authorizationId: "auth-alias-foreign-scope-0000000",
+    mutationReceiptId: "mutation.raw",
+    targetRecordId: VICTIM,
+    scope: { ...SCOPE, principalId: "principal-alias-other" },
+  });
   await assert.rejects(
     () => insertRawBinding({ authorization_id: "auth-alias-foreign-scope-0000000" }, {
       authorizationId: "auth-alias-foreign-scope-0000000",
@@ -3799,6 +3919,96 @@ test("C4-A a binding cannot be RETIRED under an authorization issued to another 
     /may only be retired under the scope of the authorization that retires it/,
   );
   assert.equal(await activeBindings(), 1);
+});
+
+// ---------------------------------------------------------------------------
+// K â€” A BINDING OR RETIREMENT IS THE MUTATION ITS AUTHORIZATION NAMED
+// (red team BREAK C against 2b2e554, migration 050).
+// ---------------------------------------------------------------------------
+
+async function witnessAliasMutation(input: {
+  authorizationId: string;
+  mutationReceiptId: string;
+  targetRecordId: string;
+  action: string;
+  version?: boolean;
+}): Promise<void> {
+  await witnessAppend(input);
+  if (input.version !== false) await appendAliasVersion(input);
+}
+
+test("K-1 a binding witnessed by a spent authorization for ANOTHER ACTION is refused", async () => {
+  await witnessAliasMutation({
+    authorizationId: "auth-k1-correct-0000000000000",
+    mutationReceiptId: "mutation.k1",
+    targetRecordId: VICTIM,
+    action: "correct",
+  });
+  await assert.rejects(
+    () => rawBindUnder({ aliasId: "alias-k1", alias: "ceo@example.com", authorizationId: "auth-k1-correct-0000000000000", mutationReceiptId: "mutation.k1" }),
+    /an alias binding must be witnessed by a spent assign_alias authorization for its own participant/,
+  );
+  assert.equal(await activeBindings(), 0);
+  // Positive control: the identical construction under assign_alias lands.
+  await witnessAliasMutation({
+    authorizationId: "auth-k1-assign-00000000000000",
+    mutationReceiptId: "mutation.k1.assign",
+    targetRecordId: VICTIM,
+    action: "assign_alias",
+  });
+  await rawBindUnder({ aliasId: "alias-k1", alias: "ceo@example.com", authorizationId: "auth-k1-assign-00000000000000", mutationReceiptId: "mutation.k1.assign" });
+  assert.equal(await activeBindings(), 1);
+});
+
+test("K-2 a binding witnessed by an assign_alias authorization for ANOTHER PARTICIPANT is refused", async () => {
+  await witnessAliasMutation({
+    authorizationId: "auth-k2-attacker-000000000000",
+    mutationReceiptId: "mutation.k2",
+    targetRecordId: ATTACKER,
+    action: "assign_alias",
+  });
+  // The raw binding names VICTIM.
+  await assert.rejects(
+    () => rawBindUnder({ aliasId: "alias-k2", alias: "ceo@example.com", authorizationId: "auth-k2-attacker-000000000000", mutationReceiptId: "mutation.k2" }),
+    /an alias binding must be witnessed by a spent assign_alias authorization for its own participant/,
+  );
+  assert.equal(await activeBindings(), 0);
+});
+
+test("K-3 a binding with no participant version appended by its own mutation is refused", async () => {
+  await witnessAliasMutation({
+    authorizationId: "auth-k3-noversion-00000000000",
+    mutationReceiptId: "mutation.k3",
+    targetRecordId: VICTIM,
+    action: "assign_alias",
+    version: false,
+  });
+  await seedGenesis(VICTIM);
+  await assert.rejects(
+    () => rawBindUnder({ aliasId: "alias-k3", alias: "ceo@example.com", authorizationId: "auth-k3-noversion-00000000000", mutationReceiptId: "mutation.k3" }),
+    /an alias binding must be accompanied by the participant record version its mutation appended/,
+  );
+  assert.equal(await activeBindings(), 0);
+});
+
+test("K-4 a retirement witnessed by the wrong action, the wrong participant, or no version is refused", async () => {
+  await bindThen("alias-k4", "ceo@example.com", VICTIM, "mutation.k4.bind");
+  const retire = (authorizationId: string, mutationReceiptId: string) =>
+    rawRetire({ aliasId: "alias-k4", authorizationId, mutationReceiptId });
+  await witnessAliasMutation({ authorizationId: "auth-k4-correct-0000000000000", mutationReceiptId: "mutation.k4.correct", targetRecordId: VICTIM, action: "correct" });
+  await assert.rejects(() => retire("auth-k4-correct-0000000000000", "mutation.k4.correct"),
+    /an alias retirement must be witnessed by a spent remove_alias authorization for its own participant/);
+  await witnessAliasMutation({ authorizationId: "auth-k4-attacker-000000000000", mutationReceiptId: "mutation.k4.attacker", targetRecordId: ATTACKER, action: "remove_alias" });
+  await assert.rejects(() => retire("auth-k4-attacker-000000000000", "mutation.k4.attacker"),
+    /an alias retirement must be witnessed by a spent remove_alias authorization for its own participant/);
+  await witnessAliasMutation({ authorizationId: "auth-k4-noversion-00000000000", mutationReceiptId: "mutation.k4.noversion", targetRecordId: VICTIM, action: "remove_alias", version: false });
+  await assert.rejects(() => retire("auth-k4-noversion-00000000000", "mutation.k4.noversion"),
+    /an alias retirement must be accompanied by the participant record version its mutation appended/);
+  assert.equal(await activeBindings(), 1);
+  // Positive control: remove_alias, own participant, own version.
+  await witnessAliasMutation({ authorizationId: "auth-k4-remove-00000000000000", mutationReceiptId: "mutation.k4.remove", targetRecordId: VICTIM, action: "remove_alias" });
+  await retire("auth-k4-remove-00000000000000", "mutation.k4.remove");
+  assert.equal(await activeBindings(), 0);
 });
 
 test("U-4 every alias-binding, blind-index and protected-domain unique index refuses the one duplicate it exists for", async () => {
@@ -4007,6 +4217,11 @@ test("C9 a binding cannot COMMIT without blind-index entries for both purposes â
   // P6 survivor TRG memory_alias_bindings_indexed: every raw fixture carried
   // its entries, so no test ever tried to commit a binding without them.
   await witnessAppend({
+    authorizationId: "auth-alias-00000000000000000000",
+    mutationReceiptId: "mutation.raw",
+    targetRecordId: VICTIM,
+  });
+  await appendAliasVersion({
     authorizationId: "auth-alias-00000000000000000000",
     mutationReceiptId: "mutation.raw",
     targetRecordId: VICTIM,
