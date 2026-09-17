@@ -4232,6 +4232,31 @@ test("Q-6 an alias mutation whose authorization named the right VERSION but a di
   assert.equal(verdict?.verdict, "COMMITTED_DIVERGED");
 });
 
+test("Q-7 the new SECURITY DEFINER helpers are executable only by the role that needs each, and refused by PRIVILEGE to every other", async () => {
+  // Sweep survivor G-19 at f59a6f7: granting the alias-effect oracle to PUBLIC
+  // changed nothing any test observed. Each helper answers questions about
+  // rows its caller may not read, so each grant is pinned in both directions.
+  const helpers = [
+    { call: `SELECT aaliyah_memory_alias_effect_present('t','w','assign_alias','r','a','p')`, name: "aaliyah_memory_alias_effect_present", allowed: "aaliyah_memory_reconciler" },
+    { call: `SELECT aaliyah_memory_unerased_merged_records('t','w','p')`, name: "aaliyah_memory_unerased_merged_records", allowed: "aaliyah_memory_mutator" },
+    { call: `SELECT aaliyah_memory_merge_chain_hops('t','w','a','b')`, name: "aaliyah_memory_merge_chain_hops", allowed: "aaliyah_memory_mutator" },
+  ];
+  const roles = ["aaliyah_memory_reader", "aaliyah_memory_mutator", "aaliyah_memory_reconciler", "aaliyah_memory_issuer"];
+  for (const helper of helpers) {
+    for (const role of roles) {
+      if (role === helper.allowed) {
+        await runAs(role, helper.call);
+      } else {
+        await assert.rejects(
+          () => runAs(role, helper.call),
+          new RegExp(`permission denied for function ${helper.name}`),
+          `${role} must not execute ${helper.name}`,
+        );
+      }
+    }
+  }
+});
+
 test("U-4 every alias-binding, blind-index and protected-domain unique index refuses the one duplicate it exists for", async () => {
   // Migration 047 moved alias uniqueness off plaintext columns and onto KEYED
   // blind-index entries; the indexes destroyed here are the ones that now
