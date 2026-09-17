@@ -40,6 +40,7 @@ import {
 import { runMailMigrations } from "../src/persistence/postgres/migrations";
 import { createMailDbPool } from "../src/persistence/postgres/pool";
 import { createPostgresAliasRegistryStore } from "../src/persistence/postgres/wave1AliasRegistryStore";
+import { createPostgresMemoryReconciler } from "../src/persistence/postgres/wave1MemoryReconciler";
 import {
   lockSharedMemoryTables,
   type SharedTableLock,
@@ -238,6 +239,7 @@ beforeEach(async () => {
               memory_authorization_nonces,
               memory_mutation_receipts,
               memory_mutation_attempts,
+              memory_reconciliations,
               memory_tombstones,
               memory_legal_hold_carve_outs,
               memory_legal_hold_records,
@@ -4009,6 +4011,160 @@ test("K-4 a retirement witnessed by the wrong action, the wrong participant, or 
   await witnessAliasMutation({ authorizationId: "auth-k4-remove-00000000000000", mutationReceiptId: "mutation.k4.remove", targetRecordId: VICTIM, action: "remove_alias" });
   await retire("auth-k4-remove-00000000000000", "mutation.k4.remove");
   assert.equal(await activeBindings(), 0);
+});
+
+// ---------------------------------------------------------------------------
+// Q — AN ALIAS MUTATION RECONCILES AGAINST WHAT IT AUTHORIZED
+// (red team BREAK B against 2b2e554, migration 052).
+// ---------------------------------------------------------------------------
+
+async function seedPendingUnknown(input: {
+  mutationReceiptId: string;
+  authorizationId: string;
+  action: "assign_alias" | "remove_alias";
+  recordId: string;
+  bindingDigest: string;
+}): Promise<void> {
+  await runAs(
+    "aaliyah_memory_mutator",
+    `INSERT INTO memory_mutation_receipts
+       (tenant_id, workspace_id, principal_id, user_id, mutation_receipt_id,
+        phase, authorization_id, consumed_nonce_digest, action,
+        target_record_id, outcome_status, emitted_at, payload)
+     VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,'pending',$6::text,
+             $7::text,$8::text,$9::text,'UNKNOWN_PENDING_RECONCILIATION', now(),
+             jsonb_build_object(
+               'mutationReceiptId',$5::text, 'authorizationId',$6::text,
+               'consumedNonceDigest',$7::text, 'action',$8::text,
+               'targetRecordId',$9::text,
+               'scope', jsonb_build_object('tenantId',$1::text,'workspaceId',$2::text,
+                                           'principalId',$3::text,'userId',$4::text),
+               'outcome', jsonb_build_object('status','UNKNOWN_PENDING_RECONCILIATION')))`,
+    [SCOPE.tenantId, SCOPE.workspaceId, SCOPE.principalId, SCOPE.userId,
+     input.mutationReceiptId, input.authorizationId, input.bindingDigest,
+     input.action, input.recordId],
+  );
+}
+
+async function spendNonce(bindingDigest: string, mutationReceiptId: string): Promise<void> {
+  await runAs(
+    "aaliyah_memory_mutator",
+    `UPDATE memory_authorization_nonces
+        SET consumed_at = now(), consumed_by_mutation_receipt_id = $2
+      WHERE binding_digest = $1 AND consumed_at IS NULL`,
+    [bindingDigest, mutationReceiptId],
+  );
+}
+
+async function fileAliasVerdictAsReconciler(input: {
+  mutationReceiptId: string;
+  authorizationId: string;
+  recordId: string;
+  verdict: string;
+}): Promise<void> {
+  const version = await adminPool.query(
+    `SELECT version, content_digest FROM memory_record_versions WHERE mutation_receipt_id = $1`,
+    [input.mutationReceiptId],
+  );
+  await runAs(
+    "aaliyah_memory_reconciler",
+    `INSERT INTO memory_reconciliations
+       (tenant_id, workspace_id, principal_id, user_id, mutation_receipt_id,
+        authorization_id, action, target_record_id, verdict,
+        observed_version, observed_content_digest, reconciled_at, evidence)
+     VALUES ($1,$2,$3,$4,$5,$6,'assign_alias',$7,$8,$9,$10, now(),
+             jsonb_build_object('mutationReceiptId',$5::text,'authorizationId',$6::text))`,
+    [SCOPE.tenantId, SCOPE.workspaceId, SCOPE.principalId, SCOPE.userId,
+     input.mutationReceiptId, input.authorizationId, input.recordId, input.verdict,
+     version.rows[0].version, version.rows[0].content_digest],
+  );
+}
+
+test("Q-1 RT2-R1: a CORRECT assign_alias whose read-back failed reconciles to COMMITTED_CONFIRMED, and the database refuses DIVERGED", async () => {
+  const prepared = await prepareAssign({ aliasId: "alias-q1", observedAlias: "ceo@example.com", participantId: VICTIM });
+  const result = await store({ readBack: shadowRecordPool }).assignAlias({
+    actor: SCOPE,
+    authorizationId: prepared.receipt.authorizationId,
+    participantRecordId: VICTIM,
+    alias: prepared.alias,
+    evidence: prepared.evidence,
+    proposedContent: prepared.content,
+    mutationReceiptId: "mutation.q1",
+  });
+  assert.equal(result.rejection, "unknown_outcome");
+  assert.equal(await activeBindings(), 1);
+  await assert.rejects(
+    () => fileAliasVerdictAsReconciler({ mutationReceiptId: "mutation.q1", authorizationId: prepared.receipt.authorizationId, recordId: VICTIM, verdict: "COMMITTED_DIVERGED" }),
+    /verdict COMMITTED_DIVERGED is not the verdict stored state implies \(COMMITTED_CONFIRMED\)/,
+  );
+  const [verdict] = await createPostgresMemoryReconciler(writePool).reconcileAll();
+  assert.equal(verdict?.mutationReceiptId, "mutation.q1");
+  assert.equal(verdict?.verdict, "COMMITTED_CONFIRMED");
+  assert.equal(verdict?.evidence.derivation, "alias_effect_and_authorized_head");
+  assert.equal(verdict?.evidence.aliasEffectPresent, true);
+});
+
+test("Q-2 a CORRECT remove_alias whose read-back failed reconciles to COMMITTED_CONFIRMED", async () => {
+  const bound = await bindThen("alias-q2", "ceo@example.com", VICTIM, "mutation.q2.bind");
+  const removalContent = successorContent(VICTIM, 3);
+  const removal = await issue(
+    authorization({
+      action: "remove_alias",
+      targetRecordId: VICTIM,
+      expectedHead: headOf(2, bound.headDigest),
+      proposedContentDigest: aliasRemovalDigest({ record: removalContent, aliasId: "alias-q2" }),
+    }),
+  );
+  const result = await store({ readBack: shadowRecordPool }).removeAlias({
+    actor: SCOPE,
+    authorizationId: removal.authorizationId,
+    participantRecordId: VICTIM,
+    aliasId: "alias-q2",
+    proposedContent: removalContent,
+    mutationReceiptId: "mutation.q2.remove",
+  });
+  assert.equal(result.rejection, "unknown_outcome");
+  assert.equal(await activeBindings(), 0);
+  const [verdict] = await createPostgresMemoryReconciler(writePool).reconcileAll();
+  assert.equal(verdict?.mutationReceiptId, "mutation.q2.remove");
+  assert.equal(verdict?.verdict, "COMMITTED_CONFIRMED");
+});
+
+test("Q-3 an alias mutation whose version landed but whose ALIAS EFFECT did not reconciles to COMMITTED_DIVERGED, and CONFIRMED is refused", async () => {
+  const prepared = await prepareAssign({ aliasId: "alias-q3", observedAlias: "ceo@example.com", participantId: VICTIM });
+  const { authorizationId, nonce } = prepared.receipt;
+  await spendNonce(nonce.bindingDigest, "mutation.q3");
+  await appendAliasVersion({ authorizationId, mutationReceiptId: "mutation.q3", targetRecordId: VICTIM });
+  await seedPendingUnknown({ mutationReceiptId: "mutation.q3", authorizationId, action: "assign_alias", recordId: VICTIM, bindingDigest: nonce.bindingDigest });
+  await assert.rejects(
+    () => fileAliasVerdictAsReconciler({ mutationReceiptId: "mutation.q3", authorizationId, recordId: VICTIM, verdict: "COMMITTED_CONFIRMED" }),
+    /verdict COMMITTED_CONFIRMED is not the verdict stored state implies \(COMMITTED_DIVERGED\)/,
+  );
+  const [verdict] = await createPostgresMemoryReconciler(writePool).reconcileAll();
+  assert.equal(verdict?.verdict, "COMMITTED_DIVERGED");
+  assert.equal(verdict?.evidence.aliasEffectPresent, false);
+});
+
+test("Q-4 an alias mutation that did NOT extend the head it authorized reconciles to COMMITTED_DIVERGED even with its effect present", async () => {
+  const prepared = await prepareAssign({ aliasId: "alias-q4", observedAlias: "ceo@example.com", participantId: VICTIM });
+  const { authorizationId, nonce } = prepared.receipt;
+  // Something else advanced the participant first: the authorized head (v1) is gone.
+  await witnessAppend({ authorizationId: "auth-q4-intervening-000000000", mutationReceiptId: "mutation.q4.intervening", targetRecordId: VICTIM, action: "assign_alias" });
+  await appendAliasVersion({ authorizationId: "auth-q4-intervening-000000000", mutationReceiptId: "mutation.q4.intervening", targetRecordId: VICTIM });
+  await spendNonce(nonce.bindingDigest, "mutation.q4");
+  await appendAliasVersion({ authorizationId, mutationReceiptId: "mutation.q4", targetRecordId: VICTIM });
+  await insertRawBinding(
+    { alias_id: "alias-q4", authorization_id: authorizationId, mutation_receipt_id: "mutation.q4" },
+    { aliasId: "alias-q4", authorizationId, mutationReceiptId: "mutation.q4" },
+  );
+  await seedPendingUnknown({ mutationReceiptId: "mutation.q4", authorizationId, action: "assign_alias", recordId: VICTIM, bindingDigest: nonce.bindingDigest });
+  await assert.rejects(
+    () => fileAliasVerdictAsReconciler({ mutationReceiptId: "mutation.q4", authorizationId, recordId: VICTIM, verdict: "COMMITTED_CONFIRMED" }),
+    /verdict COMMITTED_CONFIRMED is not the verdict stored state implies \(COMMITTED_DIVERGED\)/,
+  );
+  const [verdict] = await createPostgresMemoryReconciler(writePool).reconcileAll();
+  assert.equal(verdict?.verdict, "COMMITTED_DIVERGED");
+  assert.equal(verdict?.evidence.aliasEffectPresent, true);
 });
 
 test("U-4 every alias-binding, blind-index and protected-domain unique index refuses the one duplicate it exists for", async () => {

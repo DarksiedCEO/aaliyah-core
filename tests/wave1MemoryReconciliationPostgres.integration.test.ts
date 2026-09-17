@@ -888,6 +888,28 @@ test("V-1 M2: reconcile() refuses a request naming a different authorization tha
   assert.equal(honest.authorizationId, authorizationId);
 });
 
+test("V-5 reconcile() refuses a caller whose PRINCIPAL or USER is not the stored receipt's, one dimension at a time, and files nothing", async () => {
+  // 2b2e554 test-falsifiability review: forcing the principal comparison to
+  // false left every test in this file green — every reconcile() call used the
+  // receipt's own principal and user.
+  await committedUnknown("mutation.v5", { note: "real" });
+  const [unresolved] = await reconciler().findUnresolved();
+  assert.equal(unresolved?.mutationReceiptId, "mutation.v5");
+  for (const dimension of ["principalId", "userId"] as const) {
+    await assert.rejects(
+      () =>
+        reconciler().reconcile({
+          ...unresolved!,
+          scope: { ...unresolved!.scope, [dimension]: `${dimension}-not-the-actor` },
+        }),
+      /does not match the unknown outcome on record/,
+    );
+  }
+  assert.equal(await countReconciliations(), 0);
+  // Positive control: the receipt's own actor reconciles it.
+  assert.equal((await reconciler().reconcile(unresolved!)).verdict, "COMMITTED_CONFIRMED");
+});
+
 test("V-2 reconcile() refuses a mutation receipt id with no unknown outcome on record", async () => {
   await assert.rejects(
     () =>

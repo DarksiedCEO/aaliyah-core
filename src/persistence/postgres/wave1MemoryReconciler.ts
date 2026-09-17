@@ -274,7 +274,8 @@ export function createPostgresMemoryReconciler(
       // record version. Deliberately NOT resolved by head: a later mutation
       // may have advanced the record since, and this one still committed.
       const version = await client.query(
-        `SELECT version, content_digest, state
+        `SELECT version, content_digest, state, record_id, authorization_id,
+                predecessor_digest
            FROM memory_record_versions
           WHERE tenant_id = $1 AND workspace_id = $2
             AND mutation_receipt_id = $3
@@ -282,7 +283,14 @@ export function createPostgresMemoryReconciler(
         [scope.tenantId, scope.workspaceId, mutationReceiptId],
       );
       const versionRow = version.rows[0] as
-        | { version: number; content_digest: string; state: string }
+        | {
+            version: number;
+            content_digest: string;
+            state: string;
+            record_id: string;
+            authorization_id: string;
+            predecessor_digest: string | null;
+          }
         | undefined;
 
       // ---- WHAT WAS AUTHORIZED ------------------------------------------
@@ -332,10 +340,39 @@ export function createPostgresMemoryReconciler(
           WHERE tenant_id = $1 AND authorization_id = $2 LIMIT 1`,
         [scope.tenantId, stored.authorization_id],
       );
+      const authorizationPayload = authorization.rows[0]?.payload as
+        | Record<string, unknown>
+        | undefined;
       const authorizedDigest =
-        ((authorization.rows[0]?.payload as Record<string, unknown> | undefined)?.[
-          "proposedContentDigest"
-        ] as string | undefined) ?? null;
+        (authorizationPayload?.["proposedContentDigest"] as string | undefined) ?? null;
+      const authorizedHead = authorizationPayload?.["expectedHead"] as
+        | { version?: unknown; contentDigest?: unknown }
+        | undefined;
+
+      // ---- AN ALIAS MUTATION'S OWN EFFECT -------------------------------
+      // Red team BREAK B against 2b2e554: an alias authorization binds a
+      // KEYED digest, never the version's content digest, so comparing the
+      // two filed every correct alias mutation as DIVERGED. Migration 052
+      // derives the alias verdict from what stored state can prove, and this
+      // mirrors it exactly: the authorization's own version extended the
+      // head it authorized, and its alias effect is on record under it.
+      const aliasAction =
+        stored.action === "assign_alias" || stored.action === "remove_alias";
+      let aliasEffectPresent: boolean | null = null;
+      if (aliasAction) {
+        const effect = await client.query(
+          `SELECT aaliyah_memory_alias_effect_present($1, $2, $3, $4, $5, $6) AS present`,
+          [
+            scope.tenantId,
+            scope.workspaceId,
+            stored.action,
+            mutationReceiptId,
+            stored.authorization_id,
+            stored.target_record_id,
+          ],
+        );
+        aliasEffectPresent = effect.rows[0]?.present === true;
+      }
 
       let verdict: MemoryReconciliationVerdict;
       let escalation: string | null = null;
@@ -344,9 +381,18 @@ export function createPostgresMemoryReconciler(
         // the caller said it sent. A committed row holding something nobody
         // approved is a divergence, and it is reported as one rather than
         // being rounded up to success because the row exists.
-        verdict =
-          authorizedDigest !== null &&
-          versionRow.content_digest === authorizedDigest
+        verdict = aliasAction
+          ? aliasEffectPresent === true &&
+            versionRow.record_id === stored.target_record_id &&
+            versionRow.authorization_id === stored.authorization_id &&
+            versionRow.state === "active" &&
+            typeof authorizedHead?.version === "number" &&
+            versionRow.version === authorizedHead.version + 1 &&
+            versionRow.predecessor_digest === (authorizedHead.contentDigest ?? null)
+            ? "COMMITTED_CONFIRMED"
+            : "COMMITTED_DIVERGED"
+          : authorizedDigest !== null &&
+              versionRow.content_digest === authorizedDigest
             ? "COMMITTED_CONFIRMED"
             : "COMMITTED_DIVERGED";
       } else if (!pendingPresent && versionRow === undefined) {
@@ -383,6 +429,12 @@ export function createPostgresMemoryReconciler(
         pendingReceiptPresent: pendingPresent,
         recordVersionPresent: versionRow !== undefined,
         authorizedContentDigest: authorizedDigest,
+        // For alias actions the verdict is NOT a digest comparison; the
+        // observations it rests on are recorded instead (migration 052).
+        derivation: aliasAction ? "alias_effect_and_authorized_head" : "content_digest",
+        authorizedHeadVersion:
+          typeof authorizedHead?.version === "number" ? authorizedHead.version : null,
+        aliasEffectPresent,
         observedContentDigest: versionRow?.content_digest ?? null,
         observedState: versionRow?.state ?? null,
         escalation,

@@ -4956,6 +4956,161 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       AFTER INSERT ON memory_tombstones
       FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_erasure_reaches_merged();`,
   },
+  {
+    // ------------------------------------------------------------------
+    // AN ALIAS MUTATION IS RECONCILED AGAINST WHAT IT ACTUALLY AUTHORIZED.
+    //
+    // Red team BREAK B against 2b2e554. Migration 045 derives the verdict by
+    // comparing the committed version's content digest with the
+    // authorization's proposedContentDigest. For assign_alias and
+    // remove_alias those are never equal by construction — the authorization
+    // binds aliasAssignmentDigest / aliasRemovalDigest over the record, a
+    // keyed alias commitment and the evidence — so a correct alias mutation
+    // whose read-back failed could only be filed COMMITTED_DIVERGED, and the
+    // once-only constraint made the false alarm permanent.
+    //
+    // DISCLOSED LIMIT: the keyed digest cannot be recomputed here, because the
+    // key lives outside PostgreSQL by founder decision. For alias actions
+    // CONFIRMED therefore attests the authorized head was extended by this
+    // authorization's own version on its own target, and the authorized
+    // alias effect is on record under the same receipt. That the record
+    // content matched the keyed digest was verified inside the committing
+    // transaction, before the consumption it shares a transaction with.
+    // ------------------------------------------------------------------
+    id: "052_memory_alias_reconciliation_derivable",
+    sql: `CREATE OR REPLACE FUNCTION public.aaliyah_memory_alias_effect_present(
+      p_tenant text, p_workspace text, p_action text, p_receipt text,
+      p_authorization text, p_target text)
+      RETURNS boolean
+      LANGUAGE sql
+      STABLE
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public, pg_temp
+      AS $fn$
+        SELECT CASE p_action
+          WHEN 'assign_alias' THEN EXISTS (
+            SELECT 1 FROM public.memory_alias_bindings AS b
+             WHERE b.tenant_id = p_tenant AND b.workspace_id = p_workspace
+               AND b.mutation_receipt_id = p_receipt
+               AND b.authorization_id = p_authorization
+               AND b.canonical_participant_id = p_target)
+          WHEN 'remove_alias' THEN EXISTS (
+            SELECT 1 FROM public.memory_alias_bindings AS b
+             WHERE b.tenant_id = p_tenant AND b.workspace_id = p_workspace
+               AND b.removed_by_mutation_receipt_id = p_receipt
+               AND b.removed_authorization_id = p_authorization
+               AND b.canonical_participant_id = p_target)
+          ELSE false
+        END;
+      $fn$;
+    -- The reconciler learns whether the effect is on record, and nothing
+    -- else: it is not granted the binding table, which holds envelopes.
+    REVOKE ALL ON FUNCTION public.aaliyah_memory_alias_effect_present(text, text, text, text, text, text) FROM PUBLIC;
+    GRANT EXECUTE ON FUNCTION public.aaliyah_memory_alias_effect_present(text, text, text, text, text, text)
+      TO aaliyah_memory_reconciler;
+
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_reconciliation_derivable()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public, pg_temp
+      AS $fn$
+      DECLARE
+        pending_present boolean;
+        version_row public.memory_record_versions%ROWTYPE;
+        version_present boolean;
+        authorized_digest text;
+        authorized_head_version integer;
+        authorized_head_digest text;
+        alias_effect_present boolean;
+        implied text;
+      BEGIN
+        PERFORM 1 FROM public.memory_mutation_receipts AS r
+         WHERE r.tenant_id = NEW.tenant_id
+           AND r.workspace_id = NEW.workspace_id
+           AND r.mutation_receipt_id = NEW.mutation_receipt_id
+           AND r.outcome_status = 'UNKNOWN_PENDING_RECONCILIATION'
+           AND r.principal_id = NEW.principal_id
+           AND r.user_id = NEW.user_id
+           AND r.authorization_id = NEW.authorization_id
+           AND r.action = NEW.action
+           AND r.target_record_id = NEW.target_record_id
+         LIMIT 1;
+        IF NOT FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a reconciliation must answer an unknown outcome that is on record, as recorded'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        SELECT EXISTS (
+          SELECT 1 FROM public.memory_mutation_receipts AS p
+           WHERE p.tenant_id = NEW.tenant_id
+             AND p.workspace_id = NEW.workspace_id
+             AND p.mutation_receipt_id = NEW.mutation_receipt_id
+             AND p.phase = 'pending') INTO pending_present;
+        SELECT * INTO version_row FROM public.memory_record_versions AS v
+         WHERE v.tenant_id = NEW.tenant_id
+           AND v.workspace_id = NEW.workspace_id
+           AND v.mutation_receipt_id = NEW.mutation_receipt_id
+         LIMIT 1;
+        version_present := FOUND;
+        SELECT a.payload ->> 'proposedContentDigest',
+               (a.payload -> 'expectedHead' ->> 'version')::integer,
+               a.payload -> 'expectedHead' ->> 'contentDigest'
+          INTO authorized_digest, authorized_head_version, authorized_head_digest
+          FROM public.memory_authorization_receipts AS a
+         WHERE a.tenant_id = NEW.tenant_id
+           AND a.authorization_id = NEW.authorization_id
+         LIMIT 1;
+        IF pending_present AND version_present AND NEW.action IN ('assign_alias','remove_alias') THEN
+          -- An alias authorization binds a KEYED digest (the alias commitment
+          -- is an HMAC under a key outside PostgreSQL), never the version's
+          -- content digest, so that comparison could only ever say DIVERGED.
+          -- What stored state can prove: the authorization's own mutation
+          -- extended exactly the head it authorized, on its own target, and
+          -- the alias effect it authorized is on record under it.
+          alias_effect_present := public.aaliyah_memory_alias_effect_present(
+            NEW.tenant_id, NEW.workspace_id, NEW.action, NEW.mutation_receipt_id,
+            NEW.authorization_id, NEW.target_record_id);
+          IF alias_effect_present
+             AND version_row.record_id = NEW.target_record_id
+             AND version_row.authorization_id = NEW.authorization_id
+             AND version_row.state = 'active'
+             AND authorized_head_version IS NOT NULL
+             AND version_row.version = authorized_head_version + 1
+             AND version_row.predecessor_digest IS NOT DISTINCT FROM authorized_head_digest THEN
+            implied := 'COMMITTED_CONFIRMED';
+          ELSE
+            implied := 'COMMITTED_DIVERGED';
+          END IF;
+        ELSIF pending_present AND version_present THEN
+          IF authorized_digest IS NOT NULL
+             AND version_row.content_digest = authorized_digest THEN
+            implied := 'COMMITTED_CONFIRMED';
+          ELSE
+            implied := 'COMMITTED_DIVERGED';
+          END IF;
+        ELSIF NOT pending_present AND NOT version_present THEN
+          implied := 'NOT_COMMITTED';
+        ELSE
+          implied := 'IMPOSSIBLE_STATE';
+        END IF;
+        IF NEW.verdict <> implied THEN
+          RAISE EXCEPTION
+            'aaliyah memory: reconciliation verdict % is not the verdict stored state implies (%)',
+            NEW.verdict, implied
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF implied IN ('COMMITTED_CONFIRMED','COMMITTED_DIVERGED')
+           AND (NEW.observed_version IS DISTINCT FROM version_row.version
+                OR NEW.observed_content_digest IS DISTINCT FROM version_row.content_digest) THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a committed reconciliation must observe the record version that is actually stored'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;`,
+  },
 ];
 
 /**
