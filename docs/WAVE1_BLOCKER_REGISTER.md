@@ -950,3 +950,49 @@ Disclosed survivors, unchanged from earlier sweeps, each with proof:
 - the structurally redundant unique index on authorization receipts `(tenant, workspace, authorization)`.
 
 **Load-induced verdicts.** With eight workers sharing one machine, a kill is not trusted from its verdict alone. One disclosed backstop was "killed" on one worker by unrelated HTTP-reachability failures from CPU starvation, and survived on another. Every kill backed only by a timeout, cancellation, deadline, hook-sentinel failure or mass failure is re-run on a quiet machine against the frozen descendant before it counts. The re-run evidence sits beside the sweep at `aaliyah-w13-evidence/`.
+
+---
+
+## W1.3 THIRD HOSTILE CHAIN — `3ba769f`
+
+Five reviewers ran on the same SHA, each with its own worktree and database. Their reports are at `aaliyah-w13-evidence/3ba769f/reviews/`.
+
+| Reviewer | Verdict | Blocking findings |
+| --- | --- | --- |
+| Test Falsifiability | TEST_TRUTH_GREEN | none |
+| Security | SECURITY_GREEN | none |
+| Red Team | GREEN | none |
+| Reliability | NOT_VERIFIED | none |
+| Integration | NOT_VERIFIED | none |
+
+- **Test Falsifiability:** three clean full runs of 1001/1001. 12 database and 8 source mutants of its own, all killed. 5 hostile watchdog fixture classes, none PASS.
+- **Security:** 050–053, the vault, `pg_temp`, and HTTP were re-attacked under least-privilege roles, including RT2-H1 and RT2-K1.
+- **Red Team:**
+  - Breaks A/B/C and M1–M3 could not be reopened.
+  - F1 (MEDIUM): `TS_NODE_*` bypass.
+  - F2 (LOW): completion-pass starvation.
+- **Reliability:**
+  - W1BR-031 held through a real store `delete()` terminated while blocked on a lock.
+  - A 16-hop race held.
+  - MEDIUM: audit starvation by a pending backlog.
+  - Gaps: boot end-to-end, and resource exhaustion.
+- **Integration:**
+  - No regression. `piiKeys: null` wiring was proven over live HTTP.
+  - Gap: 050–053 over a database populated at 049.
+  - MEDIUM, reasoned: DDL state left behind by a SIGKILLed test.
+
+The confirming sweep's duplicate verdicts also surfaced two real survivors, G-13 and G-16. `3ba769f` is therefore superseded, and none of its GREENs carries forward.
+
+| Entry | Finding | Remediation | Proven by |
+| --- | --- | --- | --- |
+| W1BR-043 | G-13, G-16: privilege widenings unobserved (sweep, duplicate verdicts) | `aca256d`: an exact, declared privilege map of every memory role — tables, columns, sequences, functions, memberships — with the boundaries the register relies on asserted by name | `wave1MemoryPrivilegesPostgres`, including a positive control that a widened grant is reported |
+| W1BR-044 | Red Team F1: inherited `TS_NODE_PROJECT` preloads code into every worker; a failing fixture was PASS | `aca256d`: the watchdog drops and records every `TS_NODE_*` | the red team's preload as a fixture, with a positive control that it is hostile |
+| W1BR-045 | Red Team F2 and Reliability MEDIUM: the evidenced-key audit shared the batch limit, so it could be starved from either side | `aca256d`: evidenced keys are audited on every pass, outside the limit | K-7 (settled rows ahead), K-8 (pending backlog ahead), at limit 1. Cost: one provider state call per evidenced key per pass; disclosed. |
+| W1BR-046 | Reliability gap: boot recovery against a wedged database was verified only through primitives | `aca256d`: the real service, built as `server.ts` builds it | refused with 55P03 within the bound; completes once the wedge is lifted |
+
+**Still open — these block GREEN, not dispositioned:**
+- **INTEGRATION: migrations 050–053 over a database populated at 049.** No test builds rows at 049 and then performs honest operations after the upgrade: retiring a pre-050 binding, reconciling a pre-052 UNKNOWN alias mutation, subject-erasing a pre-051 merged participant, merging on a chain that predates 053. All four new guards are forward-only `AFTER` triggers, so no break is *expected*, but expectation is not proof. This needs `runMailMigrations` to stop at a named migration, plus store fixtures on a separate database.
+- **INTEGRATION MEDIUM (reasoned): DDL state left behind by a SIGKILLed test.** A test killed while it has a trigger disabled or a shadow schema created leaves that state for the next run against the same database. Mitigation today: CI and every reviewer run against a fresh database. There is no structural defense.
+- **RELIABILITY NOT_VERIFIED:** fd and memory exhaustion.
+- **SECURITY, theoretical (not executed):** a survivor's subject erasure checks the absorbed record's bindings for `pii_erased_at`. After a provider outage during the absorbed record's erasure, that binding is erased while its key is pending, so the survivor may report verified before the absorbed key is destroyed. The absorbed record's own erasure reported `erasure_incomplete`, and completion converges.
+- **Process:** the implementer ran `git checkout -- src/persistence/postgres/migrations.ts` in the implementation worktree to revert its own uncommitted, never-committed `through` option. No other change was in that file, and no work was lost. This still violates the worktree doctrine, and it is recorded here.
