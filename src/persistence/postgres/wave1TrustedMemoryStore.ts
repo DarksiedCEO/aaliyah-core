@@ -755,11 +755,44 @@ export function createPostgresTrustedMemoryStore(
       | { kind: MemoryIdentityEdgeKind; toRecordId: string; reason: string; evidenceRef: string }
       | null = null;
 
-    const lockKey = [
-      request.actor.tenantId,
-      request.actor.workspaceId,
-      request.recordId,
-    ].join(LOCK_KEY_SEPARATOR);
+    // ---- WHICH RECORDS THIS MUTATION MUST HOLD --------------------------
+    // Every action holds the record it targets. A merge or split ALSO holds
+    // the counterparty, because its checks read the counterparty's head and
+    // its incoming merge edges — and read unlocked, under READ COMMITTED,
+    // neither sees a concurrent transaction's uncommitted write. Falsified
+    // against b3efc82: `merge A->B` racing `merge B->A` closed a cycle on the
+    // first trial, and `merge A->B` racing `delete B` merged into a destroyed
+    // record.
+    //
+    // The counterparty is read from the PROPOSED content, before anything is
+    // resolved, because the lock has to be held before the first read. That
+    // is safe: content that does not digest to what was authorized is refused
+    // below, so a caller naming some other record gains at most a lock on it,
+    // never a mutation.
+    //
+    // Sorted, so two transactions locking one pair from opposite ends take it
+    // in the same order and cannot deadlock. Migration 043 takes the same keys
+    // in the same order inside the database.
+    const lockRecordIds = new Set<string>([request.recordId]);
+    if (action === "merge_identity" || action === "split_identity") {
+      const order =
+        action === "merge_identity"
+          ? parseIdentityMergeOrder(request.proposedContent)
+          : parseIdentitySplitOrder(request.proposedContent);
+      if (order !== null) {
+        const counterpartyId = identityCounterparty(order).recordId;
+        if (MemoryIdSchema.safeParse(counterpartyId).success) {
+          lockRecordIds.add(counterpartyId);
+        }
+      }
+    }
+    const lockKeys = [...lockRecordIds]
+      .map((recordId) =>
+        [request.actor.tenantId, request.actor.workspaceId, recordId].join(
+          LOCK_KEY_SEPARATOR,
+        ),
+      )
+      .sort();
 
     const client = await pool.connect();
     try {
@@ -772,13 +805,16 @@ export function createPostgresTrustedMemoryStore(
         `${lockWaitMs}ms`,
       ]);
       await enterRole(client, mutationRole);
-      // Single-flight on the record. Two writers racing the same head
-      // serialize here, so the loser reads the winner's head and fails its
-      // compare-and-swap rather than both reading the stale one.
-      await client.query(
-        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-        [lockKey],
-      );
+      // Single-flight on the record — and, for an identity change, on its
+      // counterparty. Two writers racing the same head serialize here, so the
+      // loser reads the winner's head and fails its compare-and-swap rather
+      // than both reading the stale one.
+      for (const lockKey of lockKeys) {
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          [lockKey],
+        );
+      }
       const txNow = (await client.query("SELECT now() AS tx_now")).rows[0]
         .tx_now as Date;
 

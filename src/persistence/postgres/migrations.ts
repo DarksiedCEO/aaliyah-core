@@ -3531,6 +3531,153 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       END;
       $fn$`,
   },
+  {
+    // ------------------------------------------------------------------
+    // AN IDENTITY CHANGE IS SERIALIZED ON BOTH RECORDS IT TOUCHES.
+    //
+    // Falsified against b3efc82 by the red team, twice, with one root cause.
+    // The store took its advisory lock on the FROM record only, and both the
+    // store's checks and migration 042's trigger read the COUNTERPARTY
+    // unlocked, under READ COMMITTED:
+    //
+    //   - `merge A->B` and `merge B->A`, each with its own valid authorization,
+    //     fired together: a CYCLE on trial 1 of 25. Both records frozen, both
+    //     identities unresolvable, and no repair path (`split_identity` is
+    //     refused `record_merged_away`). W1BR-015 had been recorded CLOSED.
+    //   - `merge A->B` and `delete B`: both committed. A redirected to a
+    //     destroyed record, and every alias pointing at A resolved to nothing.
+    //
+    // The store now locks both records in a fixed order. THIS migration makes
+    // the same serialization a property of the database, for writers that
+    // never come through the store:
+    //
+    //   - the identity-edge guard takes the advisory lock of BOTH endpoints,
+    //     in sorted key order, BEFORE it reads either, using the same key the
+    //     store uses (tenant, workspace, record joined by U+001F). A PL/pgSQL
+    //     statement after the lock takes a fresh snapshot, so it sees what the
+    //     transaction it waited for committed;
+    //   - the merged-away freeze on record versions takes the record's lock
+    //     before it reads the graph, so a version racing an edge waits for it;
+    //   - the counterparty must not merely EXIST: its head must be ACTIVE. An
+    //     edge into a record whose head is `deleted` is an edge into nothing.
+    // ------------------------------------------------------------------
+    id: "043_memory_identity_serialized",
+    sql: `CREATE OR REPLACE FUNCTION public.aaliyah_memory_record_lock(
+        p_tenant text, p_workspace text, p_record text)
+      RETURNS void
+      LANGUAGE sql
+      SET search_path = pg_catalog, public
+      AS $fn$
+        SELECT pg_advisory_xact_lock(
+          hashtextextended(concat_ws(chr(31), p_tenant, p_workspace, p_record), 0));
+      $fn$;
+
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_identity_edge_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        acted text;
+        to_state text;
+      BEGIN
+        -- BOTH ENDS, SORTED, BEFORE ANY READ. Sorted so two writers locking
+        -- the same pair from opposite directions cannot deadlock on order.
+        -- COLLATE "C" is byte order, which is the order the store's
+        -- JavaScript sort produces for these ids. The database's default
+        -- collation is not, and two different orders is a deadlock waiting.
+        IF concat_ws(chr(31), NEW.tenant_id, NEW.workspace_id, NEW.from_record_id) COLLATE "C"
+           < concat_ws(chr(31), NEW.tenant_id, NEW.workspace_id, NEW.to_record_id) COLLATE "C" THEN
+          PERFORM public.aaliyah_memory_record_lock(NEW.tenant_id, NEW.workspace_id, NEW.from_record_id);
+          PERFORM public.aaliyah_memory_record_lock(NEW.tenant_id, NEW.workspace_id, NEW.to_record_id);
+        ELSE
+          PERFORM public.aaliyah_memory_record_lock(NEW.tenant_id, NEW.workspace_id, NEW.to_record_id);
+          PERFORM public.aaliyah_memory_record_lock(NEW.tenant_id, NEW.workspace_id, NEW.from_record_id);
+        END IF;
+
+        SELECT n.action INTO acted
+          FROM public.aaliyah_memory_spent_nonce(
+                 NEW.tenant_id, NEW.authorization_id,
+                 NEW.mutation_receipt_id) AS n
+         WHERE n.target_record_id = NEW.from_record_id
+         LIMIT 1;
+        IF acted IS NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: no consumed authorization witnesses this identity edge'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.kind = 'merged_into' AND acted <> 'merge_identity' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a merge edge requires a merge_identity authorization'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.kind = 'split_to' AND acted <> 'split_identity' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a split edge requires a split_identity authorization'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        SELECT v.state INTO to_state
+          FROM public.memory_record_versions AS v
+         WHERE v.tenant_id = NEW.tenant_id
+           AND v.workspace_id = NEW.workspace_id
+           AND v.principal_id = NEW.principal_id
+           AND v.user_id = NEW.user_id
+           AND v.record_id = NEW.to_record_id
+         ORDER BY v.version DESC
+         LIMIT 1;
+        IF to_state IS NULL THEN
+          RAISE EXCEPTION
+            'aaliyah memory: an identity edge must name a record in the same scope'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF to_state <> 'active' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: an identity edge may not name a record whose head is not active'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.kind = 'merged_into' THEN
+          PERFORM 1 FROM public.memory_identity_edges AS e
+           WHERE e.tenant_id = NEW.tenant_id
+             AND e.workspace_id = NEW.workspace_id
+             AND e.from_record_id = NEW.to_record_id
+             AND e.kind = 'merged_into'
+           LIMIT 1;
+          IF FOUND THEN
+            RAISE EXCEPTION
+              'aaliyah memory: a merge may not name a record that was itself merged away'
+              USING ERRCODE = 'check_violation';
+          END IF;
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_merged_record_frozen()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      BEGIN
+        -- The record's lock first, so a version racing a merge edge on this
+        -- record waits for that edge's transaction and then sees it.
+        PERFORM public.aaliyah_memory_record_lock(NEW.tenant_id, NEW.workspace_id, NEW.record_id);
+        PERFORM 1 FROM public.memory_identity_edges AS e
+         WHERE e.tenant_id = NEW.tenant_id
+           AND e.workspace_id = NEW.workspace_id
+           AND e.from_record_id = NEW.record_id
+           AND e.kind = 'merged_into'
+         LIMIT 1;
+        IF FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a record merged into another accepts no further versions'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$`,
+  },
 ];
 
 /**

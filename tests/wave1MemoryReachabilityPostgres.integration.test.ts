@@ -765,3 +765,68 @@ test("the split order schema is exported for consumers, and a split does not red
   assert.equal(context?.canonicalRecordId, CONTACT);
   assert.equal(context?.resolvedFrom, null);
 });
+
+test("S-6 an alias REDIRECTED to a survivor that cannot be retrieved is refused as unresolvable, never answered as 'no memory'", async () => {
+  // Falsified against b3efc82: A merged into B, B erased, and resolving an
+  // alias of A returned null — "no memory for this contact" — while A itself
+  // was active and held content. Resolution hid evidence.
+  const heldByAbsorbed = {
+    recordId: "a",
+    version: 2,
+    contentDigest: "sha256:" + "a".repeat(64),
+    content: { name: "still here" },
+    scope: SCOPE,
+  };
+  function serviceWith(retrieve: (recordId: string) => unknown) {
+    return createWave1MemoryService({
+      store: {
+        async retrieve(_actor: unknown, recordId: string) {
+          return retrieve(recordId);
+        },
+      } as never,
+      aliases: {
+        async resolveAlias() {
+          return { binding: { canonicalParticipantId: "a" } };
+        },
+      },
+      identityGraph: {
+        async mergedInto(_actor, recordId) {
+          return recordId === "a" ? "b" : null;
+        },
+      },
+      reconciler: { async reconcileAll() { return []; } },
+    });
+  }
+
+  await assert.rejects(
+    () =>
+      serviceWith((id) => (id === "a" ? heldByAbsorbed : null)).resolveExecutiveContext({
+        actor: SCOPE,
+        normalizedAlias: "dana@example.com",
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof MemoryCanonicalResolutionFailed);
+      assert.match(String(error), /canonical record b is not retrievable/);
+      return true;
+    },
+  );
+
+  // Positive control: a retrievable survivor resolves, and says it was followed.
+  const resolved = await serviceWith((id) =>
+    id === "b" ? { ...heldByAbsorbed, recordId: "b" } : null,
+  ).resolveExecutiveContext({ actor: SCOPE, normalizedAlias: "dana@example.com" });
+  assert.equal(resolved?.canonicalRecordId, "b");
+  assert.equal(resolved?.resolvedFrom, "a");
+
+  // And with NO redirect, an unretrievable record is still the honest null.
+  const standalone = createWave1MemoryService({
+    store: { async retrieve() { return null; } } as never,
+    aliases: { async resolveAlias() { return { binding: { canonicalParticipantId: "a" } }; } },
+    identityGraph: { async mergedInto() { return null; } },
+    reconciler: { async reconcileAll() { return []; } },
+  });
+  assert.equal(
+    await standalone.resolveExecutiveContext({ actor: SCOPE, normalizedAlias: "dana@example.com" }),
+    null,
+  );
+});

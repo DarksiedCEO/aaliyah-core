@@ -17,6 +17,7 @@ import {
   MEMORY_IDENTITY_MERGE_ORDER_SCHEMA_VERSION,
   MEMORY_IDENTITY_SPLIT_ORDER_SCHEMA_VERSION,
 } from "../src/application/memory/wave1MemoryIdentity";
+import { MEMORY_DELETION_ORDER_SCHEMA_VERSION } from "../src/application/memory/wave1MemoryErasure";
 import { memoryContentDigest } from "../src/application/memory/wave1TrustedMemory";
 import { runMailMigrations } from "../src/persistence/postgres/migrations";
 import { createPostgresTrustedMemoryStore } from "../src/persistence/postgres/wave1TrustedMemoryStore";
@@ -1017,4 +1018,368 @@ test("ONE AUTHORIZATION CANNOT PRODUCE TWO RECORD VERSIONS — the constraint th
     /no consumed authorization witnesses this record version/,
   );
   assert.equal(await countVersions("record-identity-bob"), 1);
+});
+
+// ---------------------------------------------------------------------------
+// S — AN IDENTITY CHANGE IS SERIALIZED ON BOTH RECORDS (red team, b3efc82).
+//
+// Each race below is DRIVEN, not hoped for: a table lock or an open
+// transaction holds one writer at a known point while the other is started,
+// and `pg_stat_activity` proves the second is where the test says it is before
+// anything is released. A race that did not happen fails the test rather than
+// passing it.
+// ---------------------------------------------------------------------------
+
+async function lockWaiters(): Promise<number> {
+  const result = await adminPool.query(
+    `SELECT count(*)::int AS n
+       FROM pg_stat_activity
+      WHERE datname = current_database()
+        AND wait_event_type = 'Lock'
+        AND cardinality(pg_blocking_pids(pid)) > 0
+        AND (query LIKE '%pg_advisory_xact_lock%'
+             OR query LIKE '%INSERT INTO memory_identity_edges%'
+             OR query LIKE '%INSERT INTO memory_tombstones%'
+             OR query LIKE '%INSERT INTO memory_record_versions%')`,
+  );
+  return result.rows[0].n as number;
+}
+
+/** Wait until `n` memory writers are blocked, or until `settled()` says one finished. */
+async function untilBlocked(n: number, settled: () => boolean = () => false): Promise<void> {
+  const deadline = Date.now() + 4_000;
+  while (Date.now() < deadline) {
+    if ((await lockWaiters()) >= n || settled()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`the interleaving did not happen: fewer than ${n} blocked writers`);
+}
+
+function tracked<T>(promise: Promise<T>): { promise: Promise<T>; settled: () => boolean } {
+  let done = false;
+  const wrapped = promise.finally(() => {
+    done = true;
+  });
+  return { promise: wrapped, settled: () => done };
+}
+
+async function mergeAuthorization(target: string, targetDigest: string, survivor: string) {
+  const order = mergeOrder(survivor);
+  const receipt = await issue(
+    authorization({
+      action: "merge_identity",
+      targetRecordId: target,
+      expectedHead: { kind: "version", version: 1, contentDigest: targetDigest },
+      proposedContent: order,
+    }),
+  );
+  return { receipt, order };
+}
+
+test("S-1 merge A->B racing merge B->A cannot close a cycle: one commits, the other is refused as merged-away", async () => {
+  const bob = "record-identity-bob";
+  const alice = await createRecord(ALICE, { name: "Alice" });
+  const bobDigest = await createRecord(bob, { name: "Bob" });
+  const aToB = await mergeAuthorization(ALICE, alice, bob);
+  const bToA = await mergeAuthorization(bob, bobDigest, ALICE);
+
+  // Gate: nothing may write an identity edge until released. The first merge
+  // gets as far as its edge INSERT and waits there, holding what it holds.
+  const gate = await adminPool.connect();
+  await gate.query("BEGIN");
+  await gate.query("LOCK TABLE memory_identity_edges IN SHARE ROW EXCLUSIVE MODE");
+  let first: ReturnType<typeof tracked>;
+  let second: ReturnType<typeof tracked>;
+  try {
+    first = tracked(
+      store().mergeIdentity({
+        actor: SCOPE,
+        authorizationId: aToB.receipt.authorizationId,
+        recordId: ALICE,
+        proposedContent: aToB.order,
+        mutationReceiptId: "mutation.race.a-to-b",
+      }),
+    );
+    await untilBlocked(1);
+    second = tracked(
+      store().mergeIdentity({
+        actor: SCOPE,
+        authorizationId: bToA.receipt.authorizationId,
+        recordId: bob,
+        proposedContent: bToA.order,
+        mutationReceiptId: "mutation.race.b-to-a",
+      }),
+    );
+    // Before the fix the second merge held only its FROM lock, passed every
+    // unlocked check, and queued behind the gate at its own edge INSERT. After
+    // it, the second waits on the first's lock of the shared pair.
+    await untilBlocked(2);
+  } finally {
+    await gate.query("COMMIT");
+    gate.release();
+  }
+  type MergeResult = Awaited<ReturnType<ReturnType<typeof store>["mergeIdentity"]>>;
+  const results = (await Promise.all([first!.promise, second!.promise])) as MergeResult[];
+
+  const verified = results.filter((r) => r.verified);
+  assert.equal(verified.length, 1, JSON.stringify(results.map((r) => r.rejection)));
+  const refused = results.find((r) => !r.verified)!;
+  // PINNED. A database deadlock abort would also leave one merge standing, as
+  // `storage_rejected`; that is the trigger backstop catching what the store
+  // should have serialized, and it must not pass for the store's fix.
+  assert.equal(refused.rejection, "identity_counterparty_merged_away");
+  const edges = await adminPool.query(`SELECT from_record_id, to_record_id FROM memory_identity_edges`);
+  assert.equal(edges.rowCount, 1);
+});
+
+test("S-2 merge A->B racing delete B cannot merge into a destroyed record", async () => {
+  const bob = "record-identity-bob";
+  const alice = await createRecord(ALICE, { name: "Alice" });
+  const bobDigest = await createRecord(bob, { name: "Bob" });
+  const deletion = {
+    schemaVersion: MEMORY_DELETION_ORDER_SCHEMA_VERSION,
+    reason: "subject_erasure_request",
+    reasonEvidenceRef: "matter:erasure-request/0001",
+  };
+  const deleteReceipt = await issue(
+    authorization({
+      action: "delete",
+      targetRecordId: bob,
+      expectedHead: { kind: "version", version: 1, contentDigest: bobDigest },
+      proposedContent: deletion,
+    }),
+  );
+  const merge = await mergeAuthorization(ALICE, alice, bob);
+
+  // Gate on tombstones: the deletion holds B's lock, has written B's deleted
+  // head, and waits before COMMIT.
+  const gate = await adminPool.connect();
+  await gate.query("BEGIN");
+  await gate.query("LOCK TABLE memory_tombstones IN SHARE ROW EXCLUSIVE MODE");
+  let destroy: ReturnType<typeof tracked>;
+  let merging: ReturnType<typeof tracked>;
+  try {
+    destroy = tracked(
+      store().delete({
+        actor: SCOPE,
+        authorizationId: deleteReceipt.authorizationId,
+        recordId: bob,
+        proposedContent: deletion,
+        mutationReceiptId: "mutation.race.delete-b",
+      }),
+    );
+    await untilBlocked(1);
+    merging = tracked(
+      store().mergeIdentity({
+        actor: SCOPE,
+        authorizationId: merge.receipt.authorizationId,
+        recordId: ALICE,
+        proposedContent: merge.order,
+        mutationReceiptId: "mutation.race.merge-into-b",
+      }),
+    );
+    // Before the fix the merge read B's head unlocked — still `active`, the
+    // deletion uncommitted — and COMMITTED here without ever blocking.
+    await untilBlocked(2, merging.settled);
+  } finally {
+    await gate.query("COMMIT");
+    gate.release();
+  }
+  const deleted = (await destroy!.promise) as { verified: boolean; rejection: string | null };
+  const merged = (await merging!.promise) as { verified: boolean; rejection: string | null };
+
+  assert.equal(deleted.verified, true, deleted.rejection ?? "");
+  assert.equal(merged.verified, false, "a merge into a destroyed record committed");
+  // PINNED to the store's refusal, not the trigger's (`storage_rejected`).
+  assert.equal(merged.rejection, "identity_counterparty_missing");
+  assert.equal((await edgesFor(ALICE)).length, 0);
+  assert.equal(await countVersions(ALICE), 1);
+  assert.equal(await nonceConsumedAt(merge.receipt.nonce.bindingDigest), null);
+});
+
+/** A mutator-role transaction left OPEN, so a second writer can be raced against it. */
+async function openMutatorTransaction() {
+  const client = await adminPool.connect();
+  await client.query("BEGIN");
+  await client.query('SET LOCAL ROLE "aaliyah_memory_mutator"');
+  return client;
+}
+
+const RAW_EDGE_SQL = `INSERT INTO memory_identity_edges
+   (tenant_id, workspace_id, principal_id, user_id, kind,
+    from_record_id, to_record_id, from_version, authorization_id,
+    mutation_receipt_id, reason, reason_evidence_ref, effective_at, payload)
+ VALUES ($1::text,$2::text,$3::text,$4::text,'merged_into',
+         $5::text,$6::text,2,$7::text,$8::text,
+         'duplicate_participant','matter:identity-merge/0003', now(),
+         jsonb_build_object('kind','merged_into',
+           'fromRecordId',$5::text,'toRecordId',$6::text,
+           'authorizationId',$7::text))`;
+
+function rawEdgeParams(from: string, to: string, authorizationId: string, receipt: string) {
+  return [
+    SCOPE.tenantId,
+    SCOPE.workspaceId,
+    SCOPE.principalId,
+    SCOPE.userId,
+    from,
+    to,
+    authorizationId,
+    receipt,
+  ];
+}
+
+test("S-3 the DATABASE serializes reverse merge edges from writers that bypass the store: no cycle", async () => {
+  const bob = "record-identity-bob";
+  const alice = await createRecord(ALICE, { name: "Alice" });
+  const bobDigest = await createRecord(bob, { name: "Bob" });
+  const aAuth = await spendAuthorization({
+    action: "merge_identity",
+    targetRecordId: ALICE,
+    expectedHead: { kind: "version", version: 1, contentDigest: alice },
+    proposedContent: mergeOrder(bob),
+    mutationReceiptId: "mutation.rawrace.a",
+  });
+  const bAuth = await spendAuthorization({
+    action: "merge_identity",
+    targetRecordId: bob,
+    expectedHead: { kind: "version", version: 1, contentDigest: bobDigest },
+    proposedContent: mergeOrder(ALICE),
+    mutationReceiptId: "mutation.rawrace.b",
+  });
+
+  const one = await openMutatorTransaction();
+  const two = await openMutatorTransaction();
+  try {
+    await one.query(RAW_EDGE_SQL, rawEdgeParams(ALICE, bob, aAuth, "mutation.rawrace.a"));
+    const reverse = tracked(
+      two.query(RAW_EDGE_SQL, rawEdgeParams(bob, ALICE, bAuth, "mutation.rawrace.b")),
+    );
+    // Before migration 043 the reverse insert did not wait: its unlocked read
+    // could not see the uncommitted A->B edge, and it returned at once.
+    await untilBlocked(1, reverse.settled);
+    await one.query("COMMIT");
+    await assert.rejects(
+      reverse.promise,
+      /a merge may not name a record that was itself merged away/,
+    );
+    await two.query("ROLLBACK");
+  } finally {
+    await one.query("ROLLBACK").catch(() => undefined);
+    await two.query("ROLLBACK").catch(() => undefined);
+    one.release();
+    two.release();
+  }
+  const edges = await adminPool.query(`SELECT from_record_id FROM memory_identity_edges`);
+  assert.deepEqual(edges.rows.map((r: { from_record_id: string }) => r.from_record_id), [ALICE]);
+});
+
+test("S-4 the DATABASE makes a version racing a merge edge on the same record wait, then refuses it", async () => {
+  const bob = "record-identity-bob";
+  const alice = await createRecord(ALICE, { name: "Alice" });
+  await createRecord(bob, { name: "Bob" });
+  const mergeAuth = await spendAuthorization({
+    action: "merge_identity",
+    targetRecordId: ALICE,
+    expectedHead: { kind: "version", version: 1, contentDigest: alice },
+    proposedContent: mergeOrder(bob),
+    mutationReceiptId: "mutation.rawrace.merge",
+  });
+  const next = { name: "Alice", note: "raced edit" };
+  const correctAuth = await spendAuthorization({
+    action: "correct",
+    targetRecordId: ALICE,
+    expectedHead: { kind: "version", version: 1, contentDigest: alice },
+    proposedContent: next,
+    mutationReceiptId: "mutation.rawrace.correct",
+  });
+
+  const edgeTx = await openMutatorTransaction();
+  const versionTx = await openMutatorTransaction();
+  try {
+    await edgeTx.query(RAW_EDGE_SQL, rawEdgeParams(ALICE, bob, mergeAuth, "mutation.rawrace.merge"));
+    const version = tracked(
+      versionTx.query(
+        `INSERT INTO memory_record_versions
+           (tenant_id, workspace_id, principal_id, user_id, record_id, version,
+            state, content_digest, predecessor_digest, authorization_id,
+            mutation_receipt_id, payload)
+         VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,2,'active',
+                 $6::text,$7::text,$8::text,'mutation.rawrace.correct',
+                 jsonb_build_object(
+                   'recordId',$5::text,'version','2','state','active',
+                   'contentDigest',$6::text,'predecessorDigest',$7::text,
+                   'authorizationId',$8::text,
+                   'mutationReceiptId','mutation.rawrace.correct',
+                   'scope', jsonb_build_object('tenantId',$1::text,
+                                               'workspaceId',$2::text,
+                                               'principalId',$3::text,
+                                               'userId',$4::text)))`,
+        [
+          SCOPE.tenantId,
+          SCOPE.workspaceId,
+          SCOPE.principalId,
+          SCOPE.userId,
+          ALICE,
+          memoryContentDigest(next),
+          alice,
+          correctAuth,
+        ],
+      ),
+    );
+    await untilBlocked(1, version.settled);
+    await edgeTx.query("COMMIT");
+    await assert.rejects(version.promise, /merged into another accepts no further versions/);
+    await versionTx.query("ROLLBACK");
+  } finally {
+    await edgeTx.query("ROLLBACK").catch(() => undefined);
+    await versionTx.query("ROLLBACK").catch(() => undefined);
+    edgeTx.release();
+    versionTx.release();
+  }
+  assert.equal(await countVersions(ALICE), 1);
+});
+
+test("S-5 the DATABASE refuses an edge into a record whose head is deleted", async () => {
+  const bob = "record-identity-bob";
+  const alice = await createRecord(ALICE, { name: "Alice" });
+  const bobDigest = await createRecord(bob, { name: "Bob" });
+  const deletion = {
+    schemaVersion: MEMORY_DELETION_ORDER_SCHEMA_VERSION,
+    reason: "subject_erasure_request",
+    reasonEvidenceRef: "matter:erasure-request/0001",
+  };
+  const deleteReceipt = await issue(
+    authorization({
+      action: "delete",
+      targetRecordId: bob,
+      expectedHead: { kind: "version", version: 1, contentDigest: bobDigest },
+      proposedContent: deletion,
+    }),
+  );
+  const deleted = await store().delete({
+    actor: SCOPE,
+    authorizationId: deleteReceipt.authorizationId,
+    recordId: bob,
+    proposedContent: deletion,
+    mutationReceiptId: "mutation.delete.bob",
+  });
+  assert.equal(deleted.verified, true, deleted.rejection ?? "");
+  const mergeAuth = await spendAuthorization({
+    action: "merge_identity",
+    targetRecordId: ALICE,
+    expectedHead: { kind: "version", version: 1, contentDigest: alice },
+    proposedContent: mergeOrder(bob),
+    mutationReceiptId: "mutation.raw.into-deleted",
+  });
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        RAW_EDGE_SQL,
+        rawEdgeParams(ALICE, bob, mergeAuth, "mutation.raw.into-deleted"),
+      ),
+    /may not name a record whose head is not active/,
+  );
+  assert.equal((await edgesFor(ALICE)).length, 0);
 });

@@ -89,9 +89,11 @@ export type Wave1MemoryService = {
   /**
    * alias -> identity -> canonical identity -> authoritative record.
    *
-   * Null when the alias is unknown here, or when the record it names cannot be
-   * retrieved (deleted, erased, or outside this actor's scope). Null is an
-   * ANSWER: it means "no memory to bring", never "assume none".
+   * Null when the alias is unknown here, or when the record it names — with no
+   * merge redirect — cannot be retrieved (deleted, erased, or outside this
+   * actor's scope). Null is an ANSWER: it means "no memory to bring", never
+   * "assume none". A redirect whose canonical record cannot be retrieved
+   * THROWS `MemoryCanonicalResolutionFailed`: that is not an absence.
    */
   resolveExecutiveContext(input: {
     actor: TrustedMemoryActor;
@@ -163,7 +165,23 @@ export function createWave1MemoryService(
       // erased record, which is the behaviour a context consumer needs: a
       // destroyed identity must not come back as context.
       const record = await deps.store.retrieve(input.actor, canonicalRecordId);
-      if (record === null) return null;
+      if (record === null) {
+        // NULL MEANS "NO MEMORY" ONLY WHEN NOTHING WAS FOLLOWED. Falsified
+        // against b3efc82: once an alias had been REDIRECTED to a survivor
+        // that is not retrievable, answering null reported "no memory for
+        // this contact" while the absorbed record the alias actually names
+        // still held content — resolution hiding evidence. A redirect to
+        // nothing is not an absence; it is resolution that could not be
+        // completed, and it is refused as such so a consumer marks memory
+        // UNAVAILABLE rather than empty.
+        if (canonicalRecordId !== named) {
+          throw new MemoryCanonicalResolutionFailed(
+            named,
+            `canonical record ${canonicalRecordId} is not retrievable`,
+          );
+        }
+        return null;
+      }
 
       return {
         canonicalRecordId,
