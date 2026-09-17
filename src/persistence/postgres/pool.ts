@@ -51,6 +51,17 @@ const stderrSink: PoolErrorSink = (event) => {
  * checkout opens a fresh connection. There is nothing to recover beyond
  * recording that it happened.
  *
+ * A CHECKED-OUT CLIENT NEEDS ITS OWN LISTENER. Found by the 2b2e554
+ * reliability review: pg-pool removes its idle listener the moment a client is
+ * checked out and re-attaches it only on release, so the pool-level listener
+ * covers idle clients only. When a backend dies mid-transaction, the in-flight
+ * query rejects catchably, but the client ALSO emits `'error'` — and the
+ * store's own `ROLLBACK ... .catch(() => undefined)` on that dead client then
+ * crashed the process from outside every promise chain. Every client this pool
+ * opens therefore carries a permanent listener from the moment it connects,
+ * idle or not. The failure itself still reaches the caller: the query that hit
+ * the dead connection rejects, and so does anything issued after it.
+ *
  * The sink is called inside a try: a logger that throws must not re-create the
  * crash this listener exists to prevent.
  */
@@ -59,7 +70,7 @@ export function guardPoolErrors(
   name: string,
   sink: PoolErrorSink = stderrSink,
 ): Pool {
-  pool.on("error", (error: Error & { code?: string }) => {
+  const record = (error: Error & { code?: string }) => {
     try {
       sink({
         pool: name,
@@ -69,6 +80,10 @@ export function guardPoolErrors(
     } catch {
       // Deliberately swallowed. See above.
     }
+  };
+  pool.on("error", record);
+  pool.on("connect", (client) => {
+    client.on("error", record);
   });
   return pool;
 }

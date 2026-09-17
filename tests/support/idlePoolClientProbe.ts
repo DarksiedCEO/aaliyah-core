@@ -10,6 +10,14 @@
  *
  * Mode `unguarded` builds a bare Pool with no listener. It is the POSITIVE
  * CONTROL: it must die, or the probe cannot detect the defect at all.
+ *
+ * A second argument `active` holds the client CHECKED OUT instead, inside a
+ * transaction running `pg_sleep`, and prints that backend's pid while the
+ * statement is in flight. The parent terminates it; the probe then does
+ * exactly what every store does on failure — `ROLLBACK` with a `.catch`, then
+ * release. Found by the 2b2e554 reliability review: pg-pool removes its idle
+ * error listener at checkout, so the dead client's `'error'` event is thrown
+ * outside every promise chain and no `.catch` can intercept it.
  */
 import { Pool } from "pg";
 import * as readline from "node:readline";
@@ -36,8 +44,24 @@ async function main(): Promise<void> {
   }
   const client = await pool.connect();
   const pid = (await client.query("SELECT pg_backend_pid() AS pid")).rows[0].pid as number;
-  client.release();
-  process.stdout.write(`${JSON.stringify({ idleBackendPid: pid })}\n`);
+  if (process.argv[3] === "active") {
+    await client.query("BEGIN");
+    const inFlight = client.query("SELECT pg_sleep(30)");
+    process.stdout.write(`${JSON.stringify({ activeBackendPid: pid })}\n`);
+    try {
+      await inFlight;
+      throw new Error("the in-flight statement was never terminated");
+    } catch (error) {
+      process.stdout.write(`${JSON.stringify({ statementRejected: (error as { code?: string }).code ?? String(error) })}\n`);
+    }
+    // The store cleanup pattern, verbatim.
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+    process.stdout.write(`${JSON.stringify({ cleanedUp: true })}\n`);
+  } else {
+    client.release();
+    process.stdout.write(`${JSON.stringify({ idleBackendPid: pid })}\n`);
+  }
 
   const lines = readline.createInterface({ input: process.stdin });
   for await (const line of lines) {

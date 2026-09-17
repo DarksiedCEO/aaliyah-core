@@ -43,11 +43,14 @@ type ProbeOutcome = {
  * then ask the probe to prove its pool still works. Bounded throughout: a probe
  * that never reports a pid, or never exits, fails this test instead of hanging.
  */
-function runProbe(mode: "mail" | "idempotency" | "unguarded"): Promise<ProbeOutcome> {
+function runProbe(
+  mode: "mail" | "idempotency" | "unguarded",
+  state: "idle" | "active" = "idle",
+): Promise<ProbeOutcome> {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
-      ["--require", "ts-node/register", path.join("tests/support/idlePoolClientProbe.ts"), mode],
+      ["--require", "ts-node/register", path.join("tests/support/idlePoolClientProbe.ts"), mode, state],
       {
         cwd: ROOT,
         env: { ...process.env, AALIYAH_DATABASE_URL: DB_URL, NODE_TEST_CONTEXT: "" },
@@ -64,7 +67,7 @@ function runProbe(mode: "mail" | "idempotency" | "unguarded"): Promise<ProbeOutc
     child.stderr.on("data", (chunk) => (stderr += chunk));
     child.stdout.on("data", async (chunk) => {
       stdout += chunk;
-      const match = /"idleBackendPid":(\d+)/.exec(stdout);
+      const match = /"(?:idle|active)BackendPid":(\d+)/.exec(stdout);
       if (match && terminatedPid === -1) {
         terminatedPid = Number(match[1]);
         await adminPool.query("SELECT pg_terminate_backend($1)", [terminatedPid]);
@@ -100,6 +103,31 @@ test("the idempotency store's pool SURVIVES a terminated idle backend and keeps 
   const outcome = await runProbe("idempotency");
   assert.equal(outcome.exitCode, 0, `stderr: ${outcome.stderr}`);
   assert.match(outcome.stderr, /"event":"postgres_idle_client_error","pool":"idempotency","code":"57P01"/);
+  assert.match(outcome.stdout, /"recovered":true/);
+});
+
+test("POSITIVE CONTROL: a CHECKED-OUT client terminated mid-transaction kills an unguarded pool's process at ROLLBACK", async () => {
+  const outcome = await runProbe("unguarded", "active");
+  assert.ok(outcome.terminatedPid > 0);
+  assert.match(outcome.stdout, /"statementRejected":"57P01"/, "the in-flight statement itself rejects catchably");
+  assert.notEqual(outcome.exitCode, 0, "the probe must be able to observe the crash");
+  assert.doesNotMatch(outcome.stdout, /"recovered"/);
+});
+
+test("the mail pool SURVIVES a backend terminated while its client is CHECKED OUT in a transaction", async () => {
+  // 2b2e554 reliability CRITICAL: guardPoolErrors covered idle clients only.
+  const outcome = await runProbe("mail", "active");
+  assert.equal(outcome.exitCode, 0, `stderr: ${outcome.stderr}`);
+  assert.match(outcome.stdout, /"statementRejected":"57P01"/);
+  assert.match(outcome.stdout, /"cleanedUp":true/);
+  assert.match(outcome.stdout, /"poolError":\{"pool":"probe"/);
+  assert.match(outcome.stdout, /"recovered":true/);
+});
+
+test("the idempotency store's pool SURVIVES a backend terminated while its client is CHECKED OUT", async () => {
+  const outcome = await runProbe("idempotency", "active");
+  assert.equal(outcome.exitCode, 0, `stderr: ${outcome.stderr}`);
+  assert.match(outcome.stdout, /"cleanedUp":true/);
   assert.match(outcome.stdout, /"recovered":true/);
 });
 
