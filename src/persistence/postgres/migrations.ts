@@ -4695,6 +4695,44 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
     GRANT USAGE, SELECT ON SEQUENCE memory_alias_blind_indexes_id_seq,
       memory_pii_key_erasures_id_seq TO aaliyah_memory_mutator`,
   },
+  {
+    // ------------------------------------------------------------------
+    // pg_temp IS SEARCHED LAST, EXPLICITLY, BY EVERY GUARD.
+    //
+    // Found while building the Priority 6 database attack matrix. Every
+    // aaliyah_* function pins `search_path = pg_catalog, public` — and
+    // PostgreSQL searches the session's TEMPORARY schema FIRST for relation
+    // names unless `pg_temp` is named in the path. Every role in this database
+    // holds TEMP. So an unqualified table reference inside a SECURITY DEFINER
+    // guard would resolve to a temp table the CALLER created: a forged
+    // authorization receipt, a nonce, a tombstone, answered by the guard as if
+    // it were stored state.
+    //
+    // Today every relation reference in those bodies is `public.`-qualified,
+    // which is why this was not exploitable. That is a property of how 48
+    // migrations happened to be written, not an enforced one — the next
+    // function could omit a qualifier and nothing would say so. Naming pg_temp
+    // LAST makes the qualifier a second line rather than the only one, and the
+    // attached test pins it for every function, present and future.
+    // ------------------------------------------------------------------
+    id: "048_memory_functions_pg_temp_last",
+    sql: `DO $do$
+      DECLARE
+        fn record;
+      BEGIN
+        FOR fn IN
+          SELECT p.oid::regprocedure AS signature
+            FROM pg_catalog.pg_proc AS p
+            JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
+           WHERE n.nspname = 'public' AND p.proname LIKE 'aaliyah\\_%'
+        LOOP
+          EXECUTE pg_catalog.format(
+            'ALTER FUNCTION %s SET search_path = pg_catalog, public, pg_temp',
+            fn.signature);
+        END LOOP;
+      END
+      $do$`,
+  },
 ];
 
 /**

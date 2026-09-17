@@ -5376,3 +5376,86 @@ test("C6 an ATTEMPT cannot be rewritten or deleted, by anyone", async () => {
   );
   assert.equal((await attemptsFor("mutation.attempt.immutable")).length, 1);
 });
+
+// ---------------------------------------------------------------------------
+// T — THE TEMPORARY SCHEMA CANNOT SHADOW A GUARD'S STORED STATE (migration 048).
+// ---------------------------------------------------------------------------
+
+test("T-1 every aaliyah_* database function searches pg_temp LAST, explicitly", async () => {
+  const functions = await adminPool.query(
+    `SELECT p.proname, p.proconfig
+       FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public' AND p.proname LIKE 'aaliyah\\_%'`,
+  );
+  assert.ok((functions.rowCount ?? 0) >= 30, "the population is the guard functions, not an empty set");
+  const offenders = functions.rows
+    .filter(
+      (row: { proconfig: string[] | null }) =>
+        !(row.proconfig ?? []).includes("search_path=pg_catalog, public, pg_temp"),
+    )
+    .map((row: { proname: string }) => row.proname);
+  assert.deepEqual(offenders, []);
+});
+
+test("T-2 a TEMP TABLE forging an authorization receipt does not satisfy the genesis owner binding", async () => {
+  // The attacker holds the mutation role, which holds TEMP, and one genuine
+  // spent authorization for its OWN scope. It shadows the receipt table in its
+  // session with a forged row naming the victim's principal, then plants a
+  // genesis under the victim. If any guard resolved `memory_authorization_receipts`
+  // through the session's search_path, the forged row would answer.
+  const victim: MemoryScope = { ...SCOPE, principalId: "principal-shadowed", userId: "user-shadowed" };
+  const recordId = "record-memory-shadow";
+  const authorizationId = "shadow-000000000000000000001";
+  await witnessAppend({ authorizationId, mutationReceiptId: "mutation.shadow", recordId, scope: SCOPE, action: "create" });
+  const content = { note: "planted through a shadow table" };
+  const digest = memoryContentDigest(content);
+  const client = await adminPool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query('SET LOCAL ROLE "aaliyah_memory_mutator"');
+    await client.query(
+      `CREATE TEMP TABLE memory_authorization_receipts
+         (LIKE public.memory_authorization_receipts) ON COMMIT DROP`,
+    );
+    await client.query(
+      `INSERT INTO pg_temp.memory_authorization_receipts
+         (id, tenant_id, workspace_id, principal_id, user_id, authorization_id, action,
+          target_record_id, binding_digest, issued_at, expires_at, payload, created_at)
+       VALUES (1,$1,$2,$3,$4,$5,'create',$6,$7, now(), now() + interval '1 hour', '{}'::jsonb, now())`,
+      [victim.tenantId, victim.workspaceId, victim.principalId, victim.userId, authorizationId, recordId, `sha256:${"9".repeat(64)}`],
+    );
+    await assert.rejects(
+      client.query(
+        FORGED_VERSION_SQL,
+        [
+          victim.tenantId,
+          victim.workspaceId,
+          victim.principalId,
+          victim.userId,
+          recordId,
+          1,
+          "active",
+          digest,
+          null,
+          authorizationId,
+          "mutation.shadow",
+          versionPayload({
+            recordId,
+            version: 1,
+            contentDigest: digest,
+            predecessorDigest: null,
+            authorizationId,
+            mutationReceiptId: "mutation.shadow",
+            content,
+            scope: victim,
+          }),
+        ],
+      ),
+      /a record chain must begin under the scope its authorization names/,
+    );
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
+  assert.equal(await countVersions(recordId), 0);
+});
