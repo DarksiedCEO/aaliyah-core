@@ -160,6 +160,15 @@ function childEnv(options) {
   // runner needs is on its own argv, so the variable is dropped entirely and
   // what was dropped is recorded in the evidence.
   delete env.NODE_OPTIONS;
+  // The same holds for the compiler every worker is started with. Red team F1
+  // against 3ba769f: an inherited TS_NODE_PROJECT pointed ts-node at a
+  // tsconfig whose "ts-node".require preloaded code that swallowed test
+  // failures, and a failing fixture was PASS. The runner's own tsconfig is the
+  // only one it compiles with; every inherited TS_NODE_* is dropped and
+  // recorded.
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("TS_NODE_")) delete env[key];
+  }
   return env;
 }
 
@@ -266,6 +275,9 @@ async function main() {
     durationMs: null,
     environment: {
       nodeOptionsIgnored: process.env.NODE_OPTIONS ?? null,
+      tsNodeIgnored: Object.fromEntries(
+        Object.entries(process.env).filter(([key]) => key.startsWith("TS_NODE_")),
+      ),
     },
     bounds: {
       testTimeoutMs: options.testTimeoutMs,

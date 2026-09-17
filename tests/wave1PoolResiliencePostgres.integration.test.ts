@@ -6,6 +6,10 @@ import { Pool } from "pg";
 
 import { createMailDbPool, MAIL_DB_POOL_BOUNDS } from "../src/persistence/postgres/pool";
 import { createReadinessProbe } from "../src/http/readiness";
+import { runMailMigrations } from "../src/persistence/postgres/migrations";
+import { createPostgresWave1MemoryService } from "../src/persistence/postgres/wave1IdentityGraphStore";
+import { TEST_PII_KEYS } from "./support/piiKeys";
+import { lockSharedMemoryTables } from "./support/sharedMemoryTables";
 
 /**
  * RELIABILITY FINDINGS AGAINST b3efc82, REPRODUCED AND PINNED.
@@ -217,4 +221,54 @@ test("server.ts hands the read-back pool to readiness (wiring, not just capabili
   assert.match(source, /createReadinessProbe\(\{[\s\S]*?readPool \? \{ readPool \}/);
   assert.match(source, /createMailDbPool\(process\.env, \{ name: "write" \}\)/);
   assert.match(source, /createMailDbPool\(process\.env, \{ name: "read" \}\)/);
+});
+
+test("boot's recovery passes against a reachable but WEDGED database are refused within their bounds, never hang", async () => {
+  // Reliability gap named against 3ba769f: the boot composition in
+  // src/server.ts (reconcilePending, then completePendingErasures) had been
+  // verified only through its lock/timeout primitives. This drives the real
+  // service, built exactly as server.ts builds it but with a key provider so
+  // the erasure pass actually reads, while another session holds ACCESS
+  // EXCLUSIVE locks on the tables each pass reads first.
+  await runMailMigrations(adminPool);
+  // It wedges tables other files TRUNCATE and write, so it holds the suite's
+  // shared memory-table lock for its whole duration, like every such file.
+  const sharedTableLock = await lockSharedMemoryTables(adminPool);
+  const write = createMailDbPool({ AALIYAH_DATABASE_URL: DB_URL } as NodeJS.ProcessEnv, { name: "boot-write", onError: () => undefined });
+  const read = createMailDbPool({ AALIYAH_DATABASE_URL: DB_URL } as NodeJS.ProcessEnv, { name: "boot-read", onError: () => undefined });
+  const service = createPostgresWave1MemoryService(write, read, { piiKeys: TEST_PII_KEYS });
+  const wedge = await adminPool.connect();
+  const bound = MAIL_DB_POOL_BOUNDS.lockTimeoutMs + 10_000;
+  const timed = async (label: string, run: () => Promise<unknown>) => {
+    const started = Date.now();
+    const outcome = await Promise.race([
+      run().then(
+        () => "resolved",
+        (error: { code?: string; message?: string }) => `rejected:${error.code ?? error.message}`,
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve("STILL_WAITING"), bound + 20_000)),
+    ]);
+    return { label, outcome, elapsed: Date.now() - started };
+  };
+  try {
+    await wedge.query("BEGIN");
+    await wedge.query("LOCK TABLE memory_mutation_receipts, memory_pii_key_erasures IN ACCESS EXCLUSIVE MODE");
+    const reconcile = await timed("reconcilePending", () => service.reconcilePending());
+    const erasures = await timed("completePendingErasures", () => service.completePendingErasures());
+    for (const result of [reconcile, erasures]) {
+      assert.notEqual(result.outcome, "STILL_WAITING", JSON.stringify(result));
+      assert.match(result.outcome, /^rejected:55P03$/, JSON.stringify(result));
+      assert.ok(result.elapsed < bound, JSON.stringify(result));
+    }
+    await wedge.query("ROLLBACK");
+    // Positive control: with the wedge gone, both passes complete.
+    assert.equal(typeof (await service.reconcilePending()), "number");
+    assert.deepEqual(Object.keys(await service.completePendingErasures()).sort(), ["destroyed", "pending"]);
+  } finally {
+    await wedge.query("ROLLBACK").catch(() => undefined);
+    wedge.release();
+    await write.end();
+    await read.end();
+    await sharedTableLock.release();
+  }
 });

@@ -1,0 +1,4 @@
+{
+  "extends": "../../../tsconfig.json",
+  "ts-node": { "require": ["./preload.cjs"] }
+}

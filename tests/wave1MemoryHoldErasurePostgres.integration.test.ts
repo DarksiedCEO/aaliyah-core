@@ -4543,3 +4543,84 @@ test("K-6 RED TEAM RT2-K1: a key_destroyed row forged for a LIVE key does not st
   // Idempotent: a second pass finds the evidence true and does nothing.
   assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 0, pending: 0 });
 });
+
+/** Bind `<n>.person@example.com` to its own participant, honestly. */
+async function bindNumberedParticipant(n: number) {
+  await setAliasPolicy();
+  const participant = `participant-starve-${n}`;
+  const genesis = await seedGenesis({ participant, generation: 1 }, { recordId: participant });
+  const evidence = evidenceFor(participant);
+  const alias = aliasIdentity({ aliasId: `alias-starve-${n}`, observedAlias: `person${n}@example.com`, participantId: participant, evidence });
+  const content = { participant, generation: 2 };
+  const receipt = await issue(
+    authorization({
+      action: "assign_alias",
+      targetRecordId: participant,
+      expectedHead: headOf(1, genesis),
+      proposedContentDigest: await testAliasAssignmentDigest({ record: content, alias, evidence, scope: SCOPE }),
+    }),
+  );
+  const bound = await aliases().assignAlias({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    participantRecordId: participant,
+    alias,
+    evidence,
+    proposedContent: content,
+    mutationReceiptId: `mutation.starve.bind.${n}`,
+  });
+  assert.equal(bound.verified, true, bound.rejection ?? "");
+  const keyRef = (await bindingState(`alias-starve-${n}`)).pii_key_ref;
+  return { participant, keyRef };
+}
+
+async function forgeKeyDestroyed(tombstoneId: string) {
+  await runAs(
+    "aaliyah_memory_mutator",
+    `INSERT INTO memory_pii_key_erasures (tenant_id, workspace_id, tombstone_id, alias_id, binding_mutation_receipt_id, key_ref, provider_id, event)
+     SELECT tenant_id, workspace_id, tombstone_id, alias_id, binding_mutation_receipt_id, key_ref, provider_id, 'key_destroyed'
+       FROM memory_pii_key_erasures WHERE tombstone_id = $1 AND event = 'erasure_committed'`,
+    [tombstoneId],
+  );
+}
+
+async function eraseDuringOutage(participant: string, tag: string) {
+  TEST_PII_KEYS.setAvailable(false);
+  try {
+    const { result } = await eraseRecordAtHead(participant, `mutation.starve.${tag}`, `tombstone-starve-${tag}`);
+    assert.equal(result.rejection, "erasure_incomplete");
+  } finally {
+    TEST_PII_KEYS.setAvailable(true);
+  }
+}
+
+test("K-7 a forged key_destroyed row is audited on every pass, however many SETTLED rows sit ahead of it", async () => {
+  // Red team F2 against 3ba769f (RT3-KSTARVE), at batch limit 1 instead of 100.
+  const settled = await bindNumberedParticipant(1);
+  const { result } = await eraseRecordAtHead(settled.participant, "mutation.starve.settled", "tombstone-starve-settled");
+  assert.equal(result.verified, true, result.rejection ?? "");
+  const victim = await bindNumberedParticipant(2);
+  await eraseDuringOutage(victim.participant, "victim");
+  await forgeKeyDestroyed("tombstone-starve-victim");
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: victim.keyRef }), "active");
+
+  assert.deepEqual(await store().completePendingAliasErasures(1), { destroyed: 1, pending: 0 });
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: victim.keyRef }), "destroyed");
+  // Positive control: the settled key was, and stays, destroyed; a further pass finds nothing to do.
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: settled.keyRef }), "destroyed");
+  assert.deepEqual(await store().completePendingAliasErasures(1), { destroyed: 0, pending: 0 });
+});
+
+test("K-8 a forged key_destroyed row is audited on every pass, however many PENDING erasures are ahead of it", async () => {
+  // Reliability MEDIUM against 3ba769f: the audit shared one LIMIT with the
+  // pending work, so a backlog at the limit starved it.
+  const pending = await bindNumberedParticipant(3);
+  await eraseDuringOutage(pending.participant, "pending");
+  const victim = await bindNumberedParticipant(4);
+  await eraseDuringOutage(victim.participant, "victim4");
+  await forgeKeyDestroyed("tombstone-starve-victim4");
+
+  assert.deepEqual(await store().completePendingAliasErasures(1), { destroyed: 2, pending: 0 });
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: victim.keyRef }), "destroyed");
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: pending.keyRef }), "destroyed");
+});

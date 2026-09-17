@@ -2053,28 +2053,49 @@ export function createPostgresTrustedMemoryStore(
       await client.query("BEGIN");
       await enterRole(client, mutationRole);
       const found = await client.query(
-        // Keys already EVIDENCED destroyed are included too, after the rest.
-        // Red team M2 against 2b2e554: the mutation role could insert a
-        // `key_destroyed` row for a key that was still alive, and this pass
-        // then never looked at it again. The database cannot see a key
-        // outside it, so the evidence row is not trusted here: the provider
-        // is asked, and a contradicted row's key is destroyed.
+        // Keys NOT yet evidenced destroyed, bounded by the batch limit.
         `SELECT c.tenant_id, c.workspace_id, c.tombstone_id, c.alias_id,
                 c.binding_mutation_receipt_id, c.key_ref, c.provider_id,
-                EXISTS (
-                  SELECT 1 FROM memory_pii_key_erasures AS d
-                   WHERE d.tenant_id = c.tenant_id AND d.workspace_id = c.workspace_id
-                     AND d.key_ref = c.key_ref AND d.event = 'key_destroyed') AS evidenced
+                false AS evidenced
            FROM memory_pii_key_erasures AS c
           WHERE c.event = 'erasure_committed'
             AND ($1::text IS NULL OR c.tenant_id = $1)
             AND ($2::text IS NULL OR c.workspace_id = $2)
             AND ($3::text IS NULL OR c.tombstone_id = $3)
-          ORDER BY evidenced, c.id
+            AND NOT EXISTS (
+              SELECT 1 FROM memory_pii_key_erasures AS d
+               WHERE d.tenant_id = c.tenant_id AND d.workspace_id = c.workspace_id
+                 AND d.key_ref = c.key_ref AND d.event = 'key_destroyed')
+          ORDER BY c.id
           LIMIT $4`,
         [filter.tenantId ?? null, filter.workspaceId ?? null, filter.tombstoneId ?? null, filter.limit],
       );
-      due = found.rows;
+      // Keys already EVIDENCED destroyed, audited against the provider, and
+      // NOT under the batch limit. Red team M2 against 2b2e554: the mutation
+      // role can insert `key_destroyed` for a key that is still alive, and the
+      // database cannot see a key outside it, so the row is not trusted. Red
+      // team F2 and the reliability review against 3ba769f: when the audit
+      // shared one LIMIT with the pending work, 100 settled rows ahead of a
+      // forged one, or 100 pending rows, kept the forged row out of every pass.
+      // Every evidenced key of this provider is asked about on every pass.
+      const evidenced = await client.query(
+        `SELECT c.tenant_id, c.workspace_id, c.tombstone_id, c.alias_id,
+                c.binding_mutation_receipt_id, c.key_ref, c.provider_id,
+                true AS evidenced
+           FROM memory_pii_key_erasures AS c
+          WHERE c.event = 'erasure_committed'
+            AND ($1::text IS NULL OR c.tenant_id = $1)
+            AND ($2::text IS NULL OR c.workspace_id = $2)
+            AND ($3::text IS NULL OR c.tombstone_id = $3)
+            AND c.provider_id = $4
+            AND EXISTS (
+              SELECT 1 FROM memory_pii_key_erasures AS d
+               WHERE d.tenant_id = c.tenant_id AND d.workspace_id = c.workspace_id
+                 AND d.key_ref = c.key_ref AND d.event = 'key_destroyed')
+          ORDER BY c.id`,
+        [filter.tenantId ?? null, filter.workspaceId ?? null, filter.tombstoneId ?? null, piiKeys?.providerId ?? null],
+      );
+      due = [...found.rows, ...evidenced.rows];
       if (filter.tombstoneId !== undefined) {
         erased = (
           await client.query(

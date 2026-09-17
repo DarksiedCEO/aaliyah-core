@@ -274,3 +274,31 @@ test("an inherited NODE_OPTIONS cannot deselect a failing test: it is dropped, r
     "--test-skip-pattern=failing",
   );
 });
+
+test("an inherited TS_NODE_PROJECT cannot preload code into the workers: it is dropped, recorded, and the run is FAIL", () => {
+  // Red team F1 against 3ba769f.
+  const hostile = path.join(ROOT, FIXTURES, "hostile-ts-node/tsconfig.json");
+  // POSITIVE CONTROL: the fixture really is hostile — a bare runner that honours
+  // the inherited variable reports the failing test as passed.
+  const bare = spawnSync(
+    process.execPath,
+    ["--require", "ts-node/register", "--test", path.join(FIXTURES, "one-failing-among-two.fixture.cjs")],
+    {
+      cwd: ROOT,
+      encoding: "utf8",
+      timeout: 60_000,
+      killSignal: "SIGKILL",
+      env: Object.fromEntries(
+        Object.entries({ ...process.env, TS_NODE_PROJECT: hostile }).filter(([key]) => key !== "NODE_TEST_CONTEXT"),
+      ),
+    },
+  );
+  assert.match(bare.stdout, /ℹ fail 0/, bare.stdout + bare.stderr);
+  const run = runWatchdog(["one-failing-among-two.fixture.cjs"], FAST, { TS_NODE_PROJECT: hostile });
+  assertFail(run, /^FAILED_TESTS: 1$/);
+  assert.deepEqual(
+    (run.evidence as unknown as { environment: { tsNodeIgnored: Record<string, string> } }).environment
+      .tsNodeIgnored,
+    { TS_NODE_PROJECT: hostile },
+  );
+});
