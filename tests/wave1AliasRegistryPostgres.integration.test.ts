@@ -630,6 +630,7 @@ async function appendAliasVersion(input: {
   targetRecordId: string;
   scope?: MemoryScope;
   action?: string;
+  content?: unknown;
 }): Promise<void> {
   const scope = input.scope ?? SCOPE;
   let head = await adminPool.query(
@@ -648,7 +649,7 @@ async function appendAliasVersion(input: {
     );
   }
   const version = (head.rows[0].version as number) + 1;
-  const content = successorContent(input.targetRecordId, version);
+  const content = input.content ?? successorContent(input.targetRecordId, version);
   const digest = memoryContentDigest(content);
   const payload = {
     schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
@@ -4165,6 +4166,70 @@ test("Q-4 an alias mutation that did NOT extend the head it authorized reconcile
   const [verdict] = await createPostgresMemoryReconciler(writePool).reconcileAll();
   assert.equal(verdict?.verdict, "COMMITTED_DIVERGED");
   assert.equal(verdict?.evidence.aliasEffectPresent, true);
+});
+
+test("Q-5 ABA: an alias mutation extending a LATER version whose digest equals the authorized head's reconciles to COMMITTED_DIVERGED", async () => {
+  // Sweep survivor FX-16 at f59a6f7: Q-4 changed the digest as well as the
+  // version, so the predecessor-digest comparison alone killed it. Here the
+  // record returns to its authorized content at v3, so only the VERSION
+  // comparison can tell that v1 is not the head this mutation extended.
+  const prepared = await prepareAssign({ aliasId: "alias-q5", observedAlias: "ceo@example.com", participantId: VICTIM });
+  const { authorizationId, nonce } = prepared.receipt;
+  const genesisContent = successorContent(VICTIM, 1);
+  assert.equal(memoryContentDigest(genesisContent), prepared.genesis);
+  await witnessAppend({ authorizationId: "auth-q5-away-0000000000000000", mutationReceiptId: "mutation.q5.away", targetRecordId: VICTIM, action: "assign_alias" });
+  await appendAliasVersion({ authorizationId: "auth-q5-away-0000000000000000", mutationReceiptId: "mutation.q5.away", targetRecordId: VICTIM });
+  await witnessAppend({ authorizationId: "auth-q5-back-0000000000000000", mutationReceiptId: "mutation.q5.back", targetRecordId: VICTIM, action: "assign_alias" });
+  await appendAliasVersion({ authorizationId: "auth-q5-back-0000000000000000", mutationReceiptId: "mutation.q5.back", targetRecordId: VICTIM, content: genesisContent });
+  await spendNonce(nonce.bindingDigest, "mutation.q5");
+  await appendAliasVersion({ authorizationId, mutationReceiptId: "mutation.q5", targetRecordId: VICTIM });
+  const extended = await adminPool.query(`SELECT version, predecessor_digest FROM memory_record_versions WHERE mutation_receipt_id = 'mutation.q5'`);
+  assert.equal(extended.rows[0].version, 4);
+  assert.equal(extended.rows[0].predecessor_digest, prepared.genesis);
+  await insertRawBinding(
+    { alias_id: "alias-q5", authorization_id: authorizationId, mutation_receipt_id: "mutation.q5" },
+    { aliasId: "alias-q5", authorizationId, mutationReceiptId: "mutation.q5" },
+  );
+  await seedPendingUnknown({ mutationReceiptId: "mutation.q5", authorizationId, action: "assign_alias", recordId: VICTIM, bindingDigest: nonce.bindingDigest });
+  await assert.rejects(
+    () => fileAliasVerdictAsReconciler({ mutationReceiptId: "mutation.q5", authorizationId, recordId: VICTIM, verdict: "COMMITTED_CONFIRMED" }),
+    /verdict COMMITTED_CONFIRMED is not the verdict stored state implies \(COMMITTED_DIVERGED\)/,
+  );
+  const [verdict] = await createPostgresMemoryReconciler(writePool).reconcileAll();
+  assert.equal(verdict?.verdict, "COMMITTED_DIVERGED");
+});
+
+test("Q-6 an alias mutation whose authorization named the right VERSION but a different DIGEST reconciles to COMMITTED_DIVERGED", async () => {
+  // Sweep survivors FX-17/FX-20 at f59a6f7: in Q-4 the version comparison
+  // already failed, masking the predecessor-digest comparison in both the
+  // database and the reconciler. Here the version is exactly head + 1 and only
+  // the digest the authorization named is not the head that was extended.
+  const genesis = await seedGenesis(VICTIM);
+  const receipt = await issue(
+    authorization({
+      action: "assign_alias",
+      targetRecordId: VICTIM,
+      expectedHead: headOf(1, `sha256:${"e".repeat(64)}`),
+      proposedContentDigest: `sha256:${"d".repeat(64)}`,
+    }),
+  );
+  const { authorizationId, nonce } = receipt;
+  await spendNonce(nonce.bindingDigest, "mutation.q6");
+  await appendAliasVersion({ authorizationId, mutationReceiptId: "mutation.q6", targetRecordId: VICTIM });
+  const extended = await adminPool.query(`SELECT version, predecessor_digest FROM memory_record_versions WHERE mutation_receipt_id = 'mutation.q6'`);
+  assert.equal(extended.rows[0].version, 2);
+  assert.equal(extended.rows[0].predecessor_digest, genesis);
+  await insertRawBinding(
+    { alias_id: "alias-q6", authorization_id: authorizationId, mutation_receipt_id: "mutation.q6" },
+    { aliasId: "alias-q6", authorizationId, mutationReceiptId: "mutation.q6" },
+  );
+  await seedPendingUnknown({ mutationReceiptId: "mutation.q6", authorizationId, action: "assign_alias", recordId: VICTIM, bindingDigest: nonce.bindingDigest });
+  await assert.rejects(
+    () => fileAliasVerdictAsReconciler({ mutationReceiptId: "mutation.q6", authorizationId, recordId: VICTIM, verdict: "COMMITTED_CONFIRMED" }),
+    /verdict COMMITTED_CONFIRMED is not the verdict stored state implies \(COMMITTED_DIVERGED\)/,
+  );
+  const [verdict] = await createPostgresMemoryReconciler(writePool).reconcileAll();
+  assert.equal(verdict?.verdict, "COMMITTED_DIVERGED");
 });
 
 test("U-4 every alias-binding, blind-index and protected-domain unique index refuses the one duplicate it exists for", async () => {
