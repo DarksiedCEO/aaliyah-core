@@ -219,6 +219,22 @@ export type TrustedMemoryDeleteResult = TrustedMemoryMutationResult & {
    * defect, and the store unwinds rather than returning one.
    */
   tombstone: MemoryTombstone | null;
+  /**
+   * THE SUBJECT'S ALIASES, ERASED WITH THE RECORD (migration 047).
+   *
+   * Null when the deletion never committed. Otherwise the non-PII accounting:
+   * how many bindings naming this participant had their envelope and blind
+   * indexes destroyed in the deleting transaction, and how many of their data
+   * keys the provider has confirmed destroyed. `keysPending > 0` means the
+   * database has forgotten the identifiers but ciphertext copies elsewhere
+   * (a backup, a replica) are still decryptable — the deletion is then NOT
+   * reported verified, and `completePendingAliasErasures` finishes it.
+   */
+  aliasErasure: {
+    bindingsErased: number;
+    keysDestroyed: number;
+    keysPending: number;
+  } | null;
 };
 
 /** A record as ORDINARY RETRIEVAL sees it. Deleted and erased records are not. */
@@ -261,6 +277,16 @@ export interface TrustedMemoryStore {
    * prior version unerased.
    */
   delete(request: TrustedMemoryDeleteRequest): Promise<TrustedMemoryDeleteResult>;
+  /**
+   * Finish alias erasures whose database half committed but whose data keys
+   * the provider has not yet confirmed destroyed — after a crash, or while the
+   * provider was unavailable. Idempotent. Never reports a key destroyed that
+   * the provider did not confirm.
+   */
+  completePendingAliasErasures(limit?: number): Promise<{
+    destroyed: number;
+    pending: number;
+  }>;
   /**
    * Return a deleted record to an active state under a SEPARATE `restore`
    * authorization. It does NOT return the destroyed payload — that is gone,

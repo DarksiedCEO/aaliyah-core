@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test, { after, before, beforeEach } from "node:test";
 import { Pool } from "pg";
 
@@ -23,9 +24,19 @@ import {
 } from "@aaliyah/contracts/v1";
 
 import {
+  MemoryAliasPiiErased,
+  aliasAssignmentCommitment,
   aliasAssignmentDigest,
   aliasRemovalDigest,
 } from "../src/application/memory/wave1AliasRegistry";
+import {
+  MemoryPiiEnvelopeInvalid,
+  MemoryPiiKeyDestroyed,
+  MemoryPiiScopeMismatch,
+  aliasEnvelopeAssociatedData,
+  createLocalTestPiiKeyProvider,
+  type PiiEnvelope,
+} from "../src/crypto/memoryPiiKeys";
 import {
   aliasRestrictionLevel,
   coreAliasSkeleton,
@@ -47,12 +58,14 @@ import {
 import { runMailMigrations } from "../src/persistence/postgres/migrations";
 import { createMailDbPool } from "../src/persistence/postgres/pool";
 import { createPostgresAliasRegistryStore } from "../src/persistence/postgres/wave1AliasRegistryStore";
+import { createPostgresWave1MemoryService } from "../src/persistence/postgres/wave1IdentityGraphStore";
 import { createPostgresLegalHoldStore } from "../src/persistence/postgres/wave1LegalHoldStore";
 import { createPostgresTrustedMemoryStore } from "../src/persistence/postgres/wave1TrustedMemoryStore";
 import {
   lockSharedMemoryTables,
   type SharedTableLock,
 } from "./support/sharedMemoryTables";
+import { TEST_PII_KEYS, testAliasAssignmentDigest } from "./support/piiKeys";
 import { assertUniqueIndexKills } from "./support/uniquenessDestroyer";
 
 /**
@@ -134,7 +147,7 @@ let shadowTombstonePool: Pool;
 let sharedTableLock: SharedTableLock;
 
 function store() {
-  return createPostgresTrustedMemoryStore(writePool, readPool);
+  return createPostgresTrustedMemoryStore(writePool, readPool, { piiKeys: TEST_PII_KEYS });
 }
 
 function holds() {
@@ -142,7 +155,7 @@ function holds() {
 }
 
 function aliases() {
-  return createPostgresAliasRegistryStore(writePool, readPool);
+  return createPostgresAliasRegistryStore(writePool, readPool, { piiKeys: TEST_PII_KEYS });
 }
 
 before(async () => {
@@ -197,6 +210,8 @@ after(async () => {
               memory_mutation_receipts,
               memory_mutation_attempts,
               memory_alias_bindings,
+              memory_alias_blind_indexes,
+              memory_pii_key_erasures,
               memory_alias_tenant_policy,
               memory_alias_protected_domains,
               memory_tombstones,
@@ -219,6 +234,8 @@ beforeEach(async () => {
               memory_mutation_receipts,
               memory_mutation_attempts,
               memory_alias_bindings,
+              memory_alias_blind_indexes,
+              memory_pii_key_erasures,
               memory_alias_tenant_policy,
               memory_alias_protected_domains,
               memory_tombstones,
@@ -904,10 +921,11 @@ async function prepareAssign(aliasId: string, observedAlias: string) {
       action: "assign_alias",
       targetRecordId: PARTICIPANT,
       expectedHead: headOf(1, genesis),
-      proposedContentDigest: aliasAssignmentDigest({
+      proposedContentDigest: await testAliasAssignmentDigest({
         record: content,
-        alias,
-        evidence,
+        alias: alias,
+        evidence: evidence,
+        scope: SCOPE,
       }),
     }),
   );
@@ -1151,8 +1169,6 @@ test("a hostile direct INSERT into memory_alias_bindings is refused for a held p
     schemaVersion: WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION,
     scope: SCOPE,
     aliasId: "alias-hostile-001",
-    normalizedAlias: "ceo@example.com",
-    skeleton: "ceo@example.com",
     canonicalParticipantId: PARTICIPANT,
     subjectParticipantId: PARTICIPANT,
     crossWorkspacePolicy: "workspace_isolated",
@@ -1166,17 +1182,19 @@ test("a hostile direct INSERT into memory_alias_bindings is refused for a held p
         "aaliyah_memory_mutator",
         `INSERT INTO memory_alias_bindings
            (tenant_id, workspace_id, principal_id, user_id,
-            cross_workspace_policy, scope_key, alias_id, normalized_alias,
-            skeleton, skeleton_algorithm, normalization_profile,
-            canonical_participant_id, registrable_domain, script_code,
+            cross_workspace_policy, scope_key, alias_id,
+            skeleton_algorithm, normalization_profile,
+            canonical_participant_id, script_code,
             restriction_level, subject_participant_id, source_evidence_ref,
             source_evidence_digest, observed_at, fresh_until, authorization_id,
-            mutation_receipt_id, bound_at, payload)
+            mutation_receipt_id, bound_at, payload,
+            pii_envelope, pii_key_ref, pii_key_version)
          VALUES ($1,$2,$3,$4,'workspace_isolated',$5,'alias-hostile-001',
-                 'ceo@example.com','ceo@example.com',$6,$7,$8,'example.com',
+                 $6,$7,$8,
                  'Latn','ascii_only',$8,'identity:verification/x',$9,
                  now() - interval '1 minute', now() + interval '1 hour',
-                 $10,$11, now(), $12)`,
+                 $10,$11, now(), $12,
+                 '{"keyRef":"pii-key:raw","keyVersion":1}'::jsonb,'pii-key:raw',1)`,
         [
           SCOPE.tenantId,
           SCOPE.workspaceId,
@@ -3382,4 +3400,615 @@ test("U-3 memory_legal_holds_fk_target is STRUCTURALLY REDUNDANT as a uniqueness
   );
   assert.equal(found.rows[0]?.indisunique, true);
   assert.match(found.rows[0]?.def as string, /\(tenant_id, workspace_id, hold_id\)$/);
+});
+
+// ---------------------------------------------------------------------------
+// P — ALIAS PII ERASURE (red team BREAK 4 against b3efc82; founder decision).
+//
+// Every test here asks one question of the WHOLE database, not of one column:
+// after an authorized erasure, can the address be recovered, confirmed, or
+// read from anywhere this system stores data? Plus the refusals: a hold, a
+// retention obligation, a crash, an unavailable provider — none of which may
+// be reported as an erasure.
+// ---------------------------------------------------------------------------
+
+const VICTIM_ADDRESS = "Victim.Person@Example.com";
+const VICTIM_NORMALIZED = "victim.person@example.com";
+
+/** Every text, varchar and jsonb column of every public table that contains `needle`. */
+async function plaintextSightings(needle: string): Promise<string[]> {
+  const columns = await adminPool.query(
+    `SELECT table_name, column_name
+       FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND data_type IN ('text', 'jsonb', 'character varying', 'json')`,
+  );
+  const hits: string[] = [];
+  for (const { table_name, column_name } of columns.rows as Array<{ table_name: string; column_name: string }>) {
+    const found = await adminPool.query(
+      `SELECT count(*)::int AS n FROM public."${table_name}"
+        WHERE strpos(lower("${column_name}"::text), lower($1)) > 0`,
+      [needle],
+    );
+    if ((found.rows[0].n as number) > 0) hits.push(`${table_name}.${column_name}`);
+  }
+  return hits;
+}
+
+/** Bind VICTIM_ADDRESS to PARTICIPANT through the honest path. */
+async function bindVictimAddress(aliasId = "alias-pii-001") {
+  const prepared = await prepareAssign(aliasId, VICTIM_ADDRESS);
+  const bound = await aliases().assignAlias({
+    actor: SCOPE,
+    authorizationId: prepared.receipt.authorizationId,
+    participantRecordId: PARTICIPANT,
+    alias: prepared.alias,
+    evidence: prepared.evidence,
+    proposedContent: prepared.content,
+    mutationReceiptId: `mutation.pii.bind.${aliasId}`,
+  });
+  assert.equal(bound.verified, true, bound.rejection ?? "");
+  return prepared;
+}
+
+/** Issue a subject-erasure deletion of PARTICIPANT at its current head. */
+async function eraseParticipant(receiptId: string, tombstoneId: string) {
+  const head = await store().readHead(SCOPE, PARTICIPANT);
+  assert.ok(head);
+  const order = deletionOrder("subject_erasure_request");
+  const receipt = await issue(
+    authorization({
+      action: "delete",
+      targetRecordId: PARTICIPANT,
+      expectedHead: headOf(head.version, head.contentDigest),
+      proposedContent: order,
+    }),
+  );
+  return {
+    receipt,
+    result: await store().delete({
+      actor: SCOPE,
+      authorizationId: receipt.authorizationId,
+      recordId: PARTICIPANT,
+      proposedContent: order,
+      mutationReceiptId: receiptId,
+      tombstoneId,
+    }),
+  };
+}
+
+async function bindingState(aliasId: string) {
+  const row = await adminPool.query(
+    `SELECT pii_envelope, pii_key_ref, pii_erased_at, pii_erasure_tombstone_id,
+            removed_at, mutation_receipt_id
+       FROM memory_alias_bindings WHERE alias_id = $1`,
+    [aliasId],
+  );
+  return row.rows[0] as {
+    pii_envelope: unknown;
+    pii_key_ref: string;
+    pii_erased_at: Date | null;
+    pii_erasure_tombstone_id: string | null;
+    removed_at: Date | null;
+    mutation_receipt_id: string;
+  };
+}
+
+async function indexValues(bindingReceiptId: string): Promise<Array<string | null>> {
+  const rows = await adminPool.query(
+    `SELECT index_value FROM memory_alias_blind_indexes
+      WHERE binding_mutation_receipt_id = $1 ORDER BY id`,
+    [bindingReceiptId],
+  );
+  return rows.rows.map((r: { index_value: string | null }) => r.index_value);
+}
+
+const DATA_SCOPE = { tenantId: SCOPE.tenantId, workspaceId: SCOPE.workspaceId };
+
+async function nonceConsumedAt(bindingDigest: string): Promise<Date | null> {
+  const result = await adminPool.query(
+    `SELECT consumed_at FROM memory_authorization_nonces WHERE binding_digest = $1`,
+    [bindingDigest],
+  );
+  return (result.rows[0]?.consumed_at as Date | null) ?? null;
+}
+
+test("P-1 BREAK 4: a subject erasure destroys the address EVERYWHERE the database stores data, and says so", async () => {
+  await bindVictimAddress();
+  // Sanity: the alias resolves before erasure, and NOT because it is stored in
+  // plaintext — the address is nowhere in the database even while live.
+  assert.equal((await aliases().resolveAlias(SCOPE, VICTIM_NORMALIZED))?.binding.canonicalParticipantId, PARTICIPANT);
+  assert.deepEqual(await plaintextSightings(VICTIM_NORMALIZED), []);
+  assert.deepEqual(await plaintextSightings("victim.person"), []);
+
+  const { result } = await eraseParticipant("mutation.pii.erase.1", "tombstone-pii-001");
+  assert.equal(result.verified, true, result.rejection ?? "");
+  assert.deepEqual(result.aliasErasure, { bindingsErased: 1, keysDestroyed: 1, keysPending: 0 });
+
+  // EXECUTED against b3efc82: `resolveAlias` still answered with the address.
+  assert.equal(await aliases().resolveAlias(SCOPE, VICTIM_NORMALIZED), null);
+  await assert.rejects(
+    aliases().readAliasBinding(SCOPE, "alias-pii-001"),
+    (error: unknown) => error instanceof MemoryAliasPiiErased && error.erasureTombstoneId === "tombstone-pii-001",
+  );
+  assert.deepEqual(await plaintextSightings(VICTIM_NORMALIZED), []);
+  assert.deepEqual(await plaintextSightings("victim.person"), []);
+  const state = await bindingState("alias-pii-001");
+  assert.equal(state.pii_envelope, null);
+  assert.ok(state.pii_erased_at !== null && state.removed_at !== null);
+  // The non-PII evidence that it happened survives.
+  const events = await adminPool.query(
+    `SELECT event FROM memory_pii_key_erasures WHERE tombstone_id = 'tombstone-pii-001' ORDER BY id`,
+  );
+  assert.deepEqual(events.rows.map((r: { event: string }) => r.event), ["erasure_committed", "key_destroyed"]);
+});
+
+test("P-2 a ciphertext COPY taken before erasure — a backup, a replica — no longer decrypts", async () => {
+  await bindVictimAddress();
+  const before = await bindingState("alias-pii-001");
+  const copied = before.pii_envelope as PiiEnvelope;
+  assert.ok(!JSON.stringify(copied).toLowerCase().includes("victim"));
+  const { result } = await eraseParticipant("mutation.pii.erase.2", "tombstone-pii-002");
+  assert.equal(result.verified, true);
+  await assert.rejects(
+    TEST_PII_KEYS.decrypt({
+      scope: DATA_SCOPE,
+      envelope: copied,
+      associatedData: aliasEnvelopeAssociatedData({
+        tenantId: SCOPE.tenantId,
+        workspaceId: SCOPE.workspaceId,
+        aliasId: "alias-pii-001",
+        mutationReceiptId: before.mutation_receipt_id,
+      }),
+    }),
+    MemoryPiiKeyDestroyed,
+  );
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "destroyed");
+});
+
+test("P-3 the blind index is not queryable after erasure, even by someone holding the index key", async () => {
+  const prepared = await bindVictimAddress();
+  const bindingReceipt = (await bindingState("alias-pii-001")).mutation_receipt_id;
+  const live = await indexValues(bindingReceipt);
+  assert.equal(live.length, 2);
+  assert.ok(live.every((value) => value !== null && /^bi1\./.test(value)));
+  // A raw SHA-256 of the address, the dictionary attack, is not what is stored.
+  assert.ok(!live.includes(createHash("sha256").update(VICTIM_NORMALIZED).digest("base64url")));
+  const { result } = await eraseParticipant("mutation.pii.erase.3", "tombstone-pii-003");
+  assert.equal(result.verified, true);
+  assert.deepEqual(await indexValues(bindingReceipt), [null, null]);
+  const recomputed = await TEST_PII_KEYS.blindIndexesForLookup({
+    scope: { tenantId: SCOPE.tenantId, scopeKey: SCOPE.workspaceId },
+    purpose: "alias.normalized",
+    value: prepared.alias.normalizedAlias,
+  });
+  const stillThere = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_alias_blind_indexes WHERE index_value = ANY($1::text[])`,
+    [recomputed],
+  );
+  assert.equal(stillThere.rows[0].n, 0);
+});
+
+test("P-4 a LEGAL HOLD on the subject refuses erasure: nothing is erased, nothing is reported erased, the key lives", async () => {
+  await bindVictimAddress();
+  await placeHold(legalHold({ coverage: { kind: "subjects", canonicalParticipantIds: [PARTICIPANT] } }));
+  const before = await bindingState("alias-pii-001");
+  const { result } = await eraseParticipant("mutation.pii.held", "tombstone-pii-held");
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "legal_hold_active");
+  assert.equal(result.aliasErasure, null);
+  const after = await bindingState("alias-pii-001");
+  assert.notEqual(after.pii_envelope, null);
+  assert.equal(after.pii_erased_at, null);
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "active");
+  assert.equal((await aliases().resolveAlias(SCOPE, VICTIM_NORMALIZED))?.binding.normalizedAlias, VICTIM_NORMALIZED);
+});
+
+test("P-5 an unexpired RETENTION obligation refuses erasure, and it is never reported as erased", async () => {
+  await bindVictimAddress();
+  const imposed = await holds().imposeRetention(SCOPE, {
+    obligationId: "retention-pii-001",
+    recordId: PARTICIPANT,
+    policyRef: "policy:retention/seven-years",
+    imposingAuthorityId: "authority.records-manager",
+    imposedAt: isoOffset(-60_000),
+    retainUntil: isoOffset(3_600_000),
+  });
+  assert.equal(imposed.rejection, null);
+  const { result } = await eraseParticipant("mutation.pii.retained", "tombstone-pii-retained");
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "retention_obligation_active");
+  assert.equal(result.aliasErasure, null);
+  assert.notEqual((await bindingState("alias-pii-001")).pii_envelope, null);
+  const committed = await adminPool.query(`SELECT count(*)::int AS n FROM memory_pii_key_erasures`);
+  assert.equal(committed.rows[0].n, 0);
+});
+
+test("P-6 a CRASH mid-erasure leaves nothing half-erased: the whole transaction, alias half included, rolls back", async () => {
+  await bindVictimAddress();
+  const before = await bindingState("alias-pii-001");
+  // A failure injected at COMMIT, after the binding and index updates and the
+  // erasure record were all written inside the deleting transaction.
+  await adminPool.query(`
+    CREATE OR REPLACE FUNCTION public.test_crash_at_commit() RETURNS trigger
+      LANGUAGE plpgsql AS $fn$ BEGIN RAISE EXCEPTION 'injected crash at commit'; END; $fn$;
+    DROP TRIGGER IF EXISTS test_crash_at_commit ON memory_pii_key_erasures;
+    CREATE CONSTRAINT TRIGGER test_crash_at_commit AFTER INSERT ON memory_pii_key_erasures
+      DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.test_crash_at_commit();`);
+  try {
+    const { result } = await eraseParticipant("mutation.pii.crash", "tombstone-pii-crash");
+    assert.equal(result.verified, false);
+    assert.notEqual(result.rejection, null);
+  } finally {
+    await adminPool.query(`DROP TRIGGER IF EXISTS test_crash_at_commit ON memory_pii_key_erasures;
+      DROP FUNCTION IF EXISTS public.test_crash_at_commit();`);
+  }
+  const after = await bindingState("alias-pii-001");
+  assert.deepEqual(after.pii_envelope, before.pii_envelope);
+  assert.equal(after.pii_erased_at, null);
+  assert.equal((await indexValues(after.mutation_receipt_id)).filter((v) => v === null).length, 0);
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "active");
+  // And the retry, with a fresh authorization, erases completely.
+  const retried = await eraseParticipant("mutation.pii.crash.retry", "tombstone-pii-crash-retry");
+  assert.equal(retried.result.verified, true, retried.result.rejection ?? "");
+});
+
+test("P-7 an UNAVAILABLE key provider: the database half commits, the deletion is NOT reported erased, and completion finishes it", async () => {
+  await bindVictimAddress();
+  const before = await bindingState("alias-pii-001");
+  TEST_PII_KEYS.setAvailable(false);
+  let result;
+  try {
+    ({ result } = await eraseParticipant("mutation.pii.outage", "tombstone-pii-outage"));
+  } finally {
+    TEST_PII_KEYS.setAvailable(true);
+  }
+  assert.equal(result.verified, false);
+  assert.equal(result.rejection, "erasure_incomplete");
+  assert.deepEqual(result.aliasErasure, { bindingsErased: 1, keysDestroyed: 0, keysPending: 1 });
+  // The database has forgotten; the key has not been destroyed yet.
+  assert.equal((await bindingState("alias-pii-001")).pii_envelope, null);
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "active");
+
+  const completed = await store().completePendingAliasErasures();
+  assert.deepEqual(completed, { destroyed: 1, pending: 0 });
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "destroyed");
+  // Idempotent.
+  assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 0, pending: 0 });
+});
+
+test("P-8 the DATABASE refuses to commit a deletion that leaves the subject's alias unerased, whoever writes it", async () => {
+  await bindVictimAddress();
+  // An honest deletion of ANOTHER record supplies a structurally valid
+  // tombstone row to copy; the copy is aimed at PARTICIPANT, whose alias is
+  // still live, with every other tombstone guard stood down so the deferred
+  // alias check is the only thing left that can refuse the COMMIT.
+  await deleteThen("mutation.pii.other-delete", "tombstone-pii-other");
+  const client = await adminPool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`ALTER TABLE memory_tombstones
+      DISABLE TRIGGER memory_tombstones_structural,
+      DISABLE TRIGGER memory_tombstones_zz_authorization_scope`);
+    await client.query(
+      `INSERT INTO memory_tombstones
+         (tenant_id, workspace_id, principal_id, user_id, tombstone_id, target_record_id,
+          target_version, tombstone_version, authorization_id, mutation_receipt_id, reason,
+          effective_at, retain_until, legal_hold_state, cache_index_propagation,
+          restoration_eligibility_kind, tombstone_digest, payload)
+       SELECT tenant_id, workspace_id, principal_id, user_id, 'tombstone-pii-forged', $1,
+              target_version, tombstone_version, authorization_id, 'mutation.pii.forged', reason,
+              effective_at, retain_until, legal_hold_state, cache_index_propagation,
+              restoration_eligibility_kind, tombstone_digest,
+              jsonb_set(jsonb_set(payload, '{tombstoneId}', '"tombstone-pii-forged"'),
+                        '{targetRecordId}', to_jsonb($1::text))
+         FROM memory_tombstones WHERE tombstone_id = 'tombstone-pii-other'`,
+      [PARTICIPANT],
+    );
+    await assert.rejects(client.query("COMMIT"), /a deleted participant may not keep an unerased alias/);
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
+  assert.notEqual((await bindingState("alias-pii-001")).pii_envelope, null);
+});
+
+test("P-9 an erasure UPDATE with no tombstone of the participant behind it is refused, for the mutation role", async () => {
+  await bindVictimAddress();
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        `UPDATE memory_alias_bindings
+            SET pii_envelope = NULL, pii_erased_at = now(),
+                pii_erasure_tombstone_id = 'tombstone-never-written', removed_at = now()
+          WHERE alias_id = 'alias-pii-001'`,
+      ),
+    /no tombstone of this participant witnesses this erasure/,
+  );
+  assert.notEqual((await bindingState("alias-pii-001")).pii_envelope, null);
+});
+
+test("P-10 an erased binding, and its erased index entries, are immutable and undeletable by the owner", async () => {
+  await bindVictimAddress();
+  const { result } = await eraseParticipant("mutation.pii.immutable", "tombstone-pii-immutable");
+  assert.equal(result.verified, true);
+  const receipt = (await bindingState("alias-pii-001")).mutation_receipt_id;
+  await assert.rejects(
+    adminPool.query(`UPDATE memory_alias_bindings SET pii_envelope = '{"keyRef":"x","keyVersion":1}'::jsonb WHERE alias_id = 'alias-pii-001'`),
+    /an erased alias binding is immutable/,
+  );
+  await assert.rejects(
+    adminPool.query(`DELETE FROM memory_alias_bindings WHERE alias_id = 'alias-pii-001'`),
+    /DELETE on memory_alias_bindings is forbidden/,
+  );
+  await assert.rejects(
+    adminPool.query(`UPDATE memory_alias_blind_indexes SET active = true WHERE binding_mutation_receipt_id = $1`, [receipt]),
+    /an erased index entry is immutable/,
+  );
+  await assert.rejects(
+    adminPool.query(`DELETE FROM memory_alias_blind_indexes WHERE binding_mutation_receipt_id = $1`, [receipt]),
+    /DELETE on memory_alias_blind_indexes is forbidden/,
+  );
+  await assert.rejects(
+    adminPool.query(`DELETE FROM memory_pii_key_erasures`),
+    /DELETE on memory_pii_key_erasures is forbidden; this table is append-only/,
+  );
+});
+
+test("P-11 RESTORING the erased record does not bring the address back", async () => {
+  await bindVictimAddress();
+  const { result } = await eraseParticipant("mutation.pii.restore-seed", "tombstone-pii-restore");
+  assert.equal(result.verified, true);
+  const head = await store().readHead(SCOPE, PARTICIPANT);
+  assert.equal(head?.state, "deleted");
+  const restoreContent = { participant: PARTICIPANT, restored: true };
+  const restore = await issue(
+    authorization({
+      action: "restore",
+      targetRecordId: PARTICIPANT,
+      expectedHead: headOf(head!.version, head!.contentDigest),
+      proposedContent: restoreContent,
+    }),
+  );
+  const restored = await store().restore({
+    actor: SCOPE,
+    authorizationId: restore.authorizationId,
+    recordId: PARTICIPANT,
+    proposedContent: restoreContent,
+    mutationReceiptId: "mutation.pii.restore",
+  });
+  assert.equal(restored.verified, true, restored.rejection ?? "");
+  assert.equal(await aliases().resolveAlias(SCOPE, VICTIM_NORMALIZED), null);
+  await assert.rejects(aliases().readAliasBinding(SCOPE, "alias-pii-001"), MemoryAliasPiiErased);
+  assert.deepEqual(await plaintextSightings(VICTIM_NORMALIZED), []);
+});
+
+test("P-12 a REPEATED or REPLAYED erasure changes nothing and records nothing new", async () => {
+  await bindVictimAddress();
+  const first = await eraseParticipant("mutation.pii.first", "tombstone-pii-first");
+  assert.equal(first.result.verified, true);
+  const replay = await store().delete({
+    actor: SCOPE,
+    authorizationId: first.receipt.authorizationId,
+    recordId: PARTICIPANT,
+    proposedContent: deletionOrder("subject_erasure_request"),
+    mutationReceiptId: "mutation.pii.replay",
+    tombstoneId: "tombstone-pii-replay",
+  });
+  assert.equal(replay.verified, false);
+  const again = await eraseParticipant("mutation.pii.again", "tombstone-pii-again");
+  assert.equal(again.result.verified, false);
+  assert.equal(again.result.rejection, "record_deleted");
+  const events = await adminPool.query(`SELECT count(*)::int AS n FROM memory_pii_key_erasures`);
+  assert.equal(events.rows[0].n, 2);
+});
+
+test("P-13 an envelope moved to another tenant's row, or to another binding, does not decrypt", async () => {
+  await bindVictimAddress();
+  const original = await bindingState("alias-pii-001");
+  await bindVictimAddress2();
+  const other = await bindingState("alias-pii-002");
+  // Same tenant, different binding: the associated data binds the alias id and
+  // receipt, so a swapped envelope fails authentication.
+  await assert.rejects(
+    TEST_PII_KEYS.decrypt({
+      scope: DATA_SCOPE,
+      envelope: original.pii_envelope as PiiEnvelope,
+      associatedData: aliasEnvelopeAssociatedData({
+        tenantId: SCOPE.tenantId,
+        workspaceId: SCOPE.workspaceId,
+        aliasId: "alias-pii-002",
+        mutationReceiptId: other.mutation_receipt_id,
+      }),
+    }),
+    MemoryPiiEnvelopeInvalid,
+  );
+  // Another tenant's scope: the key refuses to be used outside the scope it
+  // was issued to.
+  await assert.rejects(
+    TEST_PII_KEYS.decrypt({
+      scope: { tenantId: "tenant-elsewhere", workspaceId: SCOPE.workspaceId },
+      envelope: original.pii_envelope as PiiEnvelope,
+      associatedData: "anything",
+    }),
+    MemoryPiiScopeMismatch,
+  );
+});
+
+async function bindVictimAddress2() {
+  // A second participant and address, for the tests that need two bindings.
+  await setAliasPolicy();
+  const participant = "participant-hold-002";
+  const genesis = await seedGenesis({ participant, generation: 1 }, { recordId: participant });
+  const evidence = evidenceFor(participant);
+  const alias = aliasIdentity({ aliasId: "alias-pii-002", observedAlias: "other.person@example.com", participantId: participant, evidence });
+  const content = { participant, generation: 2 };
+  const receipt = await issue(
+    authorization({
+      action: "assign_alias",
+      targetRecordId: participant,
+      expectedHead: headOf(1, genesis),
+      proposedContentDigest: await testAliasAssignmentDigest({ record: content, alias, evidence, scope: SCOPE }),
+    }),
+  );
+  const bound = await aliases().assignAlias({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    participantRecordId: participant,
+    alias,
+    evidence,
+    proposedContent: content,
+    mutationReceiptId: "mutation.pii.bind.alias-pii-002",
+  });
+  assert.equal(bound.verified, true, bound.rejection ?? "");
+}
+
+test("P-14 erasing ONE subject leaves every other subject's alias intact and resolvable", async () => {
+  await bindVictimAddress();
+  await bindVictimAddress2();
+  const { result } = await eraseParticipant("mutation.pii.scope", "tombstone-pii-scope");
+  assert.equal(result.verified, true);
+  assert.deepEqual(result.aliasErasure, { bindingsErased: 1, keysDestroyed: 1, keysPending: 0 });
+  assert.equal(await aliases().resolveAlias(SCOPE, VICTIM_NORMALIZED), null);
+  assert.equal((await aliases().resolveAlias(SCOPE, "other.person@example.com"))?.binding.aliasId, "alias-pii-002");
+});
+
+test("P-15 the alias may not ride along in the record's content, and refusing it spends nothing", async () => {
+  await setAliasPolicy();
+  const genesis = await seedGenesis({ participant: PARTICIPANT, generation: 1 }, { recordId: PARTICIPANT });
+  const evidence = evidenceFor(PARTICIPANT);
+  const alias = aliasIdentity({ aliasId: "alias-pii-leak", observedAlias: VICTIM_ADDRESS, participantId: PARTICIPANT, evidence });
+  const content = { participant: PARTICIPANT, note: `contact: ${VICTIM_ADDRESS.toUpperCase()}` };
+  const receipt = await issue(
+    authorization({
+      action: "assign_alias",
+      targetRecordId: PARTICIPANT,
+      expectedHead: headOf(1, genesis),
+      proposedContentDigest: await testAliasAssignmentDigest({ record: content, alias, evidence, scope: SCOPE }),
+    }),
+  );
+  const result = await aliases().assignAlias({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    participantRecordId: PARTICIPANT,
+    alias,
+    evidence,
+    proposedContent: content,
+    mutationReceiptId: "mutation.pii.leak",
+  });
+  assert.equal(result.rejection, "alias_plaintext_in_record_content");
+  assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
+});
+
+test("P-16 the AUTHORIZATION RECEIPT is not an offline oracle: its digest is not reproducible from the address without the key", async () => {
+  const prepared = await bindVictimAddress();
+  const stored = await adminPool.query(
+    `SELECT payload->>'proposedContentDigest' AS digest FROM memory_authorization_receipts
+      WHERE authorization_id = $1`,
+    [prepared.receipt.authorizationId],
+  );
+  // The pre-047 construction: an unkeyed digest over the alias itself.
+  const unkeyed = canonicalDigest({
+    schemaVersion: `${WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION}#alias-assignment`,
+    value: { record: prepared.content, alias: prepared.alias, evidence: prepared.evidence },
+  });
+  assert.notEqual(stored.rows[0].digest, unkeyed);
+  // An attacker-chosen commitment key does not reproduce it either.
+  const attacker = createLocalTestPiiKeyProvider({ rootKey: Buffer.alloc(32, 1) });
+  const forgedCommitment = await aliasAssignmentCommitment({ piiKeys: attacker, scope: SCOPE, alias: prepared.alias });
+  assert.notEqual(
+    stored.rows[0].digest,
+    aliasAssignmentDigest({ record: prepared.content, aliasCommitment: forgedCommitment, evidence: prepared.evidence }),
+  );
+  // The holder of the real key does reproduce it, so the digest still binds.
+  assert.equal(
+    stored.rows[0].digest,
+    await testAliasAssignmentDigest({ record: prepared.content, alias: prepared.alias, evidence: prepared.evidence, scope: SCOPE }),
+  );
+});
+
+test("P-17 ROTATION: after a new index key version, an alias bound under the old one still resolves and still collides", async () => {
+  await bindVictimAddress();
+  const indexScope = { tenantId: SCOPE.tenantId, scopeKey: SCOPE.workspaceId };
+  TEST_PII_KEYS.rotateBlindIndexKey(indexScope, "alias.normalized");
+  TEST_PII_KEYS.rotateBlindIndexKey(indexScope, "alias.skeleton");
+  assert.equal((await aliases().resolveAlias(SCOPE, VICTIM_NORMALIZED))?.binding.aliasId, "alias-pii-001");
+  // The same address for another participant, written under v1 AND v2 entries,
+  // collides with the v1 entry.
+  await setAliasPolicy();
+  const participant = "participant-hold-003";
+  const genesis = await seedGenesis({ participant, generation: 1 }, { recordId: participant });
+  const evidence = evidenceFor(participant);
+  const alias = aliasIdentity({ aliasId: "alias-pii-rotated", observedAlias: VICTIM_ADDRESS, participantId: participant, evidence });
+  const content = { participant, generation: 2 };
+  const receipt = await issue(
+    authorization({
+      action: "assign_alias",
+      targetRecordId: participant,
+      expectedHead: headOf(1, genesis),
+      proposedContentDigest: await testAliasAssignmentDigest({ record: content, alias, evidence, scope: SCOPE }),
+    }),
+  );
+  const collided = await aliases().assignAlias({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    participantRecordId: participant,
+    alias,
+    evidence,
+    proposedContent: content,
+    mutationReceiptId: "mutation.pii.rotated",
+  });
+  assert.equal(collided.rejection, "alias_already_bound");
+});
+
+test("P-18 a lookup RACING an erasure sees the whole binding or nothing — never a half-erased one — and nothing after", async () => {
+  await bindVictimAddress();
+  // Gate: the deleting transaction has erased the binding and its indexes but
+  // cannot record the erasure, so it holds everything uncommitted.
+  const gate = await adminPool.connect();
+  await gate.query("BEGIN");
+  await gate.query("LOCK TABLE memory_pii_key_erasures IN SHARE ROW EXCLUSIVE MODE");
+  let erasing: Promise<Awaited<ReturnType<typeof eraseParticipant>>>;
+  try {
+    erasing = eraseParticipant("mutation.pii.race", "tombstone-pii-race");
+    const deadline = Date.now() + 4_000;
+    for (;;) {
+      const waiting = await adminPool.query(
+        `SELECT count(*)::int AS n FROM pg_stat_activity
+          WHERE datname = current_database() AND wait_event_type = 'Lock'
+            AND query LIKE '%INSERT INTO memory_pii_key_erasures%'`,
+      );
+      if ((waiting.rows[0].n as number) >= 1) break;
+      if (Date.now() > deadline) throw new Error("the erasure never reached the gate");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    // MID-ERASURE, on the independent read pool: the committed state is the
+    // pre-erasure one, and it is served whole — decryptable, not blanked.
+    const during = await aliases().resolveAlias(SCOPE, VICTIM_NORMALIZED);
+    assert.equal(during?.binding.normalizedAlias, VICTIM_NORMALIZED);
+    const view = await aliases().readAliasBinding(SCOPE, "alias-pii-001");
+    assert.equal(view?.binding.claimed.observedAlias, VICTIM_ADDRESS);
+  } finally {
+    await gate.query("COMMIT");
+    gate.release();
+  }
+  const { result } = await erasing!;
+  assert.equal(result.verified, true, result.rejection ?? "");
+  assert.equal(await aliases().resolveAlias(SCOPE, VICTIM_NORMALIZED), null);
+  await assert.rejects(aliases().readAliasBinding(SCOPE, "alias-pii-001"), MemoryAliasPiiErased);
+});
+
+test("P-19 no CACHE outlives an erasure: the executive memory service answers from the database every time", async () => {
+  await bindVictimAddress();
+  const service = createPostgresWave1MemoryService(writePool, readPool, { piiKeys: TEST_PII_KEYS });
+  const before = await service.resolveExecutiveContext({ actor: SCOPE, normalizedAlias: VICTIM_NORMALIZED });
+  assert.equal(before?.canonicalRecordId, PARTICIPANT);
+  const { result } = await eraseParticipant("mutation.pii.cache", "tombstone-pii-cache");
+  assert.equal(result.verified, true);
+  // The SAME service instance, asked again.
+  assert.equal(
+    await service.resolveExecutiveContext({ actor: SCOPE, normalizedAlias: VICTIM_NORMALIZED }),
+    null,
+  );
 });

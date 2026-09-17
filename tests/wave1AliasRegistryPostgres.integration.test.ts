@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test, { after, before, beforeEach } from "node:test";
 import { Pool } from "pg";
 
@@ -21,7 +22,6 @@ import {
 } from "@aaliyah/contracts/v1";
 
 import {
-  aliasAssignmentDigest,
   aliasRemovalDigest,
   type AliasCrossWorkspacePolicy,
 } from "../src/application/memory/wave1AliasRegistry";
@@ -44,6 +44,7 @@ import {
   lockSharedMemoryTables,
   type SharedTableLock,
 } from "./support/sharedMemoryTables";
+import { TEST_PII_KEYS, testAliasAssignmentDigest } from "./support/piiKeys";
 import { assertUniqueIndexKills } from "./support/uniquenessDestroyer";
 
 /**
@@ -138,6 +139,7 @@ function store(options?: { write?: Pool; readBack?: Pool }) {
   return createPostgresAliasRegistryStore(
     options?.write ?? writePool,
     options?.readBack ?? readPool,
+    { piiKeys: TEST_PII_KEYS },
   );
 }
 
@@ -227,6 +229,8 @@ beforeEach(async () => {
   // widen what is being reset.
   await adminPool.query(
     `TRUNCATE memory_alias_bindings,
+              memory_alias_blind_indexes,
+              memory_pii_key_erasures,
               memory_alias_tenant_policy,
               memory_alias_protected_domains,
               memory_record_versions,
@@ -254,10 +258,14 @@ beforeEach(async () => {
     `TRUNCATE ${SHADOW_RECORD_SCHEMA}.memory_record_versions RESTART IDENTITY`,
   );
   await adminPool.query(
-    `TRUNCATE ${SHADOW_BINDING_SCHEMA}.memory_alias_bindings RESTART IDENTITY`,
+    `TRUNCATE ${SHADOW_BINDING_SCHEMA}.memory_alias_bindings,
+              memory_alias_blind_indexes,
+              memory_pii_key_erasures RESTART IDENTITY`,
   );
   await adminPool.query(
-    `TRUNCATE ${UNCHECKED_SCHEMA}.memory_alias_bindings RESTART IDENTITY`,
+    `TRUNCATE ${UNCHECKED_SCHEMA}.memory_alias_bindings,
+              memory_alias_blind_indexes,
+              memory_pii_key_erasures RESTART IDENTITY`,
   );
 });
 
@@ -710,10 +718,11 @@ async function prepareAssign(input: {
       scope,
       targetRecordId: input.participantId,
       expectedHead: headOf(1, genesis),
-      proposedContentDigest: aliasAssignmentDigest({
+      proposedContentDigest: await testAliasAssignmentDigest({
         record: content,
-        alias,
-        evidence,
+        alias: alias,
+        evidence: evidence,
+        scope: scope,
       }),
     }),
   );
@@ -749,12 +758,9 @@ const BINDING_INSERT_COLUMNS = [
   "cross_workspace_policy",
   "scope_key",
   "alias_id",
-  "normalized_alias",
-  "skeleton",
   "skeleton_algorithm",
   "normalization_profile",
   "canonical_participant_id",
-  "registrable_domain",
   "script_code",
   "restriction_level",
   "subject_participant_id",
@@ -769,6 +775,9 @@ const BINDING_INSERT_COLUMNS = [
   "removed_by_mutation_receipt_id",
   "removed_authorization_id",
   "payload",
+  "pii_envelope",
+  "pii_key_ref",
+  "pii_key_version",
 ] as const;
 
 function rawBindingRow(
@@ -784,8 +793,6 @@ function rawBindingRow(
       userId: SCOPE.userId,
     },
     aliasId,
-    normalizedAlias: "ceo@example.com",
-    skeleton: "ceo@example.com",
     canonicalParticipantId: VICTIM,
     subjectParticipantId: VICTIM,
     crossWorkspacePolicy: "workspace_isolated",
@@ -802,12 +809,9 @@ function rawBindingRow(
     cross_workspace_policy: "workspace_isolated",
     scope_key: SCOPE.workspaceId,
     alias_id: aliasId,
-    normalized_alias: "ceo@example.com",
-    skeleton: "ceo@example.com",
     skeleton_algorithm: "aaliyah.alias-skeleton/core-subset-v1",
     normalization_profile: "aaliyah.alias-normalization/core-v1",
     canonical_participant_id: VICTIM,
-    registrable_domain: "example.com",
     script_code: "Latn",
     restriction_level: "ascii_only",
     subject_participant_id: VICTIM,
@@ -822,6 +826,11 @@ function rawBindingRow(
     removed_by_mutation_receipt_id: null,
     removed_authorization_id: null,
     payload: JSON.stringify(payload),
+    // The vault columns (migration 047). A raw row carries a well-formed
+    // envelope REFERENCE; it is never decrypted in these fixtures.
+    pii_envelope: JSON.stringify({ keyRef: "pii-key:raw", keyVersion: 1 }),
+    pii_key_ref: "pii-key:raw",
+    pii_key_version: 1,
     ...overrides,
   };
   if (!("payload" in overrides)) base.payload = JSON.stringify(payload);
@@ -840,11 +849,43 @@ async function insertRawBinding(
   const placeholders = BINDING_INSERT_COLUMNS.map(
     (_column, index) => `$${index + 1}`,
   ).join(",");
-  await pool.query(
-    `INSERT INTO memory_alias_bindings (${BINDING_INSERT_COLUMNS.join(", ")})
-     VALUES (${placeholders})`,
-    row.columns,
-  );
+  // Migration 047 refuses to COMMIT a binding without blind-index entries for
+  // both purposes, so a raw binding that is meant to LAND carries two. They
+  // are fixture values of the right form, derived from the alias id and
+  // receipt so two raw bindings never collide by accident.
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO memory_alias_bindings (${BINDING_INSERT_COLUMNS.join(", ")})
+       VALUES (${placeholders})`,
+      row.columns,
+    );
+    const at = (column: string) => row.columns[BINDING_INSERT_COLUMNS.indexOf(column as never)];
+    for (const purpose of ["alias.normalized", "alias.skeleton"]) {
+      await client.query(
+        `INSERT INTO memory_alias_blind_indexes
+           (tenant_id, workspace_id, scope_key, alias_id,
+            binding_mutation_receipt_id, purpose, key_version, index_value)
+         VALUES ($1,$2,$3,$4,$5,$6,1,$7)`,
+        [
+          at("tenant_id"),
+          at("workspace_id"),
+          at("scope_key"),
+          at("alias_id"),
+          at("mutation_receipt_id"),
+          purpose,
+          `bi1.1.${createHash("sha256").update(`${String(at("alias_id"))}|${String(at("mutation_receipt_id"))}|${purpose}`).digest("base64url")}`,
+        ],
+      );
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function nonceConsumedAt(bindingDigest: string): Promise<Date | null> {
@@ -1529,10 +1570,11 @@ test("evidence that is not the evidence the alias cites is refused", async () =>
       action: "assign_alias",
       targetRecordId: VICTIM,
       expectedHead: headOf(1, prepared.genesis),
-      proposedContentDigest: aliasAssignmentDigest({
+      proposedContentDigest: await testAliasAssignmentDigest({
         record: prepared.content,
         alias: prepared.alias,
         evidence: other,
+        scope: SCOPE,
       }),
     }),
   );
@@ -1593,10 +1635,11 @@ test("an alias declaring a scope other than the authorized one is refused", asyn
       action: "assign_alias",
       targetRecordId: VICTIM,
       expectedHead: headOf(1, genesis),
-      proposedContentDigest: aliasAssignmentDigest({
+      proposedContentDigest: await testAliasAssignmentDigest({
         record: content,
-        alias,
-        evidence,
+        alias: alias,
+        evidence: evidence,
+        scope: SCOPE,
       }),
     }),
   );
@@ -1627,10 +1670,11 @@ test("an alias naming a participant other than the authorized record is refused"
       action: "assign_alias",
       targetRecordId: VICTIM,
       expectedHead: headOf(1, genesis),
-      proposedContentDigest: aliasAssignmentDigest({
+      proposedContentDigest: await testAliasAssignmentDigest({
         record: content,
-        alias,
-        evidence,
+        alias: alias,
+        evidence: evidence,
+        scope: SCOPE,
       }),
     }),
   );
@@ -2242,10 +2286,11 @@ test("a revoked authorization, an expired one and a missing nonce are all refuse
       action: "assign_alias",
       targetRecordId: VICTIM,
       expectedHead: headOf(1, genesis),
-      proposedContentDigest: aliasAssignmentDigest({
+      proposedContentDigest: await testAliasAssignmentDigest({
         record: content,
-        alias,
-        evidence,
+        alias: alias,
+        evidence: evidence,
+        scope: SCOPE,
       }),
       issuedAt: isoOffset(-7_200_000),
       expiresAt: isoOffset(-3_600_000),
@@ -2277,10 +2322,11 @@ test("a revoked authorization, an expired one and a missing nonce are all refuse
       action: "assign_alias",
       targetRecordId: VICTIM,
       expectedHead: headOf(1, genesis),
-      proposedContentDigest: aliasAssignmentDigest({
+      proposedContentDigest: await testAliasAssignmentDigest({
         record: content,
         alias: orphanAlias,
-        evidence,
+        evidence: evidence,
+        scope: SCOPE,
       }),
     }),
     { skipNonceRow: true },
@@ -2337,10 +2383,11 @@ test("a receipt ROW marked consumed refuses the assignment even when its nonce i
       action: "assign_alias",
       targetRecordId: VICTIM,
       expectedHead: headOf(1, genesis),
-      proposedContentDigest: aliasAssignmentDigest({
+      proposedContentDigest: await testAliasAssignmentDigest({
         record: content,
-        alias,
-        evidence,
+        alias: alias,
+        evidence: evidence,
+        scope: SCOPE,
       }),
     }),
     { receiptConsumedAt: isoOffset(-30_000) },
@@ -2375,10 +2422,11 @@ test("a receipt whose jsonb PAYLOAD is already consumed is refused", async () =>
       action: "assign_alias",
       targetRecordId: VICTIM,
       expectedHead: headOf(1, genesis),
-      proposedContentDigest: aliasAssignmentDigest({
+      proposedContentDigest: await testAliasAssignmentDigest({
         record: content,
-        alias,
-        evidence,
+        alias: alias,
+        evidence: evidence,
+        scope: SCOPE,
       }),
       consumedAt: isoOffset(-30_000),
     }),
@@ -2505,10 +2553,11 @@ test("a head at the RIGHT VERSION with the wrong content digest is refused", asy
       action: "assign_alias",
       targetRecordId: VICTIM,
       expectedHead: headOf(1, `sha256:${"e".repeat(64)}`),
-      proposedContentDigest: aliasAssignmentDigest({
+      proposedContentDigest: await testAliasAssignmentDigest({
         record: content,
-        alias,
-        evidence,
+        alias: alias,
+        evidence: evidence,
+        scope: SCOPE,
       }),
     }),
   );
@@ -2540,10 +2589,11 @@ test("a nonce row that disagrees with its receipt refuses the assignment", async
       action: "assign_alias",
       targetRecordId: VICTIM,
       expectedHead: headOf(1, genesis),
-      proposedContentDigest: aliasAssignmentDigest({
+      proposedContentDigest: await testAliasAssignmentDigest({
         record: content,
-        alias,
-        evidence,
+        alias: alias,
+        evidence: evidence,
+        scope: SCOPE,
       }),
     }),
     { nonceAction: "remove_alias" },
@@ -2655,8 +2705,6 @@ test("a binding row cannot lie about its scope key or its tenant's policy", asyn
         userId: "u",
       },
       aliasId,
-      normalizedAlias: "a@x.com",
-      skeleton: "a@x.com",
       canonicalParticipantId: "part",
       subjectParticipantId: "part",
       crossWorkspacePolicy: policy,
@@ -2668,16 +2716,17 @@ test("a binding row cannot lie about its scope key or its tenant's policy", asyn
     adminPool.query(
       `INSERT INTO memory_alias_bindings
          (tenant_id, workspace_id, principal_id, user_id,
-          cross_workspace_policy, scope_key, alias_id, normalized_alias,
-          skeleton, skeleton_algorithm, normalization_profile,
-          canonical_participant_id, registrable_domain, script_code,
+          cross_workspace_policy, scope_key, alias_id,
+          skeleton_algorithm, normalization_profile,
+          canonical_participant_id, script_code,
           restriction_level, subject_participant_id, source_evidence_ref,
           source_evidence_digest, observed_at, fresh_until,
-          authorization_id, mutation_receipt_id, bound_at, payload)
-       VALUES ($1,$2,'p','u',$4,$5,$6,'a@x.com',
-               'a@x.com','sk','np','part','x.com','Latn','ascii_only','part',
+          authorization_id, mutation_receipt_id, bound_at, payload,
+              pii_envelope, pii_key_ref, pii_key_version)
+       VALUES ($1,$2,'p','u',$4,$5,$6,
+               'sk','np','part','Latn','ascii_only','part',
                'identity:x/y',$3, now(), now() + interval '1 hour',
-               'auth-x','m.x', now(), $7::jsonb)`,
+               'auth-x','m.x', now(), $7::jsonb, '{"keyRef":"pii-key:raw","keyVersion":1}'::jsonb,'pii-key:raw',1)`,
       [
         TENANT,
         SCOPE.workspaceId,
@@ -2841,7 +2890,7 @@ test("the mutation role can bind and retire, and can do nothing else to a bindin
     await assert.rejects(
       () =>
         client.query(
-          `UPDATE memory_alias_bindings SET normalized_alias = 'other@x.com'
+          `UPDATE memory_alias_bindings SET canonical_participant_id = 'other'
             WHERE tenant_id = $1`,
           [TENANT],
         ),
@@ -2882,17 +2931,17 @@ test("the mutation role can bind and retire, and can do nothing else to a bindin
         reader.query(
           `INSERT INTO memory_alias_bindings (tenant_id, workspace_id,
              principal_id, user_id, cross_workspace_policy, scope_key, alias_id,
-             normalized_alias, skeleton, skeleton_algorithm,
+             skeleton_algorithm,
              normalization_profile, canonical_participant_id,
-             registrable_domain, script_code, restriction_level,
+             script_code, restriction_level,
              subject_participant_id, source_evidence_ref, source_evidence_digest,
              observed_at, fresh_until, authorization_id, mutation_receipt_id,
-             bound_at, payload)
+             bound_at, payload, pii_envelope, pii_key_ref, pii_key_version)
            VALUES ($1,$2,'p','u','workspace_isolated',$2,'alias-reader',
-                   'a@x.com','a@x.com','sk','np','part','x.com','Latn',
+                   'sk','np','part','Latn',
                    'ascii_only','part','identity:x/y',$3, now(),
                    now() + interval '1 hour','auth-x','m.x', now(),
-                   '{}'::jsonb)`,
+                   '{}'::jsonb, '{"keyRef":"pii-key:raw","keyVersion":1}'::jsonb,'pii-key:raw',1)`,
           [TENANT, SCOPE.workspaceId, EVIDENCE_DIGEST],
         ),
       /permission denied for table memory_alias_bindings/,
@@ -3132,21 +3181,21 @@ test("a binding row whose columns disagree with its payload is refused, not reco
   await adminPool.query(
     `INSERT INTO ${UNCHECKED_SCHEMA}.memory_alias_bindings
        (tenant_id, workspace_id, principal_id, user_id,
-        cross_workspace_policy, scope_key, alias_id, normalized_alias,
-        skeleton, skeleton_algorithm, normalization_profile,
-        canonical_participant_id, registrable_domain, script_code,
+        cross_workspace_policy, scope_key, alias_id,
+        skeleton_algorithm, normalization_profile,
+        canonical_participant_id, script_code,
         restriction_level, subject_participant_id, source_evidence_ref,
         source_evidence_digest, observed_at, fresh_until,
-        authorization_id, mutation_receipt_id, bound_at, payload)
+        authorization_id, mutation_receipt_id, bound_at, payload,
+              pii_envelope, pii_key_ref, pii_key_version)
      VALUES ($1,$2,$3,$4,'workspace_isolated',$2,'alias-unchecked',
-             'ceo@example.com','ceo@example.com',
              'aaliyah.alias-skeleton/core-subset-v1',
              'aaliyah.alias-normalization/core-v1',
-             $5,'example.com','Latn','ascii_only',$5,
+             $5,'Latn','ascii_only',$5,
              'identity:verification/participant-record',$6,
              now(), now() + interval '1 hour',
              'auth-alias-00000000000000000000','mutation.unchecked',
-             now(), $7::jsonb)`,
+             now(), $7::jsonb, '{"keyRef":"pii-key:raw","keyVersion":1}'::jsonb,'pii-key:raw',1)`,
     [
       SCOPE.tenantId,
       SCOPE.workspaceId,
@@ -3155,18 +3204,15 @@ test("a binding row whose columns disagree with its payload is refused, not reco
       VICTIM,
       EVIDENCE_DIGEST,
       JSON.stringify({
-        schemaVersion: `${WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION}#alias-binding`,
+        schemaVersion: `${WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION}#alias-binding-stored/v2`,
         aliasId: "alias-unchecked",
         scope: SCOPE,
         crossWorkspacePolicy: "workspace_isolated",
         scopeKey: SCOPE.workspaceId,
         // THE LIE: the payload names a different participant than the column.
         canonicalParticipantId: ATTACKER,
-        normalizedAlias: "ceo@example.com",
         normalizationProfile: "aaliyah.alias-normalization/core-v1",
-        skeleton: "ceo@example.com",
         skeletonAlgorithm: "aaliyah.alias-skeleton/core-subset-v1",
-        registrableDomain: "example.com",
         scriptCode: "Latn",
         restrictionLevel: "ascii_only",
         subjectParticipantId: VICTIM,
@@ -3177,12 +3223,12 @@ test("a binding row whose columns disagree with its payload is refused, not reco
         authorizationId: "auth-alias-00000000000000000000",
         mutationReceiptId: "mutation.unchecked",
         boundAt: isoOffset(-1000),
-        claimed: aliasIdentity({
-          aliasId: "alias-unchecked",
-          observedAlias: "ceo@example.com",
-          participantId: VICTIM,
-          evidence: evidenceFor(VICTIM),
-        }),
+        pii: {
+          algorithm: "AES-256-GCM/aaliyah-pii-envelope-v1",
+          providerId: "local-test/v1",
+          keyRef: "pii-key:raw",
+          keyVersion: 1,
+        },
       }),
     ],
   );
@@ -3233,16 +3279,13 @@ test("every jsonb-to-column binding CHECK on the registry refuses a row that lie
         p.aliasId = "alias-elsewhere";
       },
     },
+    // `normalized_binding` and `skeleton_binding` are GONE with the plaintext
+    // columns they bound (migration 047). The payload may not carry the alias
+    // at all now; that refusal is its own case:
     {
-      constraint: "memory_alias_bindings_normalized_binding",
+      constraint: "memory_alias_bindings_payload_carries_no_alias",
       corrupt: (p) => {
-        p.normalizedAlias = "elsewhere@example.com";
-      },
-    },
-    {
-      constraint: "memory_alias_bindings_skeleton_binding",
-      corrupt: (p) => {
-        p.skeleton = "elsewhere@example.com";
+        p.normalizedAlias = "ceo@example.com";
       },
     },
     {
@@ -3287,8 +3330,6 @@ test("every jsonb-to-column binding CHECK on the registry refuses a row that lie
     const payload: Record<string, unknown> = {
       scope: { ...SCOPE },
       aliasId: `alias-check-${index}`,
-      normalizedAlias: "ceo@example.com",
-      skeleton: "ceo@example.com",
       canonicalParticipantId: VICTIM,
       subjectParticipantId: VICTIM,
       crossWorkspacePolicy: "workspace_isolated",
@@ -3302,18 +3343,19 @@ test("every jsonb-to-column binding CHECK on the registry refuses a row that lie
         adminPool.query(
           `INSERT INTO memory_alias_bindings
              (tenant_id, workspace_id, principal_id, user_id,
-              cross_workspace_policy, scope_key, alias_id, normalized_alias,
-              skeleton, skeleton_algorithm, normalization_profile,
-              canonical_participant_id, registrable_domain, script_code,
+              cross_workspace_policy, scope_key, alias_id,
+              skeleton_algorithm, normalization_profile,
+              canonical_participant_id, script_code,
               restriction_level, subject_participant_id, source_evidence_ref,
               source_evidence_digest, observed_at, fresh_until,
-              authorization_id, mutation_receipt_id, bound_at, payload)
-           VALUES ($1,$2,$3,$4,'workspace_isolated',$2,$5,'ceo@example.com',
-                   'ceo@example.com','sk','np',$6,'example.com','Latn',
+              authorization_id, mutation_receipt_id, bound_at, payload,
+              pii_envelope, pii_key_ref, pii_key_version)
+           VALUES ($1,$2,$3,$4,'workspace_isolated',$2,$5,
+                   'sk','np',$6,'Latn',
                    'ascii_only',$6,'identity:x/y',$7,
                    now(), now() + interval '1 hour',
                    'auth-alias-00000000000000000000','mutation.check',
-                   now(), $8::jsonb)`,
+                   now(), $8::jsonb, '{"keyRef":"pii-key:raw","keyVersion":1}'::jsonb,'pii-key:raw',1)`,
           [
             SCOPE.tenantId,
             SCOPE.workspaceId,
@@ -3373,17 +3415,19 @@ test("Part D the mutation role cannot forge a binding either", async () => {
         client.query(
           `INSERT INTO memory_alias_bindings
              (tenant_id, workspace_id, principal_id, user_id,
-              cross_workspace_policy, scope_key, alias_id, normalized_alias,
-              skeleton, skeleton_algorithm, normalization_profile,
-              canonical_participant_id, registrable_domain, script_code,
+              cross_workspace_policy, scope_key, alias_id,
+              skeleton_algorithm, normalization_profile,
+              canonical_participant_id, script_code,
               restriction_level, subject_participant_id, source_evidence_ref,
               source_evidence_digest, observed_at, fresh_until,
-              authorization_id, mutation_receipt_id, bound_at, payload)
+              authorization_id, mutation_receipt_id, bound_at, payload,
+              pii_envelope, pii_key_ref, pii_key_version)
            VALUES ($1,$2,'p','u','workspace_isolated',$2,'alias-forged',
-                   'ceo@example.com','ceo@example.com','sk','np',$4,
-                   'example.com','Latn','ascii_only',$4,'identity:x/y',$3,
+                   'sk','np',$4,
+                   'Latn','ascii_only',$4,'identity:x/y',$3,
                    now(), now() + interval '1 hour',
-                   'auth-does-not-exist-0000000','mutation.forged', now(), $5)`,
+                   'auth-does-not-exist-0000000','mutation.forged', now(), $5,
+                   '{"keyRef":"pii-key:raw","keyVersion":1}'::jsonb,'pii-key:raw',1)`,
           [
             TENANT,
             SCOPE.workspaceId,
@@ -3397,8 +3441,6 @@ test("Part D the mutation role cannot forge a binding either", async () => {
                 userId: "u",
               },
               aliasId: "alias-forged",
-              normalizedAlias: "ceo@example.com",
-              skeleton: "ceo@example.com",
               canonicalParticipantId: VICTIM,
               subjectParticipantId: VICTIM,
               crossWorkspacePolicy: "workspace_isolated",
@@ -3499,14 +3541,11 @@ async function rawBindUnder(input: {
   await insertRawBinding(
     {
       alias_id: input.aliasId,
-      normalized_alias: input.alias,
-      skeleton: input.alias,
       authorization_id: input.authorizationId,
       mutation_receipt_id: input.mutationReceiptId,
     },
     {
-      normalizedAlias: input.alias,
-      skeleton: input.alias,
+      aliasId: input.aliasId,
       authorizationId: input.authorizationId,
       mutationReceiptId: input.mutationReceiptId,
     },
@@ -3762,13 +3801,15 @@ test("C4-A a binding cannot be RETIRED under an authorization issued to another 
   assert.equal(await activeBindings(), 1);
 });
 
-test("U-4 every alias-binding and protected-domain unique index refuses the one duplicate it exists for", async () => {
+test("U-4 every alias-binding, blind-index and protected-domain unique index refuses the one duplicate it exists for", async () => {
+  // Migration 047 moved alias uniqueness off plaintext columns and onto KEYED
+  // blind-index entries; the indexes destroyed here are the ones that now
+  // decide an alias race.
   await protectDomain(SCOPE, "acme-unique.example");
   await bindThen("alias-unique-active", "ceo@example.com", VICTIM, "mutation.unique.alias.active");
-  // A retired binding, for the removal-receipt index.
-  // A second participant: `bindThen` seeds its participant's genesis.
-  const retired = await bindThen("alias-unique-retired", "cfo@example.com", "record-alias-unique-second", "mutation.unique.alias.retired");
-  assert.equal(typeof retired.headDigest, "string");
+  // A retired binding, for the removal-receipt index. A second participant:
+  // `bindThen` seeds its participant's genesis.
+  await bindThen("alias-unique-retired", "cfo@example.com", "record-alias-unique-second", "mutation.unique.alias.retired");
   await adminPool.query(`ALTER TABLE memory_alias_bindings DISABLE TRIGGER USER`);
   try {
     await adminPool.query(
@@ -3780,70 +3821,70 @@ test("U-4 every alias-binding and protected-domain unique index refuses the one 
   } finally {
     await adminPool.query(`ALTER TABLE memory_alias_bindings ENABLE TRIGGER USER`);
   }
-
-  const other = (label: string) => ({
+  const fresh = (label: string) => ({
     alias_id: `alias-unique-${label}`,
-    normalized_alias: `${label}@example.com`,
-    skeleton: `${label}@example.com`,
     mutation_receipt_id: `mutation.unique.alias.${label}`,
-    payload: {
-      aliasId: `alias-unique-${label}`,
-      normalizedAlias: `${label}@example.com`,
-      skeleton: `${label}@example.com`,
-      mutationReceiptId: `mutation.unique.alias.${label}`,
-    },
+    payload: { aliasId: `alias-unique-${label}`, mutationReceiptId: `mutation.unique.alias.${label}` },
   });
-  const without = (fields: readonly string[], label: string) => {
-    const base = other(label) as Record<string, unknown> & { payload: Record<string, unknown> };
-    const payloadKey: Record<string, string> = {
-      alias_id: "aliasId",
-      normalized_alias: "normalizedAlias",
-      skeleton: "skeleton",
-      mutation_receipt_id: "mutationReceiptId",
-    };
-    for (const field of fields) {
-      delete base[field];
-      delete base.payload[payloadKey[field]!];
-    }
-    return base;
-  };
   const active = { where: "alias_id = $1", params: ["alias-unique-active"] };
 
   await assertUniqueIndexKills(adminPool, {
     table: "memory_alias_bindings",
     index: "memory_alias_bindings_alias_id_unique",
     ...active,
-    freshen: () => without(["alias_id"], "a"),
-    positive: () => other("a"),
-  });
-  await assertUniqueIndexKills(adminPool, {
-    table: "memory_alias_bindings",
-    index: "memory_alias_bindings_alias_unique",
-    ...active,
-    freshen: () => without(["normalized_alias"], "b"),
-    positive: () => other("b"),
-  });
-  await assertUniqueIndexKills(adminPool, {
-    table: "memory_alias_bindings",
-    index: "memory_alias_bindings_skeleton_unique",
-    ...active,
-    freshen: () => without(["skeleton"], "c"),
-    positive: () => other("c"),
+    freshen: () => ({ mutation_receipt_id: "mutation.unique.alias.a", payload: { mutationReceiptId: "mutation.unique.alias.a" } }),
+    positive: () => fresh("a"),
   });
   await assertUniqueIndexKills(adminPool, {
     table: "memory_alias_bindings",
     index: "memory_alias_bindings_receipt_unique",
     ...active,
-    freshen: () => without(["mutation_receipt_id"], "d"),
-    positive: () => other("d"),
+    freshen: () => ({ alias_id: "alias-unique-d", payload: { aliasId: "alias-unique-d" } }),
+    positive: () => fresh("d"),
   });
   await assertUniqueIndexKills(adminPool, {
     table: "memory_alias_bindings",
     index: "memory_alias_bindings_removal_receipt_unique",
     where: "alias_id = $1",
     params: ["alias-unique-retired"],
-    freshen: () => other("e"),
-    positive: () => ({ ...other("e"), removed_by_mutation_receipt_id: "mutation.unique.alias.removal.2" }),
+    freshen: () => fresh("e"),
+    positive: () => ({ ...fresh("e"), removed_by_mutation_receipt_id: "mutation.unique.alias.removal.2" }),
+  });
+  // THE ALIAS RACE, NOW DECIDED BY KEYED INDEX VALUES. An entry for another
+  // binding carrying the same index value under the same key version collides.
+  const normalizedEntry = {
+    where: "binding_mutation_receipt_id = $1 AND purpose = 'alias.normalized'",
+    params: ["mutation.unique.alias.active"],
+  };
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_alias_blind_indexes",
+    index: "memory_alias_blind_indexes_normalized_unique",
+    ...normalizedEntry,
+    freshen: () => ({ binding_mutation_receipt_id: "mutation.unique.alias.other", alias_id: "alias-unique-other" }),
+    positive: () => ({
+      binding_mutation_receipt_id: "mutation.unique.alias.other",
+      alias_id: "alias-unique-other",
+      index_value: `bi1.1.${"A".repeat(43)}`,
+    }),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_alias_blind_indexes",
+    index: "memory_alias_blind_indexes_skeleton_unique",
+    where: "binding_mutation_receipt_id = $1 AND purpose = 'alias.skeleton'",
+    params: ["mutation.unique.alias.active"],
+    freshen: () => ({ binding_mutation_receipt_id: "mutation.unique.alias.other", alias_id: "alias-unique-other" }),
+    positive: () => ({
+      binding_mutation_receipt_id: "mutation.unique.alias.other",
+      alias_id: "alias-unique-other",
+      index_value: `bi1.1.${"B".repeat(43)}`,
+    }),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_alias_blind_indexes",
+    index: "memory_alias_blind_indexes_one_per_version",
+    ...normalizedEntry,
+    freshen: () => ({ index_value: `bi1.1.${"C".repeat(43)}` }),
+    positive: () => ({ index_value: `bi1.2.${"C".repeat(43)}`, key_version: 2 }),
   });
   await assertUniqueIndexKills(adminPool, {
     table: "memory_alias_protected_domains",
@@ -3924,6 +3965,7 @@ test("C7 a participant lock held elsewhere refuses an alias mutation with record
     const started = Date.now();
     const result = await createPostgresAliasRegistryStore(writePool, readPool, {
       lockWaitMs: 400,
+      piiKeys: TEST_PII_KEYS,
     }).assignAlias({
       actor: SCOPE,
       authorizationId: prepared.receipt.authorizationId,

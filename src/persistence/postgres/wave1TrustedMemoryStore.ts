@@ -43,6 +43,7 @@ import {
   type TrustedMemoryStore,
 } from "../../application/memory/wave1TrustedMemory";
 import { appendMutationAttempt } from "./memoryMutationAttempts";
+import type { MemoryPiiKeyProvider } from "../../crypto/memoryPiiKeys";
 
 /**
  * PostgreSQL trusted-memory mutation service.
@@ -304,6 +305,13 @@ export type TrustedMemoryStoreOptions = {
    * transaction itself, so it holds whatever pool the store was handed.
    */
   lockWaitMs?: number;
+  /**
+   * The provider holding alias data keys. A deletion erases the subject's
+   * alias envelopes and indexes in the database regardless; destroying the
+   * KEYS needs the provider, and without one the deletion reports the erasure
+   * incomplete rather than done.
+   */
+  piiKeys?: MemoryPiiKeyProvider | null;
 };
 
 /** Default bound on a mutation's lock waits. */
@@ -354,6 +362,7 @@ export function createPostgresTrustedMemoryStore(
     "readBackRole",
   );
   const lockWaitMs = options.lockWaitMs ?? TRUSTED_MEMORY_LOCK_WAIT_MS;
+  const piiKeys = options.piiKeys ?? null;
   if (!Number.isSafeInteger(lockWaitMs) || lockWaitMs <= 0) {
     // Zero is PostgreSQL's "wait forever". Refused at construction so it can
     // never be configured by accident.
@@ -1516,6 +1525,74 @@ export function createPostgresTrustedMemoryStore(
             tombstone.tombstoneId,
           ],
         );
+        // ---- 6c. THE SUBJECT'S ALIASES, IN THE SAME TRANSACTION ----------
+        //
+        // Red team BREAK 4 against b3efc82: the record's content was destroyed
+        // and the subject's email address survived, active and in cleartext,
+        // in the alias registry. Every binding naming this participant — active
+        // or already retired, under any principal — loses its envelope and is
+        // retired; its blind indexes are nulled; and each data key is recorded
+        // as due for destruction. Migration 047 refuses the COMMIT if any
+        // binding naming this participant is left unerased, and refuses the
+        // binding update without this tombstone or under a legal hold.
+        const erasedAliases = await client.query(
+          `UPDATE memory_alias_bindings
+              SET removed_at = COALESCE(removed_at, now()),
+                  pii_envelope = NULL,
+                  pii_erased_at = now(),
+                  pii_erasure_tombstone_id = $4
+            WHERE tenant_id = $1 AND workspace_id = $2
+              AND canonical_participant_id = $3
+              AND pii_erased_at IS NULL
+          RETURNING alias_id, mutation_receipt_id, pii_key_ref,
+                    payload->'pii'->>'providerId' AS provider_id`,
+          [
+            stored.scope.tenantId,
+            stored.scope.workspaceId,
+            stored.targetRecordId,
+            tombstone.tombstoneId,
+          ],
+        );
+        const aliasRows = erasedAliases.rows as Array<{
+          alias_id: string;
+          mutation_receipt_id: string;
+          pii_key_ref: string;
+          provider_id: string;
+        }>;
+        if (aliasRows.length > 0) {
+          await client.query(
+            `UPDATE memory_alias_blind_indexes
+                SET index_value = NULL, active = false,
+                    erased_at = now(), erasure_tombstone_id = $4
+              WHERE tenant_id = $1 AND workspace_id = $2
+                AND binding_mutation_receipt_id = ANY($3::text[])
+                AND erased_at IS NULL`,
+            [
+              stored.scope.tenantId,
+              stored.scope.workspaceId,
+              aliasRows.map((row) => row.mutation_receipt_id),
+              tombstone.tombstoneId,
+            ],
+          );
+          for (const row of aliasRows) {
+            await client.query(
+              `INSERT INTO memory_pii_key_erasures
+                 (tenant_id, workspace_id, tombstone_id, alias_id,
+                  binding_mutation_receipt_id, key_ref, provider_id, event)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,'erasure_committed')`,
+              [
+                stored.scope.tenantId,
+                stored.scope.workspaceId,
+                tombstone.tombstoneId,
+                row.alias_id,
+                row.mutation_receipt_id,
+                row.pii_key_ref,
+                row.provider_id,
+              ],
+            );
+          }
+        }
+
         if (erased.rowCount !== priorResult.rowCount) {
           // A partial erasure is not a deletion. Unwind rather than report a
           // destruction that did not happen.
@@ -1905,30 +1982,173 @@ export function createPostgresTrustedMemoryStore(
    * accounting cannot be read back is reported as `erasure_incomplete` and
    * never as success.
    */
+  /**
+   * DESTROY THE DATA KEYS WHOSE ERASURE COMMITTED, and record each one the
+   * provider CONFIRMS. Filtered to one tombstone after a deletion, or across
+   * the whole store for the boot-time completion pass.
+   */
+  async function destroyCommittedAliasKeys(filter: {
+    tenantId?: string;
+    workspaceId?: string;
+    tombstoneId?: string;
+    limit: number;
+  }): Promise<{ destroyed: number; pending: number; erased: number }> {
+    const client = await pool.connect();
+    let due: Array<{
+      tenant_id: string;
+      workspace_id: string;
+      tombstone_id: string;
+      alias_id: string;
+      binding_mutation_receipt_id: string;
+      key_ref: string;
+      provider_id: string;
+    }>;
+    let erased = 0;
+    try {
+      await client.query("BEGIN");
+      await enterRole(client, mutationRole);
+      const found = await client.query(
+        `SELECT c.tenant_id, c.workspace_id, c.tombstone_id, c.alias_id,
+                c.binding_mutation_receipt_id, c.key_ref, c.provider_id
+           FROM memory_pii_key_erasures AS c
+          WHERE c.event = 'erasure_committed'
+            AND ($1::text IS NULL OR c.tenant_id = $1)
+            AND ($2::text IS NULL OR c.workspace_id = $2)
+            AND ($3::text IS NULL OR c.tombstone_id = $3)
+            AND NOT EXISTS (
+              SELECT 1 FROM memory_pii_key_erasures AS d
+               WHERE d.tenant_id = c.tenant_id AND d.workspace_id = c.workspace_id
+                 AND d.key_ref = c.key_ref AND d.event = 'key_destroyed')
+          ORDER BY c.id
+          LIMIT $4`,
+        [filter.tenantId ?? null, filter.workspaceId ?? null, filter.tombstoneId ?? null, filter.limit],
+      );
+      due = found.rows;
+      if (filter.tombstoneId !== undefined) {
+        erased = (
+          await client.query(
+            `SELECT count(*)::int AS n FROM memory_pii_key_erasures
+              WHERE tenant_id = $1 AND workspace_id = $2 AND tombstone_id = $3
+                AND event = 'erasure_committed'`,
+            [filter.tenantId, filter.workspaceId, filter.tombstoneId],
+          )
+        ).rows[0].n as number;
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    let destroyed = 0;
+    for (const row of due) {
+      if (piiKeys === null || row.provider_id !== piiKeys.providerId) continue;
+      try {
+        await piiKeys.destroyDataKey({
+          scope: { tenantId: row.tenant_id, workspaceId: row.workspace_id },
+          keyRef: row.key_ref,
+        });
+        // Confirmed by asking again, not by trusting the call's return.
+        const state = await piiKeys.dataKeyState({
+          scope: { tenantId: row.tenant_id, workspaceId: row.workspace_id },
+          keyRef: row.key_ref,
+        });
+        if (state !== "destroyed") continue;
+      } catch {
+        continue;
+      }
+      const writer = await pool.connect();
+      try {
+        await writer.query("BEGIN");
+        await enterRole(writer, mutationRole);
+        await writer.query(
+          `INSERT INTO memory_pii_key_erasures
+             (tenant_id, workspace_id, tombstone_id, alias_id,
+              binding_mutation_receipt_id, key_ref, provider_id, event)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'key_destroyed')
+           ON CONFLICT ON CONSTRAINT memory_pii_key_erasures_once DO NOTHING`,
+          [
+            row.tenant_id,
+            row.workspace_id,
+            row.tombstone_id,
+            row.alias_id,
+            row.binding_mutation_receipt_id,
+            row.key_ref,
+            row.provider_id,
+          ],
+        );
+        await writer.query("COMMIT");
+        destroyed += 1;
+      } catch {
+        await writer.query("ROLLBACK").catch(() => undefined);
+      } finally {
+        writer.release();
+      }
+    }
+    return { destroyed, pending: due.length - destroyed, erased };
+  }
+
+  /**
+   * DELETE, WHICH IS ERASURE, AND THEN AN INDEPENDENT READ-BACK OF THE
+   * ACCOUNTING.
+   *
+   * The tombstone is NOT returned from the writing transaction. It is read
+   * back on the read-back pool, on a different connection under the SELECT-only
+   * role, exactly as the head is — because a tombstone the writer hands back
+   * to itself proves only that the writer built one. A verified deletion whose
+   * accounting cannot be read back is reported as `erasure_incomplete` and
+   * never as success.
+   *
+   * THE SAME HOLDS FOR THE SUBJECT'S ALIASES. After the tombstone reads back,
+   * every data key the deleting transaction recorded as due is destroyed by the
+   * provider and confirmed. A key the provider did not confirm leaves the
+   * deletion `erasure_incomplete`: the database has forgotten the identifier,
+   * but a copy of its ciphertext somewhere else could still be decrypted, and
+   * that is not an erasure.
+   */
   async function deleteRecord(
     request: TrustedMemoryDeleteRequest,
   ): Promise<TrustedMemoryDeleteResult> {
     const result = await mutate("delete", request, request);
-    if (!result.verified) return { ...result, tombstone: null };
-    const tombstone = await readTombstone(
-      request.actor,
-      request.tombstoneId ?? request.mutationReceiptId,
-    ).catch(() => null);
-    if (tombstone === null) {
+    if (!result.verified) return { ...result, tombstone: null, aliasErasure: null };
+    const tombstoneId = request.tombstoneId ?? request.mutationReceiptId;
+    const tombstone = await readTombstone(request.actor, tombstoneId).catch(() => null);
+    const keys = await destroyCommittedAliasKeys({
+      tenantId: request.actor.tenantId,
+      workspaceId: request.actor.workspaceId,
+      tombstoneId,
+      limit: 10_000,
+    }).catch(() => null);
+    const aliasErasure =
+      keys === null
+        ? null
+        : {
+            bindingsErased: keys.erased,
+            keysDestroyed: keys.erased - keys.pending,
+            keysPending: keys.pending,
+          };
+    if (tombstone === null || aliasErasure === null || aliasErasure.keysPending > 0) {
       return {
         verified: false,
         rejection: "erasure_incomplete",
         receipt: result.receipt,
-        tombstone: null,
+        tombstone,
+        aliasErasure,
       };
     }
-    return { ...result, tombstone };
+    return { ...result, tombstone, aliasErasure };
   }
 
   return {
     create: (request) => mutate("create", request),
     correct: (request) => mutate("correct", request),
     delete: deleteRecord,
+    completePendingAliasErasures: async (limit = 100) => {
+      const done = await destroyCommittedAliasKeys({ limit });
+      return { destroyed: done.destroyed, pending: done.pending };
+    },
     restore: (request) => mutate("restore", request),
     promote: (request) => mutate("promote", request),
     mergeIdentity: (request) => mutate("merge_identity", request),

@@ -13,12 +13,24 @@ import {
 import type { Pool, PoolClient } from "pg";
 
 import { appendMutationAttempt } from "./memoryMutationAttempts";
+import {
+  MemoryPiiProviderUnavailable,
+  aliasEnvelopeAssociatedData,
+  type MemoryPiiKeyProvider,
+  type PiiEnvelope,
+} from "../../crypto/memoryPiiKeys";
 
 import {
   ALIAS_TENANT_SCOPE_KEY,
   AliasCrossWorkspacePolicySchema,
   MEMORY_ALIAS_BINDING_SCHEMA_VERSION,
   MemoryAliasBindingSchema,
+  AliasPiiPlaintextSchema,
+  MEMORY_ALIAS_BINDING_STORED_SCHEMA_VERSION,
+  MemoryAliasBindingStoredSchema,
+  MemoryAliasPiiErased,
+  MemoryAliasVaultUnavailable,
+  aliasAssignmentCommitment,
   aliasAssignmentDigest,
   aliasRemovalDigest,
   aliasScopeKey,
@@ -129,9 +141,11 @@ const NONCE_COLUMNS = `tenant_id, workspace_id, binding_digest,
   authorization_id, action, target_record_id,
   issued_at, expires_at, revoked_at, consumed_at`;
 
-const BINDING_COLUMNS = `tenant_id, workspace_id, alias_id, normalized_alias,
-  skeleton, canonical_participant_id, scope_key, cross_workspace_policy,
-  mutation_receipt_id, removed_at, removed_by_mutation_receipt_id, payload`;
+const BINDING_COLUMNS = `tenant_id, workspace_id, alias_id,
+  canonical_participant_id, scope_key, cross_workspace_policy,
+  mutation_receipt_id, removed_at, removed_by_mutation_receipt_id, payload,
+  pii_envelope, pii_key_ref, pii_key_version, pii_erased_at,
+  pii_erasure_tombstone_id`;
 
 /** Unit separator. Keeps a lock key unambiguous across its components. */
 const LOCK_KEY_SEPARATOR = "\u001f";
@@ -183,8 +197,6 @@ type BindingRow = {
   tenant_id: string;
   workspace_id: string;
   alias_id: string;
-  normalized_alias: string;
-  skeleton: string;
   canonical_participant_id: string;
   scope_key: string;
   cross_workspace_policy: string;
@@ -192,7 +204,38 @@ type BindingRow = {
   removed_at: Date | null;
   removed_by_mutation_receipt_id: string | null;
   payload: unknown;
+  pii_envelope: PiiEnvelope | null;
+  pii_key_ref: string;
+  pii_key_version: number;
+  pii_erased_at: Date | null;
+  pii_erasure_tombstone_id: string | null;
 };
+
+/** SQLSTATE lock_not_available. */
+const LOCK_NOT_AVAILABLE = "55P03";
+
+/**
+ * Does `content` carry any of `needles`, anywhere, as or inside a string?
+ * Case-insensitive: the normalized alias is lowercase, and an identifier
+ * written in another case is still the identifier.
+ */
+function carriesPlaintext(content: unknown, needles: readonly string[]): boolean {
+  const lowered = needles.map((n) => n.toLowerCase()).filter((n) => n.length > 0);
+  const walk = (node: unknown): boolean => {
+    if (typeof node === "string") {
+      const hay = node.toLowerCase();
+      return lowered.some((needle) => hay.includes(needle));
+    }
+    if (Array.isArray(node)) return node.some(walk);
+    if (node !== null && typeof node === "object") {
+      return Object.entries(node as Record<string, unknown>).some(
+        ([key, value]) => walk(key) || walk(value),
+      );
+    }
+    return false;
+  };
+  return walk(content);
+}
 
 /** A rejection that must unwind the transaction and emit an abort receipt. */
 class AliasMutationAborted extends Error {
@@ -239,6 +282,13 @@ export type AliasRegistryStoreOptions = {
   readBackRole?: string | null;
   /** How long a binding mutation waits for any lock before refusing. */
   lockWaitMs?: number;
+  /**
+   * The key provider that encrypts, indexes and erases aliases. Absent, the
+   * registry stores nothing and resolves nothing — it fails closed rather than
+   * falling back to plaintext (migration 047 has no plaintext columns left to
+   * fall back to).
+   */
+  piiKeys?: MemoryPiiKeyProvider | null;
 };
 
 /** Default bound on a binding mutation's lock waits. */
@@ -291,6 +341,7 @@ export function createPostgresAliasRegistryStore(
     "readBackRole",
   );
   const lockWaitMs = options.lockWaitMs ?? ALIAS_REGISTRY_LOCK_WAIT_MS;
+  const piiKeys = options.piiKeys ?? null;
   if (!Number.isSafeInteger(lockWaitMs) || lockWaitMs <= 0) {
     throw new Error("alias registry: lockWaitMs must be a positive integer");
   }
@@ -486,21 +537,64 @@ export function createPostgresAliasRegistryStore(
     };
   }
 
-  function bindingFromRow(row: BindingRow): MemoryAliasBinding {
-    const parsed = MemoryAliasBindingSchema.parse(row.payload);
+  /** The non-PII stored form, checked against its columns. */
+  function storedFromRow(row: BindingRow) {
+    const parsed = MemoryAliasBindingStoredSchema.parse(row.payload);
     if (
       parsed.aliasId !== row.alias_id ||
-      parsed.normalizedAlias !== row.normalized_alias ||
-      parsed.skeleton !== row.skeleton ||
       parsed.canonicalParticipantId !== row.canonical_participant_id ||
       parsed.scopeKey !== row.scope_key ||
       parsed.crossWorkspacePolicy !== row.cross_workspace_policy ||
       parsed.scope.tenantId !== row.tenant_id ||
-      parsed.scope.workspaceId !== row.workspace_id
+      parsed.scope.workspaceId !== row.workspace_id ||
+      parsed.pii.keyRef !== row.pii_key_ref ||
+      parsed.pii.keyVersion !== row.pii_key_version
     ) {
       throw new Error("alias registry: binding row and payload mismatch");
     }
     return parsed;
+  }
+
+  /**
+   * THE READABLE BINDING: stored form plus the decrypted identifiers.
+   *
+   * An ERASED binding throws `MemoryAliasPiiErased` — it is neither "no such
+   * binding" nor a binding with blanks where the address was. A destroyed key
+   * throws the provider's `MemoryPiiKeyDestroyed`; an unavailable provider
+   * throws. None of those is returned as an answer.
+   */
+  async function viewFromRow(row: BindingRow): Promise<MemoryAliasBinding> {
+    const stored = storedFromRow(row);
+    if (row.pii_erased_at !== null || row.pii_envelope === null) {
+      throw new MemoryAliasPiiErased(
+        row.alias_id,
+        row.pii_erasure_tombstone_id ?? "unknown",
+      );
+    }
+    if (piiKeys === null) throw new MemoryAliasVaultUnavailable();
+    const plaintext = AliasPiiPlaintextSchema.parse(
+      JSON.parse(
+        await piiKeys.decrypt({
+          scope: { tenantId: row.tenant_id, workspaceId: row.workspace_id },
+          envelope: row.pii_envelope,
+          associatedData: aliasEnvelopeAssociatedData({
+            tenantId: row.tenant_id,
+            workspaceId: row.workspace_id,
+            aliasId: row.alias_id,
+            mutationReceiptId: row.mutation_receipt_id,
+          }),
+        }),
+      ),
+    );
+    const { pii: _pii, schemaVersion: _version, ...rest } = stored;
+    return MemoryAliasBindingSchema.parse({
+      ...rest,
+      schemaVersion: MEMORY_ALIAS_BINDING_SCHEMA_VERSION,
+      normalizedAlias: plaintext.normalizedAlias,
+      skeleton: plaintext.skeleton,
+      registrableDomain: plaintext.registrableDomain,
+      claimed: plaintext.claimed,
+    });
   }
 
   /**
@@ -779,6 +873,13 @@ export function createPostgresAliasRegistryStore(
       };
     }
 
+    // NO VAULT, NO ALIAS. There is nowhere to put an identifier that is not
+    // plaintext, and plaintext is not an option.
+    if (piiKeys === null) {
+      return { verified: false, rejection: "alias_pii_vault_unavailable", receipt: null };
+    }
+    const vault: MemoryPiiKeyProvider = piiKeys;
+
     let stored: MemoryAuthorizationReceipt | null = null;
     let failure:
       | { kind: "abort"; rejection: AliasRegistryRejection }
@@ -790,6 +891,9 @@ export function createPostgresAliasRegistryStore(
     let nextVersion = 0;
     let recordDigest = "";
     let binding: MemoryAliasBinding | null = null;
+    // A data key created for a transaction that then rolls back holds no
+    // ciphertext anywhere; it is destroyed rather than left behind.
+    let createdKey: { keyRef: string } | null = null;
 
     const lockKey = [
       request.actor.tenantId,
@@ -843,14 +947,29 @@ export function createPostgresAliasRegistryStore(
       const expectedHead = resolved.expectedHead;
 
       // ---- THE ALIAS IS BOUND TO THE AUTHORIZATION ----------------------
-      // Record content, alias value and evidence value, all three inside one
-      // digest. Swap any of them and this is a different mutation than the
-      // one that was approved.
+      // Record content, the alias's KEYED commitment and the evidence value,
+      // all three inside one digest. Swap any of them and this is a different
+      // mutation than the one that was approved. The commitment is keyed so
+      // the authorization receipt — which erasure does not touch — is not an
+      // offline oracle for the address.
       let proposedDigest: string;
+      let aliasCommitment: string;
+      try {
+        aliasCommitment = await aliasAssignmentCommitment({
+          piiKeys: vault,
+          scope: stored.scope,
+          alias,
+        });
+      } catch (error) {
+        if (error instanceof MemoryPiiProviderUnavailable) {
+          throw new AliasMutationAborted("alias_pii_vault_unavailable");
+        }
+        throw new AliasMutationAborted("proposed_content_digest_mismatch");
+      }
       try {
         proposedDigest = aliasAssignmentDigest({
           record: request.proposedContent,
-          alias,
+          aliasCommitment,
           evidence,
         });
       } catch {
@@ -935,6 +1054,12 @@ export function createPostgresAliasRegistryStore(
       if (alias.dispositionProposal !== "propose_accept") {
         throw new AliasMutationAborted("alias_disposition_not_acceptable");
       }
+      // The identifier may live ONLY in the vault. Successor record content
+      // carrying it would put it on the record chain, beyond the reach of the
+      // binding's erasure. Refused before anything is spent.
+      if (carriesPlaintext(request.proposedContent, [normalized, alias.observedAlias])) {
+        throw new AliasMutationAborted("alias_plaintext_in_record_content");
+      }
 
       const policy = await readCrossWorkspacePolicy(
         client,
@@ -982,17 +1107,100 @@ export function createPostgresAliasRegistryStore(
         claimed: alias,
       });
 
-      // ---- THE EXCLUSION. One statement, two partial UNIQUE indexes ------
+      // ---- THE VAULT ----------------------------------------------------
+      // One data key per binding, so erasing one subject's aliases destroys
+      // exactly their recoverability and nobody else's. The envelope is bound
+      // to its scope, alias id and receipt as associated data: moved to
+      // another row, it does not decrypt.
+      let envelope: PiiEnvelope;
+      let dataKey: { keyRef: string; keyVersion: number };
+      let normalizedIndexes: string[];
+      let skeletonIndexes: string[];
+      try {
+        dataKey = await vault.createDataKey({
+          scope: { tenantId: binding.scope.tenantId, workspaceId: binding.scope.workspaceId },
+          subjectRef: binding.aliasId,
+        });
+        createdKey = { keyRef: dataKey.keyRef };
+        envelope = await vault.encrypt({
+          scope: { tenantId: binding.scope.tenantId, workspaceId: binding.scope.workspaceId },
+          keyRef: dataKey.keyRef,
+          plaintext: JSON.stringify(
+            AliasPiiPlaintextSchema.parse({
+              normalizedAlias: binding.normalizedAlias,
+              skeleton: binding.skeleton,
+              registrableDomain: binding.registrableDomain,
+              claimed: binding.claimed,
+            }),
+          ),
+          associatedData: aliasEnvelopeAssociatedData({
+            tenantId: binding.scope.tenantId,
+            workspaceId: binding.scope.workspaceId,
+            aliasId: binding.aliasId,
+            mutationReceiptId: binding.mutationReceiptId,
+          }),
+        });
+        // EVERY version still active for lookup, so a binding written during
+        // a rotation collides with one written under either version.
+        const indexScope = { tenantId: binding.scope.tenantId, scopeKey };
+        normalizedIndexes = await vault.blindIndexesForLookup({
+          scope: indexScope,
+          purpose: "alias.normalized",
+          value: binding.normalizedAlias,
+        });
+        skeletonIndexes = await vault.blindIndexesForLookup({
+          scope: indexScope,
+          purpose: "alias.skeleton",
+          value: binding.skeleton,
+        });
+      } catch (error) {
+        if (error instanceof MemoryPiiProviderUnavailable) {
+          throw new AliasMutationAborted("alias_pii_vault_unavailable");
+        }
+        throw error;
+      }
+
+      const storedBinding = MemoryAliasBindingStoredSchema.parse({
+        schemaVersion: MEMORY_ALIAS_BINDING_STORED_SCHEMA_VERSION,
+        aliasId: binding.aliasId,
+        scope: binding.scope,
+        crossWorkspacePolicy: binding.crossWorkspacePolicy,
+        scopeKey: binding.scopeKey,
+        canonicalParticipantId: binding.canonicalParticipantId,
+        normalizationProfile: binding.normalizationProfile,
+        skeletonAlgorithm: binding.skeletonAlgorithm,
+        scriptCode: binding.scriptCode,
+        restrictionLevel: binding.restrictionLevel,
+        subjectParticipantId: binding.subjectParticipantId,
+        sourceEvidenceRef: binding.sourceEvidenceRef,
+        sourceEvidenceDigest: binding.sourceEvidenceDigest,
+        observedAt: binding.observedAt,
+        freshUntil: binding.freshUntil,
+        authorizationId: binding.authorizationId,
+        mutationReceiptId: binding.mutationReceiptId,
+        boundAt: binding.boundAt,
+        pii: {
+          algorithm: envelope.algorithm,
+          providerId: envelope.providerId,
+          keyRef: dataKey.keyRef,
+          keyVersion: dataKey.keyVersion,
+        },
+      });
+
+      // ---- THE EXCLUSION. The binding, then its index entries ------------
+      // The partial UNIQUE indexes on `memory_alias_blind_indexes` decide the
+      // race; this file only translates the resulting SQLSTATE 23505.
       try {
         await client.query(
           `INSERT INTO memory_alias_bindings
              (tenant_id, workspace_id, principal_id, user_id,
-              cross_workspace_policy, scope_key, alias_id, normalized_alias,
-              skeleton, skeleton_algorithm, normalization_profile,
-              canonical_participant_id, registrable_domain, script_code,
+              cross_workspace_policy, scope_key, alias_id,
+              skeleton_algorithm, normalization_profile,
+              canonical_participant_id, script_code,
               restriction_level, subject_participant_id, source_evidence_ref,
               source_evidence_digest, observed_at, fresh_until,
-              authorization_id, mutation_receipt_id, bound_at, payload)
+              authorization_id, mutation_receipt_id, bound_at, payload,
+              pii_envelope, pii_key_ref, pii_key_version)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
                    $17,$18,$19,$20,$21,$22,$23,$24)`,
           [
@@ -1003,12 +1211,9 @@ export function createPostgresAliasRegistryStore(
             binding.crossWorkspacePolicy,
             binding.scopeKey,
             binding.aliasId,
-            binding.normalizedAlias,
-            binding.skeleton,
             binding.skeletonAlgorithm,
             binding.normalizationProfile,
             binding.canonicalParticipantId,
-            binding.registrableDomain,
             binding.scriptCode,
             binding.restrictionLevel,
             binding.subjectParticipantId,
@@ -1019,13 +1224,39 @@ export function createPostgresAliasRegistryStore(
             binding.authorizationId,
             binding.mutationReceiptId,
             binding.boundAt,
-            JSON.stringify(binding),
+            JSON.stringify(storedBinding),
+            JSON.stringify(envelope),
+            dataKey.keyRef,
+            dataKey.keyVersion,
           ],
         );
+        for (const [purpose, values] of [
+          ["alias.normalized", normalizedIndexes],
+          ["alias.skeleton", skeletonIndexes],
+        ] as const) {
+          for (const indexValue of values) {
+            await client.query(
+              `INSERT INTO memory_alias_blind_indexes
+                 (tenant_id, workspace_id, scope_key, alias_id,
+                  binding_mutation_receipt_id, purpose, key_version, index_value)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+              [
+                binding.scope.tenantId,
+                binding.scope.workspaceId,
+                binding.scopeKey,
+                binding.aliasId,
+                binding.mutationReceiptId,
+                purpose,
+                Number(indexValue.split(".")[1]),
+                indexValue,
+              ],
+            );
+          }
+        }
       } catch (error) {
         if (isUniqueViolation(error)) {
           // Translation only. The EXCLUSION happened in the index.
-          if (error.constraint === "memory_alias_bindings_skeleton_unique") {
+          if (error.constraint === "memory_alias_blind_indexes_skeleton_unique") {
             throw new AliasMutationAborted("alias_skeleton_collision");
           }
           throw new AliasMutationAborted("alias_already_bound");
@@ -1059,12 +1290,21 @@ export function createPostgresAliasRegistryStore(
     } catch (error) {
       if (!commitIssued) {
         await client.query("ROLLBACK").catch(() => undefined);
+        if (createdKey !== null) {
+          const orphan = createdKey;
+          await vault
+            .destroyDataKey({
+              scope: { tenantId: request.actor.tenantId, workspaceId: request.actor.workspaceId },
+              keyRef: orphan.keyRef,
+            })
+            .catch(() => undefined);
+        }
       }
       if (error instanceof AliasMutationAborted) {
         failure = { kind: "abort", rejection: error.rejection };
       } else if (
         !commitIssued &&
-        (error as { code?: unknown } | null)?.code === "55P03"
+        (error as { code?: unknown } | null)?.code === LOCK_NOT_AVAILABLE
       ) {
         // A participant lock held past the bound. Rolled back; nothing spent.
         failure = { kind: "abort", rejection: "record_busy" };
@@ -1259,7 +1499,7 @@ export function createPostgresAliasRegistryStore(
       if (retired.rowCount !== 1) {
         throw new AliasMutationAborted("alias_not_bound");
       }
-      const existing = bindingFromRow(retired.rows[0] as BindingRow);
+      const existing = storedFromRow(retired.rows[0] as BindingRow);
       if (existing.canonicalParticipantId !== stored.targetRecordId) {
         throw new AliasMutationAborted("alias_participant_mismatch");
       }
@@ -1295,7 +1535,7 @@ export function createPostgresAliasRegistryStore(
         failure = { kind: "abort", rejection: error.rejection };
       } else if (
         !commitIssued &&
-        (error as { code?: unknown } | null)?.code === "55P03"
+        (error as { code?: unknown } | null)?.code === LOCK_NOT_AVAILABLE
       ) {
         // A participant lock held past the bound. Rolled back; nothing spent.
         failure = { kind: "abort", rejection: "record_busy" };
@@ -1578,30 +1818,57 @@ export function createPostgresAliasRegistryStore(
       [actor.tenantId, actor.workspaceId, aliasId],
     );
     if (row === null) return null;
-    return { binding: bindingFromRow(row), removed: row.removed_at !== null };
+    return { binding: await viewFromRow(row), removed: row.removed_at !== null };
   }
 
   async function resolveAlias(
     actor: TrustedMemoryActor,
     normalizedAlias: string,
   ): Promise<AliasBindingView | null> {
-    // Scoped by BOTH tenant and the two possible scope keys, so a
-    // tenant-exclusive binding made in another workspace is still resolvable
-    // by the workspace that is excluded by it — which is the whole point of
-    // the policy being tenant-wide.
+    if (piiKeys === null) throw new MemoryAliasVaultUnavailable();
+    // Scoped by tenant and by BOTH possible scope keys, so a tenant-exclusive
+    // binding made in another workspace is still resolvable by the workspace
+    // it excludes. The lookup is over KEYED index values under every active
+    // key version — never over the address itself.
+    const candidates = (
+      await Promise.all(
+        [actor.workspaceId, ALIAS_TENANT_SCOPE_KEY].map((scopeKey) =>
+          piiKeys.blindIndexesForLookup({
+            scope: { tenantId: actor.tenantId, scopeKey },
+            purpose: "alias.normalized",
+            value: normalizedAlias,
+          }),
+        ),
+      )
+    ).flat();
     const row = await readOnIndependentPool(
-      `SELECT ${BINDING_COLUMNS}
-         FROM memory_alias_bindings
-        WHERE tenant_id = $1
-          AND scope_key IN ($2, $3)
-          AND normalized_alias = $4
-          AND removed_at IS NULL
-        ORDER BY id DESC
+      `SELECT ${BINDING_COLUMNS.split(",")
+        .map((column) => `b.${column.trim()}`)
+        .join(", ")}
+         FROM memory_alias_bindings AS b
+         JOIN memory_alias_blind_indexes AS i
+           ON i.tenant_id = b.tenant_id
+          AND i.workspace_id = b.workspace_id
+          AND i.binding_mutation_receipt_id = b.mutation_receipt_id
+        WHERE b.tenant_id = $1
+          AND b.scope_key IN ($2, $3)
+          AND i.purpose = 'alias.normalized'
+          AND i.active
+          AND i.index_value = ANY($4::text[])
+          AND b.removed_at IS NULL
+          AND b.pii_erased_at IS NULL
+        ORDER BY b.id DESC
         LIMIT 1`,
-      [actor.tenantId, actor.workspaceId, ALIAS_TENANT_SCOPE_KEY, normalizedAlias],
+      [actor.tenantId, actor.workspaceId, ALIAS_TENANT_SCOPE_KEY, candidates],
     );
     if (row === null) return null;
-    return { binding: bindingFromRow(row), removed: false };
+    const binding = await viewFromRow(row);
+    // An index match that does not decrypt to the address asked for is not a
+    // resolution; it is an integrity failure, and it is refused as one.
+    if (binding.normalizedAlias !== normalizedAlias) {
+      throw new Error("alias registry: a blind index matched a binding that is not this alias");
+    }
+    return { binding, removed: false };
   }
 
   return { assignAlias, removeAlias, readAliasBinding, resolveAlias };

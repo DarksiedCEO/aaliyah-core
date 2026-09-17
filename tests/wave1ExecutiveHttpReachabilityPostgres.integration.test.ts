@@ -20,7 +20,6 @@ import {
   type Principal,
 } from "@aaliyah/contracts/v1";
 
-import { aliasAssignmentDigest } from "../src/application/memory/wave1AliasRegistry";
 import {
   aliasRestrictionLevel,
   coreAliasSkeleton,
@@ -43,6 +42,7 @@ import {
   lockSharedMemoryTables,
   type SharedTableLock,
 } from "./support/sharedMemoryTables";
+import { TEST_PII_KEYS, testAliasAssignmentDigest } from "./support/piiKeys";
 
 /**
  * W1BR-016 — A REAL REQUEST ENTERS THE TRUSTED-MEMORY CHAIN.
@@ -131,7 +131,7 @@ before(async () => {
     },
     executive: {
       // Composed exactly as src/server.ts composes it at boot.
-      memory: createPostgresWave1MemoryService(writePool, readPool),
+      memory: createPostgresWave1MemoryService(writePool, readPool, { piiKeys: TEST_PII_KEYS }),
       pipeline: {
         triageRouter: classifyRouter({
           category: "real_lead",
@@ -173,6 +173,8 @@ beforeEach(async () => {
   await adminPool.query(
     `TRUNCATE memory_identity_edges,
               memory_alias_bindings,
+              memory_alias_blind_indexes,
+              memory_pii_key_erasures,
               memory_record_versions,
               memory_authorization_receipts,
               memory_authorization_nonces,
@@ -361,16 +363,18 @@ async function bindAlias(alias: string, participantId: string, successor: unknow
         version: head!.version,
         contentDigest: head!.contentDigest,
       },
-      proposedContentDigest: aliasAssignmentDigest({
+      proposedContentDigest: await testAliasAssignmentDigest({
         record: successor,
         alias: identity,
-        evidence,
+        evidence: evidence,
+        scope: SCOPE,
       }),
     }),
   );
   const result = await createPostgresAliasRegistryStore(
     writePool,
     readPool,
+    { piiKeys: TEST_PII_KEYS },
   ).assignAlias({
     actor: SCOPE,
     authorizationId: receipt.authorizationId,

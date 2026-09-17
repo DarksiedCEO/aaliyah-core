@@ -101,6 +101,11 @@ export type Wave1MemoryService = {
   }): Promise<ExecutiveMemoryContext | null>;
   /** Resolve outstanding UNKNOWN outcomes. Returns how many it settled. */
   reconcilePending(limit?: number): Promise<number>;
+  /**
+   * Destroy alias data keys whose erasure committed but was never confirmed
+   * — the other half of a deletion a crash or a provider outage interrupted.
+   */
+  completePendingErasures(limit?: number): Promise<{ destroyed: number; pending: number }>;
   /** The canonical identity a record has been merged into, transitively. */
   canonicalIdentity(
     actor: TrustedMemoryActor,
@@ -193,6 +198,10 @@ export function createWave1MemoryService(
     async reconcilePending(limit) {
       const settled = await deps.reconciler.reconcileAll(limit);
       return settled.length;
+    },
+
+    completePendingErasures(limit) {
+      return deps.store.completePendingAliasErasures(limit);
     },
   };
 }

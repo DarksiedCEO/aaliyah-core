@@ -24,6 +24,10 @@ import {
   TRUSTED_MEMORY_REJECTIONS,
   type TrustedMemoryActor,
 } from "./wave1TrustedMemory";
+import {
+  PII_ENVELOPE_ALGORITHM,
+  type MemoryPiiKeyProvider,
+} from "../../crypto/memoryPiiKeys";
 
 /**
  * Wave 1.3 Part D — THE AUTHORITATIVE ALIAS REGISTRY, Core-side vocabulary.
@@ -184,23 +188,116 @@ export const MemoryAliasBindingSchema = z.strictObject({
 export type MemoryAliasBinding = z.infer<typeof MemoryAliasBindingSchema>;
 
 /**
+ * THE BINDING AS IT IS STORED (migration 047). It carries NO alias value: the
+ * normalized alias, the skeleton, the registrable domain and the producer's
+ * claim live only in the encrypted envelope, and the database refuses a
+ * payload carrying any of those members. What remains is non-PII: ids, scope,
+ * policy, algorithm names, script and restriction level, evidence reference
+ * and digest, times, and the reference to the key that can decrypt the rest.
+ */
+export const MEMORY_ALIAS_BINDING_STORED_SCHEMA_VERSION =
+  `${WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION}#alias-binding-stored/v2` as const;
+
+export const MemoryAliasBindingStoredSchema = z.strictObject({
+  schemaVersion: z.literal(MEMORY_ALIAS_BINDING_STORED_SCHEMA_VERSION),
+  aliasId: MemoryIdSchema,
+  scope: MemoryScopeSchema,
+  crossWorkspacePolicy: AliasCrossWorkspacePolicySchema,
+  scopeKey: z.string().min(1).max(128),
+  canonicalParticipantId: MemoryIdSchema,
+  normalizationProfile: z.literal(CORE_ALIAS_NORMALIZATION_PROFILE),
+  skeletonAlgorithm: z.literal(CORE_ALIAS_SKELETON_ALGORITHM),
+  scriptCode: UnicodeScriptCodeSchema,
+  restrictionLevel: UnicodeRestrictionLevelSchema,
+  subjectParticipantId: z.string().min(1),
+  sourceEvidenceRef: Wave1EvidenceRefSchema,
+  sourceEvidenceDigest: CanonicalDigestSchema,
+  observedAt: z.string().datetime(),
+  freshUntil: z.string().datetime(),
+  authorizationId: MemoryAuthorizationIdSchema,
+  mutationReceiptId: MemoryIdSchema,
+  boundAt: z.string().datetime(),
+  pii: z.strictObject({
+    algorithm: z.literal(PII_ENVELOPE_ALGORITHM),
+    providerId: z.string().min(1),
+    keyRef: z.string().min(1),
+    keyVersion: z.number().int().positive(),
+  }),
+});
+export type MemoryAliasBindingStored = z.infer<typeof MemoryAliasBindingStoredSchema>;
+
+/** What the envelope encrypts: exactly the members the stored form omits. */
+export const AliasPiiPlaintextSchema = z.strictObject({
+  normalizedAlias: z.string().min(3).max(254),
+  skeleton: z.string().min(1).max(254),
+  registrableDomain: z.string().min(3).max(253),
+  claimed: CanonicalAliasIdentitySchema,
+});
+export type AliasPiiPlaintext = z.infer<typeof AliasPiiPlaintextSchema>;
+
+/** A binding whose personal identifiers were erased. There is nothing to read. */
+export class MemoryAliasPiiErased extends Error {
+  constructor(
+    readonly aliasId: string,
+    readonly erasureTombstoneId: string,
+  ) {
+    super(`alias ${aliasId} was erased under tombstone ${erasureTombstoneId}`);
+    this.name = "MemoryAliasPiiErased";
+  }
+}
+
+/** The alias registry was built without a PII key provider. Never "no alias". */
+export class MemoryAliasVaultUnavailable extends Error {
+  constructor() {
+    super("alias registry: no PII key provider is configured, so aliases can be neither stored nor resolved");
+    this.name = "MemoryAliasVaultUnavailable";
+  }
+}
+
+/**
+ * A KEYED COMMITMENT TO THE ALIAS, for use inside the authorization digest.
+ *
+ * Before migration 047 the authorization's `proposedContentDigest` hashed the
+ * whole alias value unkeyed, so anyone holding an authorization receipt could
+ * confirm a guessed address offline — and the receipt table is not erased.
+ * The digest now covers this commitment instead: an HMAC under a key the
+ * database never holds. The commitment is deterministic for one alias, scope
+ * and key version, so issuer and store agree; a rotation between issuance and
+ * use changes it, and the mismatch is refused rather than accepted.
+ */
+export async function aliasAssignmentCommitment(input: {
+  piiKeys: MemoryPiiKeyProvider;
+  scope: { tenantId: string; workspaceId: string };
+  alias: CanonicalAliasIdentity;
+}): Promise<string> {
+  return input.piiKeys.blindIndex({
+    scope: { tenantId: input.scope.tenantId, scopeKey: input.scope.workspaceId },
+    purpose: "alias.assignment-commitment",
+    value: canonicalDigest({
+      schemaVersion: MEMORY_ALIAS_ASSIGNMENT_SCHEMA_VERSION,
+      value: input.alias,
+    }),
+  });
+}
+
+/**
  * The digest an `assign_alias` authorization binds.
  *
- * All three components are inside it. An issuer approves ONE alias, for ONE
- * participant, on ONE piece of subject-bound evidence, advancing ONE record to
- * ONE successor content — and a request that changes any of those is a
- * different mutation than the one approved.
+ * All three components are inside it. An issuer approves ONE alias (through
+ * its keyed commitment), for ONE participant, on ONE piece of subject-bound
+ * evidence, advancing ONE record to ONE successor content — and a request that
+ * changes any of those is a different mutation than the one approved.
  */
 export function aliasAssignmentDigest(input: {
   record: unknown;
-  alias: CanonicalAliasIdentity;
+  aliasCommitment: string;
   evidence: Wave1SubjectBoundEvidence;
 }): string {
   return canonicalDigest({
     schemaVersion: MEMORY_ALIAS_ASSIGNMENT_SCHEMA_VERSION,
     value: {
       record: input.record,
-      alias: input.alias,
+      aliasCommitment: input.aliasCommitment,
       evidence: input.evidence,
     },
   });
@@ -267,6 +364,14 @@ export const ALIAS_REGISTRY_REJECTIONS = [
   "alias_skeleton_collision",
   /** Nothing active to remove under this alias id in this scope. */
   "alias_not_bound",
+  /** No PII key provider: an alias cannot be stored without being encrypted. */
+  "alias_pii_vault_unavailable",
+  /**
+   * The successor record content carries the alias in plaintext. The record
+   * chain would then hold the identifier outside the vault, where binding
+   * erasure cannot reach it.
+   */
+  "alias_plaintext_in_record_content",
 ] as const;
 export type AliasRegistryRejection = (typeof ALIAS_REGISTRY_REJECTIONS)[number];
 

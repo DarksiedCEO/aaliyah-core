@@ -4133,6 +4133,568 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
         CHECK (payload ->> 'authorizationId' IS NOT NULL
                AND payload ->> 'authorizationId' = authorization_id)`,
   },
+  {
+    // ------------------------------------------------------------------
+    // THE ALIAS VAULT: NO PLAINTEXT PERSONAL IDENTIFIER IS STORED, AND
+    // ERASURE DESTROYS RECOVERABILITY.
+    //
+    // Red team BREAK 4 against b3efc82. After a `subject_erasure_request`,
+    // `memory_alias_bindings` still held the subject's email address in
+    // cleartext — in `normalized_alias`, `skeleton`, `registrable_domain` and
+    // twice more in the payload — still ACTIVE, still resolvable, and
+    // `aaliyah_alias_binding_guard` refused both DELETE and redaction for every
+    // writer including the table owner. The address was architecturally
+    // indestructible, and that was disclosed nowhere.
+    //
+    // FOUNDER DECISION, LOCKED: erasure covers personally identifying aliases,
+    // subject to independently enforced legal-hold and retention rules, and the
+    // minimum non-PII evidence that an authorized erasure occurred survives.
+    //
+    // WHAT THIS MIGRATION MAKES TRUE, IN THE DATABASE:
+    //
+    //   - The three plaintext columns are GONE, and a binding's payload may not
+    //     carry the alias in any of the members it used to. The alias lives
+    //     only in `pii_envelope` — ciphertext under a per-binding data key
+    //     whose material is held by a key provider OUTSIDE PostgreSQL.
+    //   - Uniqueness and lookup are over BLIND INDEXES in
+    //     `memory_alias_blind_indexes`: keyed HMAC values, one row per binding,
+    //     purpose and key version, so a rotation keeps both old and new
+    //     versions findable and colliding until the old one is retired.
+    //   - ERASURE is the one change an erased-or-retired binding still accepts:
+    //     the envelope is nulled, the binding is retired, and its index values
+    //     are nulled and deactivated — witnessed by a tombstone that destroyed
+    //     the participant record, refused under an applicable legal hold. The
+    //     data key is then destroyed by the provider, and
+    //     `memory_pii_key_erasures` records both steps as non-PII evidence, so
+    //     "the database forgot" and "the key is gone" are separately provable
+    //     and a crash between them is recoverable rather than silent.
+    //
+    // WHAT IT DOES NOT MAKE TRUE: the database cannot verify that an index
+    // value is the correct HMAC of anything — it has no key. It enforces
+    // presence, form, version agreement, uniqueness and erasure shape; a writer
+    // holding the mutator role and the provider could still index garbage.
+    //
+    // NOT REPLAYED OVER PLAINTEXT. Existing plaintext bindings cannot be
+    // encrypted here — the key is not in the database — so the migration
+    // refuses to run over any, rather than dropping the columns and destroying
+    // them unaccounted.
+    // ------------------------------------------------------------------
+    id: "047_memory_alias_pii_vault",
+    sql: `DO $do$
+      DECLARE
+        plaintext bigint;
+      BEGIN
+        -- Only while the plaintext column still exists: re-applying this
+        -- migration over vault rows (an interrupted-deploy re-run of the
+        -- highest migration, W1BR-014) is not a refusal case.
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+           WHERE table_schema = 'public'
+             AND table_name = 'memory_alias_bindings'
+             AND column_name = 'normalized_alias') THEN
+          RETURN;
+        END IF;
+        SELECT count(*) INTO plaintext FROM memory_alias_bindings;
+        IF plaintext > 0 THEN
+          RAISE EXCEPTION
+            'aaliyah memory: % plaintext alias binding(s) exist; migration 047 will not drop personal identifiers it cannot first re-encrypt',
+            plaintext;
+        END IF;
+      END
+      $do$;
+
+    ALTER TABLE memory_alias_bindings
+      DROP COLUMN IF EXISTS normalized_alias CASCADE,
+      DROP COLUMN IF EXISTS skeleton CASCADE,
+      DROP COLUMN IF EXISTS registrable_domain CASCADE,
+      ADD COLUMN IF NOT EXISTS pii_envelope jsonb,
+      ADD COLUMN IF NOT EXISTS pii_key_ref text NOT NULL,
+      ADD COLUMN IF NOT EXISTS pii_key_version integer NOT NULL,
+      ADD COLUMN IF NOT EXISTS pii_erased_at timestamptz,
+      ADD COLUMN IF NOT EXISTS pii_erasure_tombstone_id text;
+
+    ALTER TABLE memory_alias_bindings
+      DROP CONSTRAINT IF EXISTS memory_alias_bindings_removal_witness,
+      DROP CONSTRAINT IF EXISTS memory_alias_bindings_pii_key_version_positive,
+      DROP CONSTRAINT IF EXISTS memory_alias_bindings_pii_present_or_erased,
+      DROP CONSTRAINT IF EXISTS memory_alias_bindings_erased_is_retired,
+      DROP CONSTRAINT IF EXISTS memory_alias_bindings_envelope_key_binding,
+      DROP CONSTRAINT IF EXISTS memory_alias_bindings_payload_carries_no_alias;
+    ALTER TABLE memory_alias_bindings
+      ADD CONSTRAINT memory_alias_bindings_removal_witness CHECK (
+        (removed_by_mutation_receipt_id IS NULL) = (removed_authorization_id IS NULL)
+        AND (removed_by_mutation_receipt_id IS NULL OR removed_at IS NOT NULL)
+        AND (removed_at IS NULL
+             OR removed_by_mutation_receipt_id IS NOT NULL
+             OR pii_erasure_tombstone_id IS NOT NULL)),
+      ADD CONSTRAINT memory_alias_bindings_pii_key_version_positive
+        CHECK (pii_key_version > 0),
+      ADD CONSTRAINT memory_alias_bindings_pii_present_or_erased CHECK (
+        (pii_erased_at IS NULL AND pii_erasure_tombstone_id IS NULL
+         AND pii_envelope IS NOT NULL AND jsonb_typeof(pii_envelope) = 'object')
+        OR (pii_erased_at IS NOT NULL AND pii_erasure_tombstone_id IS NOT NULL
+            AND pii_envelope IS NULL)),
+      ADD CONSTRAINT memory_alias_bindings_erased_is_retired
+        CHECK (pii_erased_at IS NULL OR removed_at IS NOT NULL),
+      ADD CONSTRAINT memory_alias_bindings_envelope_key_binding CHECK (
+        pii_envelope IS NULL
+        OR (pii_envelope ->> 'keyRef' IS NOT NULL
+            AND pii_envelope ->> 'keyRef' = pii_key_ref
+            AND pii_envelope ->> 'keyVersion' IS NOT NULL
+            AND pii_envelope ->> 'keyVersion' = pii_key_version::text)),
+      ADD CONSTRAINT memory_alias_bindings_payload_carries_no_alias CHECK (
+        NOT (payload ?| ARRAY['normalizedAlias','skeleton','registrableDomain',
+                              'claimed','observedAlias']));
+
+    CREATE TABLE IF NOT EXISTS memory_alias_blind_indexes (
+      id bigserial PRIMARY KEY,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      scope_key text NOT NULL,
+      alias_id text NOT NULL,
+      binding_mutation_receipt_id text NOT NULL,
+      purpose text NOT NULL,
+      key_version integer NOT NULL,
+      index_value text,
+      active boolean NOT NULL DEFAULT true,
+      erased_at timestamptz,
+      erasure_tombstone_id text,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT memory_alias_blind_indexes_purpose_domain
+        CHECK (purpose IN ('alias.normalized','alias.skeleton')),
+      CONSTRAINT memory_alias_blind_indexes_version_positive
+        CHECK (key_version > 0),
+      CONSTRAINT memory_alias_blind_indexes_value_form CHECK (
+        index_value IS NULL
+        OR index_value ~ '^bi1\\.[1-9][0-9]{0,5}\\.[A-Za-z0-9_-]{43}$'),
+      CONSTRAINT memory_alias_blind_indexes_version_agreement CHECK (
+        index_value IS NULL
+        OR split_part(index_value, '.', 2) = key_version::text),
+      CONSTRAINT memory_alias_blind_indexes_present_or_erased CHECK (
+        (erased_at IS NULL AND erasure_tombstone_id IS NULL AND index_value IS NOT NULL)
+        OR (erased_at IS NOT NULL AND erasure_tombstone_id IS NOT NULL
+            AND index_value IS NULL AND NOT active)),
+      CONSTRAINT memory_alias_blind_indexes_one_per_version
+        UNIQUE (tenant_id, workspace_id, binding_mutation_receipt_id, purpose, key_version)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS memory_alias_blind_indexes_normalized_unique
+      ON memory_alias_blind_indexes (tenant_id, scope_key, key_version, index_value)
+      WHERE active AND purpose = 'alias.normalized';
+    CREATE UNIQUE INDEX IF NOT EXISTS memory_alias_blind_indexes_skeleton_unique
+      ON memory_alias_blind_indexes (tenant_id, scope_key, key_version, index_value)
+      WHERE active AND purpose = 'alias.skeleton';
+    CREATE INDEX IF NOT EXISTS idx_memory_alias_blind_indexes_binding
+      ON memory_alias_blind_indexes (tenant_id, workspace_id, binding_mutation_receipt_id);
+
+    -- An index entry belongs to an ACTIVE, UNERASED binding in its own scope.
+    CREATE OR REPLACE FUNCTION public.aaliyah_alias_index_insert_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      BEGIN
+        IF NOT NEW.active OR NEW.erased_at IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: an index entry is written active and unerased'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        PERFORM 1 FROM public.memory_alias_bindings AS b
+         WHERE b.tenant_id = NEW.tenant_id
+           AND b.workspace_id = NEW.workspace_id
+           AND b.alias_id = NEW.alias_id
+           AND b.mutation_receipt_id = NEW.binding_mutation_receipt_id
+           AND b.scope_key = NEW.scope_key
+           AND b.removed_at IS NULL
+           AND b.pii_erased_at IS NULL;
+        IF NOT FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: an index entry must belong to an active binding in its scope'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_alias_blind_indexes_belongs ON memory_alias_blind_indexes;
+    CREATE TRIGGER memory_alias_blind_indexes_belongs
+      AFTER INSERT ON memory_alias_blind_indexes
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_alias_index_insert_guard();
+
+    -- Two transitions only: deactivation with the binding's retirement, and
+    -- erasure with the binding's erasure. No DELETE, for anyone.
+    CREATE OR REPLACE FUNCTION public.aaliyah_alias_index_update_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      BEGIN
+        IF TG_OP = 'DELETE' THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: DELETE on memory_alias_blind_indexes is forbidden; an index entry is erased, never removed'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF OLD.erased_at IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: an erased index entry is immutable'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.erased_at IS NOT NULL THEN
+          IF (pg_catalog.to_jsonb(NEW) - 'index_value' - 'active' - 'erased_at' - 'erasure_tombstone_id')
+             IS DISTINCT FROM
+             (pg_catalog.to_jsonb(OLD) - 'index_value' - 'active' - 'erased_at' - 'erasure_tombstone_id') THEN
+            RAISE EXCEPTION
+              'aaliyah alias registry: erasure may not rewrite an index entry'
+              USING ERRCODE = 'check_violation';
+          END IF;
+          PERFORM 1 FROM public.memory_alias_bindings AS b
+           WHERE b.tenant_id = NEW.tenant_id
+             AND b.workspace_id = NEW.workspace_id
+             AND b.mutation_receipt_id = NEW.binding_mutation_receipt_id
+             AND b.pii_erasure_tombstone_id = NEW.erasure_tombstone_id;
+          IF NOT FOUND THEN
+            RAISE EXCEPTION
+              'aaliyah alias registry: an index entry is erased only with its binding'
+              USING ERRCODE = 'check_violation';
+          END IF;
+          RETURN NEW;
+        END IF;
+        IF (pg_catalog.to_jsonb(NEW) - 'active') IS DISTINCT FROM (pg_catalog.to_jsonb(OLD) - 'active')
+           OR NEW.active OR NOT OLD.active THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: deactivation is the only other permitted update'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        PERFORM 1 FROM public.memory_alias_bindings AS b
+         WHERE b.tenant_id = NEW.tenant_id
+           AND b.workspace_id = NEW.workspace_id
+           AND b.mutation_receipt_id = NEW.binding_mutation_receipt_id
+           AND b.removed_at IS NOT NULL;
+        IF NOT FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: an index entry is deactivated only with its binding'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_alias_blind_indexes_guard ON memory_alias_blind_indexes;
+    CREATE TRIGGER memory_alias_blind_indexes_guard
+      BEFORE UPDATE OR DELETE ON memory_alias_blind_indexes
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_alias_index_update_guard();
+
+    -- Retiring a binding deactivates its index entries in the same statement,
+    -- so a retired alias can never keep a uniqueness claim or answer a lookup.
+    CREATE OR REPLACE FUNCTION public.aaliyah_alias_retirement_deactivates_indexes()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      BEGIN
+        IF OLD.removed_at IS NULL AND NEW.removed_at IS NOT NULL
+           AND NEW.pii_erased_at IS NULL THEN
+          UPDATE public.memory_alias_blind_indexes AS i
+             SET active = false
+           WHERE i.tenant_id = NEW.tenant_id
+             AND i.workspace_id = NEW.workspace_id
+             AND i.binding_mutation_receipt_id = NEW.mutation_receipt_id
+             AND i.active;
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_alias_bindings_retirement_deactivates
+      ON memory_alias_bindings;
+    CREATE TRIGGER memory_alias_bindings_retirement_deactivates
+      AFTER UPDATE OF removed_at ON memory_alias_bindings
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_alias_retirement_deactivates_indexes();
+
+    -- A binding COMMITS with index entries for both purposes, or not at all:
+    -- a binding with none would escape the uniqueness it exists under.
+    CREATE OR REPLACE FUNCTION public.aaliyah_alias_binding_indexed()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      BEGIN
+        IF (SELECT count(DISTINCT i.purpose) FROM public.memory_alias_blind_indexes AS i
+             WHERE i.tenant_id = NEW.tenant_id
+               AND i.workspace_id = NEW.workspace_id
+               AND i.binding_mutation_receipt_id = NEW.mutation_receipt_id) <> 2 THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: a binding must commit with blind index entries for both purposes'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_alias_bindings_indexed ON memory_alias_bindings;
+    CREATE CONSTRAINT TRIGGER memory_alias_bindings_indexed
+      AFTER INSERT ON memory_alias_bindings
+      DEFERRABLE INITIALLY DEFERRED
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_alias_binding_indexed();
+
+    -- THE RETIRE-ONLY GUARD, WITH ERASURE AS ITS ONE ADDITIONAL TRANSITION.
+    CREATE OR REPLACE FUNCTION public.aaliyah_alias_binding_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        witnessed boolean;
+        crossed boolean;
+      BEGIN
+        IF TG_OP = 'DELETE' THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: DELETE on % is forbidden; a binding is retired, never erased'
+            , TG_TABLE_NAME
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF OLD.pii_erased_at IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: an erased alias binding is immutable'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.pii_erased_at IS NOT NULL THEN
+          IF (pg_catalog.to_jsonb(NEW) - 'pii_envelope' - 'pii_erased_at'
+                - 'pii_erasure_tombstone_id' - 'removed_at')
+             IS DISTINCT FROM
+             (pg_catalog.to_jsonb(OLD) - 'pii_envelope' - 'pii_erased_at'
+                - 'pii_erasure_tombstone_id' - 'removed_at') THEN
+            RAISE EXCEPTION
+              'aaliyah alias registry: erasure may not rewrite a binding'
+              USING ERRCODE = 'check_violation';
+          END IF;
+          IF OLD.removed_at IS NOT NULL AND NEW.removed_at IS DISTINCT FROM OLD.removed_at THEN
+            RAISE EXCEPTION
+              'aaliyah alias registry: erasure may not move a retirement'
+              USING ERRCODE = 'check_violation';
+          END IF;
+          PERFORM 1 FROM public.memory_tombstones AS t
+           WHERE t.tenant_id = NEW.tenant_id
+             AND t.workspace_id = NEW.workspace_id
+             AND t.tombstone_id = NEW.pii_erasure_tombstone_id
+             AND t.target_record_id = NEW.canonical_participant_id;
+          IF NOT FOUND THEN
+            RAISE EXCEPTION
+              'aaliyah alias registry: no tombstone of this participant witnesses this erasure'
+              USING ERRCODE = 'check_violation';
+          END IF;
+          RETURN NEW;
+        END IF;
+        IF OLD.removed_at IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: a retired alias binding is immutable'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.removed_at IS NULL THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: retirement is the only permitted update'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF (pg_catalog.to_jsonb(NEW) - 'removed_at' - 'removed_by_mutation_receipt_id'
+              - 'removed_authorization_id')
+           IS DISTINCT FROM
+           (pg_catalog.to_jsonb(OLD) - 'removed_at' - 'removed_by_mutation_receipt_id'
+              - 'removed_authorization_id') THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: retirement may not rewrite a binding'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.aaliyah_memory_spent_nonce(
+                   NEW.tenant_id, NEW.removed_authorization_id,
+                   NEW.removed_by_mutation_receipt_id) AS n
+        ) INTO witnessed;
+        IF NOT witnessed THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: no consumed authorization witnesses this retirement'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        SELECT EXISTS (
+          SELECT 1
+            FROM public.memory_alias_bindings AS b
+           WHERE b.tenant_id = NEW.tenant_id
+             AND b.workspace_id = NEW.workspace_id
+             AND b.mutation_receipt_id = NEW.removed_by_mutation_receipt_id
+        ) INTO crossed;
+        IF crossed THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: this authorization has already been spent on another binding'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$;
+
+    -- The hold guard, taught that an ERASURE is a delete of the participant.
+    CREATE OR REPLACE FUNCTION public.aaliyah_alias_binding_hold_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        acted text;
+        target text;
+        blocking text;
+        auth_id text;
+        receipt_id text;
+      BEGIN
+        IF TG_OP = 'UPDATE' AND OLD.pii_erased_at IS NULL AND NEW.pii_erased_at IS NOT NULL THEN
+          blocking := public.aaliyah_memory_restricting_hold(
+            NEW.tenant_id, NEW.workspace_id, NEW.canonical_participant_id,
+            NEW.canonical_participant_id, 'delete');
+          IF blocking IS NOT NULL THEN
+            RAISE EXCEPTION
+              'aaliyah alias registry: legal hold % restricts erasure of this participant''s aliases'
+              , blocking
+              USING ERRCODE = 'check_violation';
+          END IF;
+          RETURN NULL;
+        END IF;
+        IF TG_OP = 'INSERT' THEN
+          auth_id := NEW.authorization_id;
+          receipt_id := NEW.mutation_receipt_id;
+        ELSE
+          auth_id := NEW.removed_authorization_id;
+          receipt_id := NEW.removed_by_mutation_receipt_id;
+        END IF;
+        SELECT n.action, n.target_record_id INTO acted, target
+          FROM public.memory_authorization_nonces AS n
+         WHERE n.tenant_id = NEW.tenant_id
+           AND n.authorization_id = auth_id
+           AND n.consumed_at IS NOT NULL
+           AND n.consumed_by_mutation_receipt_id = receipt_id
+         LIMIT 1;
+        IF acted IS NULL THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: the action of this binding cannot be resolved, so a legal hold cannot be evaluated'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        blocking := public.aaliyah_memory_restricting_hold(
+          NEW.tenant_id, NEW.workspace_id, target,
+          NEW.canonical_participant_id, acted);
+        IF blocking IS NOT NULL THEN
+          RAISE EXCEPTION
+            'aaliyah alias registry: legal hold % restricts % on this participant'
+            , blocking, acted
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+
+    CREATE TABLE IF NOT EXISTS memory_pii_key_erasures (
+      id bigserial PRIMARY KEY,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      tombstone_id text NOT NULL,
+      alias_id text NOT NULL,
+      binding_mutation_receipt_id text NOT NULL,
+      key_ref text NOT NULL,
+      provider_id text NOT NULL,
+      event text NOT NULL,
+      recorded_at timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT memory_pii_key_erasures_event_domain
+        CHECK (event IN ('erasure_committed','key_destroyed')),
+      CONSTRAINT memory_pii_key_erasures_once
+        UNIQUE (tenant_id, workspace_id, key_ref, event)
+    );
+    DROP TRIGGER IF EXISTS memory_pii_key_erasures_append_only ON memory_pii_key_erasures;
+    CREATE TRIGGER memory_pii_key_erasures_append_only
+      BEFORE UPDATE OR DELETE ON memory_pii_key_erasures
+      FOR EACH ROW EXECUTE FUNCTION aaliyah_memory_forbid_row_rewrite();
+    CREATE OR REPLACE FUNCTION public.aaliyah_pii_key_erasure_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      BEGIN
+        IF NEW.event = 'erasure_committed' THEN
+          PERFORM 1 FROM public.memory_alias_bindings AS b
+           WHERE b.tenant_id = NEW.tenant_id
+             AND b.workspace_id = NEW.workspace_id
+             AND b.mutation_receipt_id = NEW.binding_mutation_receipt_id
+             AND b.alias_id = NEW.alias_id
+             AND b.pii_key_ref = NEW.key_ref
+             AND b.pii_erasure_tombstone_id = NEW.tombstone_id
+             AND b.pii_envelope IS NULL;
+          IF NOT FOUND THEN
+            RAISE EXCEPTION
+              'aaliyah memory: a committed erasure must name a binding erased under that tombstone and key'
+              USING ERRCODE = 'check_violation';
+          END IF;
+        ELSE
+          PERFORM 1 FROM public.memory_pii_key_erasures AS e
+           WHERE e.tenant_id = NEW.tenant_id
+             AND e.workspace_id = NEW.workspace_id
+             AND e.key_ref = NEW.key_ref
+             AND e.tombstone_id = NEW.tombstone_id
+             AND e.event = 'erasure_committed';
+          IF NOT FOUND THEN
+            RAISE EXCEPTION
+              'aaliyah memory: a key is recorded destroyed only after its erasure committed'
+              USING ERRCODE = 'check_violation';
+          END IF;
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_pii_key_erasures_witnessed ON memory_pii_key_erasures;
+    CREATE TRIGGER memory_pii_key_erasures_witnessed
+      AFTER INSERT ON memory_pii_key_erasures
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_pii_key_erasure_guard();
+
+    -- A DELETION CANNOT COMMIT WHILE ITS SUBJECT'S ALIASES SURVIVE.
+    -- Deferred to COMMIT, so the deleting transaction may write the tombstone
+    -- first and erase the bindings after it; what it may not do is finish
+    -- without having erased them. This is what makes the cascade a property of
+    -- the database rather than of the store that happens to perform it.
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_tombstone_erases_aliases()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      BEGIN
+        PERFORM 1 FROM public.memory_alias_bindings AS b
+         WHERE b.tenant_id = NEW.tenant_id
+           AND b.workspace_id = NEW.workspace_id
+           AND b.canonical_participant_id = NEW.target_record_id
+           AND b.pii_erased_at IS NULL
+         LIMIT 1;
+        IF FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a deleted participant may not keep an unerased alias'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_tombstones_aliases_erased ON memory_tombstones;
+    CREATE CONSTRAINT TRIGGER memory_tombstones_aliases_erased
+      AFTER INSERT ON memory_tombstones
+      DEFERRABLE INITIALLY DEFERRED
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_tombstone_erases_aliases();
+
+    GRANT SELECT ON memory_alias_blind_indexes, memory_pii_key_erasures
+      TO aaliyah_memory_mutator, aaliyah_memory_reader, aaliyah_memory_reconciler,
+         aaliyah_memory_issuer, aaliyah_memory_revoker;
+    GRANT INSERT ON memory_alias_blind_indexes, memory_pii_key_erasures
+      TO aaliyah_memory_mutator;
+    GRANT UPDATE (index_value, active, erased_at, erasure_tombstone_id)
+      ON memory_alias_blind_indexes TO aaliyah_memory_mutator;
+    GRANT UPDATE (pii_envelope, pii_erased_at, pii_erasure_tombstone_id)
+      ON memory_alias_bindings TO aaliyah_memory_mutator;
+    GRANT USAGE, SELECT ON SEQUENCE memory_alias_blind_indexes_id_seq,
+      memory_pii_key_erasures_id_seq TO aaliyah_memory_mutator`,
+  },
 ];
 
 /**

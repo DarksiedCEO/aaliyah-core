@@ -89,7 +89,15 @@ async function main(): Promise<void> {
     // ambiguous outcome could not be settled would turn a historical unknown
     // into a total outage. The unknown stays durable and stays unknown, which
     // is exactly what it did before this ran.
-    memoryService = createPostgresWave1MemoryService(pool, readPool);
+    // NO PRODUCTION PII KEY PROVIDER IS PROVISIONED. The alias vault is
+    // therefore stated as absent, not faked: the registry refuses to store or
+    // resolve an alias, the executive route records memory UNAVAILABLE for a
+    // sender, and a deletion reports alias key destruction incomplete. The
+    // local test provider refuses NODE_ENV=production by construction.
+    memoryService = createPostgresWave1MemoryService(pool, readPool, { piiKeys: null });
+    process.stdout.write(
+      "trusted memory: alias vault NOT configured (no production PII key provider) — aliases are neither stored nor resolved\n",
+    );
     const memory = memoryService;
     try {
       const settled = await memory.reconcilePending();
@@ -98,6 +106,12 @@ async function main(): Promise<void> {
           ? "trusted memory: no unresolved mutations\n"
           : `trusted memory: reconciled ${settled} unresolved mutation(s)\n`,
       );
+      const erasures = await memory.completePendingErasures().catch(() => null);
+      if (erasures !== null && erasures.pending > 0) {
+        process.stderr.write(
+          `trusted memory: ${erasures.pending} alias key erasure(s) remain unconfirmed\n`,
+        );
+      }
     } catch (error) {
       process.stderr.write(
         `trusted memory: reconciliation pass failed (${

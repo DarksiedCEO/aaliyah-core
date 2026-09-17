@@ -9,6 +9,7 @@ import type { TrustedMemoryActor } from "../../application/memory/wave1TrustedMe
 import { createPostgresAliasRegistryStore } from "./wave1AliasRegistryStore";
 import { createPostgresMemoryReconciler } from "./wave1MemoryReconciler";
 import { createPostgresTrustedMemoryStore } from "./wave1TrustedMemoryStore";
+import type { MemoryPiiKeyProvider } from "../../crypto/memoryPiiKeys";
 
 /**
  * THE MERGE GRAPH, READ-ONLY.
@@ -85,10 +86,24 @@ export function createPostgresIdentityGraph(
 export function createPostgresWave1MemoryService(
   writePool: Pool,
   readPool: Pool,
+  options: {
+    /**
+     * The PII key provider aliases are encrypted, indexed and erased under.
+     * REQUIRED to be stated: null is an explicit "none", under which the alias
+     * registry stores and resolves nothing (migration 047 has no plaintext to
+     * fall back to) and a deletion reports its alias erasure incomplete.
+     */
+    piiKeys: MemoryPiiKeyProvider | null;
+  },
 ): Wave1MemoryService {
+  const store = createPostgresTrustedMemoryStore(writePool, readPool, {
+    piiKeys: options.piiKeys,
+  });
   return createWave1MemoryService({
-    store: createPostgresTrustedMemoryStore(writePool, readPool),
-    aliases: createPostgresAliasRegistryStore(writePool, readPool),
+    store,
+    aliases: createPostgresAliasRegistryStore(writePool, readPool, {
+      piiKeys: options.piiKeys,
+    }),
     identityGraph: createPostgresIdentityGraph(readPool),
     reconciler: createPostgresMemoryReconciler(writePool),
   });

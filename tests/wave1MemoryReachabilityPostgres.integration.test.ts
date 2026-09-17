@@ -18,7 +18,6 @@ import {
   type CanonicalAliasIdentity,
 } from "@aaliyah/contracts/v1";
 
-import { aliasAssignmentDigest } from "../src/application/memory/wave1AliasRegistry";
 import {
   aliasRestrictionLevel,
   coreAliasSkeleton,
@@ -46,6 +45,7 @@ import {
   lockSharedMemoryTables,
   type SharedTableLock,
 } from "./support/sharedMemoryTables";
+import { TEST_PII_KEYS, testAliasAssignmentDigest } from "./support/piiKeys";
 
 /**
  * W1.3 REACHABILITY — IS THE AUTHORITATIVE STORE ACTUALLY USED?
@@ -110,6 +110,8 @@ beforeEach(async () => {
     `TRUNCATE memory_reconciliations,
               memory_identity_edges,
               memory_alias_bindings,
+              memory_alias_blind_indexes,
+              memory_pii_key_erasures,
               memory_record_versions,
               memory_authorization_receipts,
               memory_authorization_nonces,
@@ -123,7 +125,7 @@ beforeEach(async () => {
 
 /** Exactly what `src/server.ts` builds at boot. */
 function memoryService() {
-  return createPostgresWave1MemoryService(writePool, readPool);
+  return createPostgresWave1MemoryService(writePool, readPool, { piiKeys: TEST_PII_KEYS });
 }
 
 function isoOffset(ms: number): string {
@@ -374,16 +376,18 @@ async function bindAlias(
         version: head!.version,
         contentDigest: head!.contentDigest,
       },
-      proposedContentDigest: aliasAssignmentDigest({
+      proposedContentDigest: await testAliasAssignmentDigest({
         record: content,
         alias: identity,
-        evidence,
+        evidence: evidence,
+        scope: SCOPE,
       }),
     }),
   );
   const result = await createPostgresAliasRegistryStore(
     writePool,
     readPool,
+    { piiKeys: TEST_PII_KEYS },
   ).assignAlias({
     actor: SCOPE,
     authorizationId: receipt.authorizationId,
@@ -662,6 +666,9 @@ test("the pipeline distinguishes 'no memory for this contact' from 'memory unava
           },
           async reconcilePending() {
             return 0;
+          },
+          async completePendingErasures() {
+            return { destroyed: 0, pending: 0 };
           },
           async canonicalIdentity(_a, id) {
             return id;

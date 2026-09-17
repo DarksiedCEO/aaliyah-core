@@ -73,6 +73,8 @@ beforeEach(async () => {
   await adminPool.query(
     `TRUNCATE memory_identity_edges,
               memory_alias_bindings,
+              memory_alias_blind_indexes,
+              memory_pii_key_erasures,
               memory_record_versions,
               memory_authorization_receipts,
               memory_authorization_nonces,
@@ -905,8 +907,6 @@ function bindingPayload(overrides: Row = {}): Row {
     scopeKey: SCOPE.workspaceId,
     canonicalParticipantId: PARTICIPANT,
     subjectParticipantId: PARTICIPANT,
-    normalizedAlias: ALIAS,
-    skeleton: ALIAS,
     authorizationId: "destroy-auth-000000000001",
     mutationReceiptId: "mutation.destroy.001",
     ...overrides,
@@ -922,12 +922,9 @@ function bindingBase(): Row {
     cross_workspace_policy: "workspace_isolated",
     scope_key: SCOPE.workspaceId,
     alias_id: "alias-destroy-001",
-    normalized_alias: ALIAS,
-    skeleton: ALIAS,
     skeleton_algorithm: "core-alias-skeleton/v1",
     normalization_profile: "core-alias-normalization/v1",
     canonical_participant_id: PARTICIPANT,
-    registrable_domain: "example.com",
     script_code: "Latn",
     restriction_level: "ascii_only",
     subject_participant_id: PARTICIPANT,
@@ -939,6 +936,9 @@ function bindingBase(): Row {
     mutation_receipt_id: "mutation.destroy.001",
     bound_at: new Date().toISOString(),
     payload: bindingPayload(),
+    pii_envelope: { keyRef: "pii-key:destroy", keyVersion: 1 },
+    pii_key_ref: "pii-key:destroy",
+    pii_key_version: 1,
   };
 }
 
@@ -998,18 +998,40 @@ destroyers(
       why: "a payload naming a different alias id than its column",
       mutate: (r) => ({ ...r, payload: bindingPayload({ aliasId: "alias-other" }) }),
     },
+    // ---- migration 047: the vault's shape ------------------------------
     {
-      constraint: "memory_alias_bindings_normalized_binding",
-      why: "a payload naming a different normalized alias than its column",
+      constraint: "memory_alias_bindings_payload_carries_no_alias",
+      why: "THE PLAINTEXT ADDRESS back in the payload, where erasure cannot reach it",
+      mutate: (r) => ({ ...r, payload: bindingPayload({ normalizedAlias: ALIAS }) }),
+    },
+    {
+      constraint: "memory_alias_bindings_pii_present_or_erased",
+      why: "a live binding with no envelope: an identifier that is neither held nor erased",
+      mutate: (r) => ({ ...r, pii_envelope: null }),
+    },
+    {
+      constraint: "memory_alias_bindings_erased_is_retired",
+      why: "an erased binding still active, still claiming its alias",
       mutate: (r) => ({
         ...r,
-        payload: bindingPayload({ normalizedAlias: "other@example.com" }),
+        pii_envelope: null,
+        pii_erased_at: new Date().toISOString(),
+        pii_erasure_tombstone_id: "tombstone-destroy-001",
       }),
     },
     {
-      constraint: "memory_alias_bindings_skeleton_binding",
-      why: "a payload naming a different confusable skeleton than its column",
-      mutate: (r) => ({ ...r, payload: bindingPayload({ skeleton: "other" }) }),
+      constraint: "memory_alias_bindings_envelope_key_binding",
+      why: "an envelope naming a different key than its column",
+      mutate: (r) => ({ ...r, pii_envelope: { keyRef: "pii-key:other", keyVersion: 1 } }),
+    },
+    {
+      constraint: "memory_alias_bindings_pii_key_version_positive",
+      why: "a key version of zero",
+      mutate: (r) => ({
+        ...r,
+        pii_key_version: 0,
+        pii_envelope: { keyRef: "pii-key:destroy", keyVersion: 0 },
+      }),
     },
     {
       constraint: "memory_alias_bindings_participant_binding",
@@ -1098,6 +1120,154 @@ destroyers(
     note: "it reaches the witness trigger, which only runs once every CHECK has held",
   },
 );
+
+// ---------------------------------------------------------------------------
+// memory_alias_blind_indexes (migration 047)
+// ---------------------------------------------------------------------------
+
+function blindIndexBase(): Row {
+  return {
+    tenant_id: SCOPE.tenantId,
+    workspace_id: SCOPE.workspaceId,
+    scope_key: SCOPE.workspaceId,
+    alias_id: "alias-destroy-001",
+    binding_mutation_receipt_id: "mutation.destroy.001",
+    purpose: "alias.normalized",
+    key_version: 1,
+    index_value: `bi1.1.${"a".repeat(43)}`,
+  };
+}
+
+destroyers(
+  "memory_alias_blind_indexes",
+  blindIndexBase,
+  [
+    {
+      constraint: "memory_alias_blind_indexes_purpose_domain",
+      why: "an index purpose outside the two the registry decides on",
+      mutate: (r) => ({ ...r, purpose: "alias.anything" }),
+    },
+    {
+      constraint: "memory_alias_blind_indexes_version_positive",
+      why: "a key version of zero",
+      mutate: (r) => ({ ...r, key_version: 0, index_value: null, erased_at: new Date().toISOString(), erasure_tombstone_id: "t", active: false }),
+    },
+    {
+      constraint: "memory_alias_blind_indexes_value_form",
+      why: "a RAW value where a keyed index belongs — for example the address itself",
+      mutate: (r) => ({ ...r, index_value: ALIAS }),
+    },
+    {
+      constraint: "memory_alias_blind_indexes_version_agreement",
+      why: "a value produced under one key version filed under another",
+      mutate: (r) => ({ ...r, key_version: 2 }),
+    },
+    {
+      constraint: "memory_alias_blind_indexes_present_or_erased",
+      why: "an entry erased in name while its value survives",
+      mutate: (r) => ({ ...r, erased_at: new Date().toISOString(), erasure_tombstone_id: "tombstone-destroy-001", active: false }),
+    },
+  ],
+  {
+    expect: /an index entry must belong to an active binding in its scope/,
+    note: "it reaches the belongs-to-a-binding trigger, which only runs once every CHECK has held",
+  },
+);
+
+// ---------------------------------------------------------------------------
+// memory_pii_key_erasures (migration 047)
+// ---------------------------------------------------------------------------
+
+function keyErasureBase(): Row {
+  return {
+    tenant_id: SCOPE.tenantId,
+    workspace_id: SCOPE.workspaceId,
+    tombstone_id: "tombstone-destroy-001",
+    alias_id: "alias-destroy-001",
+    binding_mutation_receipt_id: "mutation.destroy.001",
+    key_ref: "pii-key:destroy",
+    provider_id: "local-test/v1",
+    event: "erasure_committed",
+  };
+}
+
+destroyers(
+  "memory_pii_key_erasures",
+  keyErasureBase,
+  [
+    {
+      constraint: "memory_pii_key_erasures_event_domain",
+      why: "an erasure event outside committed/destroyed",
+      mutate: (r) => ({ ...r, event: "key_probably_gone" }),
+    },
+  ],
+  {
+    expect: /a committed erasure must name a binding erased under that tombstone and key/,
+    note: "it reaches the witness trigger, which only runs once every CHECK has held",
+  },
+);
+
+// ---------------------------------------------------------------------------
+// memory_mutation_attempts (migration 045)
+// ---------------------------------------------------------------------------
+
+function attemptPayload(overrides: Row = {}): Row {
+  return {
+    mutationReceiptId: "mutation.destroy.attempt",
+    authorizationId: "destroy-auth-000000000001",
+    action: "correct",
+    targetRecordId: RECORD_ID,
+    scope: { ...SCOPE },
+    outcome: { status: "ABORTED_NO_MUTATION", abortReason: "policy_rejected" },
+    ...overrides,
+  };
+}
+
+function attemptBase(): Row {
+  return {
+    tenant_id: SCOPE.tenantId,
+    workspace_id: SCOPE.workspaceId,
+    principal_id: SCOPE.principalId,
+    user_id: SCOPE.userId,
+    mutation_receipt_id: "mutation.destroy.attempt",
+    authorization_id: "destroy-auth-000000000001",
+    action: "correct",
+    target_record_id: RECORD_ID,
+    rejection: "authorization_not_found",
+    abort_reason: "policy_rejected",
+    attempted_at: new Date().toISOString(),
+    payload: attemptPayload(),
+  };
+}
+
+test("memory_mutation_attempts: the base row is ACCEPTED, so the cases below are not passing on a broken table", async () => {
+  await insertRow("memory_mutation_attempts", attemptBase());
+  const count = await adminPool.query(`SELECT count(*)::int AS n FROM memory_mutation_attempts`);
+  assert.equal(count.rows[0].n, 1);
+});
+
+for (const destroyer of [
+  { constraint: "memory_mutation_attempts_action_domain", why: "an action outside the nine", mutate: (r: Row) => ({ ...r, action: "rewrite", payload: attemptPayload({ action: "rewrite" }) }) },
+  { constraint: "memory_mutation_attempts_abort_reason_domain", why: "an abort reason outside the contract's seven", mutate: (r: Row) => ({ ...r, abort_reason: "because", payload: attemptPayload({ outcome: { status: "ABORTED_NO_MUTATION", abortReason: "because" } }) }) },
+  { constraint: "memory_mutation_attempts_rejection_form", why: "free text where a closed rejection name belongs — where an alias would be quoted back", mutate: (r: Row) => ({ ...r, rejection: "ceo@example.com refused" }) },
+  { constraint: "memory_mutation_attempts_status_is_aborted", why: "an attempt claiming a committed outcome", mutate: (r: Row) => ({ ...r, payload: attemptPayload({ outcome: { status: "COMMITTED_AND_READ_BACK", abortReason: "policy_rejected" } }) }) },
+  { constraint: "memory_mutation_attempts_receipt_binding", why: "a payload naming a different receipt than its column", mutate: (r: Row) => ({ ...r, payload: attemptPayload({ mutationReceiptId: "mutation.other" }) }) },
+  { constraint: "memory_mutation_attempts_authorization_binding", why: "a payload naming a different authorization than its column", mutate: (r: Row) => ({ ...r, payload: attemptPayload({ authorizationId: "other" }) }) },
+  { constraint: "memory_mutation_attempts_action_binding", why: "a payload naming a different action than its column", mutate: (r: Row) => ({ ...r, payload: attemptPayload({ action: "delete" }) }) },
+  { constraint: "memory_mutation_attempts_target_binding", why: "a payload naming a different target than its column", mutate: (r: Row) => ({ ...r, payload: attemptPayload({ targetRecordId: "record-other" }) }) },
+  { constraint: "memory_mutation_attempts_scope_binding", why: "a payload claiming a scope its columns do not", mutate: (r: Row) => ({ ...r, payload: attemptPayload({ scope: { ...SCOPE, principalId: "principal-other" } }) }) },
+  { constraint: "memory_mutation_attempts_abort_reason_binding", why: "a payload naming a different abort reason than its column", mutate: (r: Row) => ({ ...r, payload: attemptPayload({ outcome: { status: "ABORTED_NO_MUTATION", abortReason: "head_mismatch" } }) }) },
+]) {
+  test(`memory_mutation_attempts: ${destroyer.constraint} — ${destroyer.why}`, async () => {
+    await assert.rejects(
+      () => insertRow("memory_mutation_attempts", destroyer.mutate(attemptBase())),
+      (error: unknown) => {
+        assert.match(String(error), new RegExp(destroyer.constraint));
+        return true;
+      },
+    );
+  });
+}
 
 // ---------------------------------------------------------------------------
 // THE FOUR CONSTRAINTS THAT CANNOT BE ISOLATED, STATED RATHER THAN HIDDEN.
