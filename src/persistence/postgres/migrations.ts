@@ -5214,7 +5214,22 @@ function migrationOrdinal(id: string): number {
   return Number(match[1]);
 }
 
-export async function runMailMigrations(pool: Pool): Promise<void> {
+/**
+ * Apply every migration not yet applied, in order.
+ *
+ * `through` stops after the named migration. It exists for UPGRADE tests: a
+ * database populated at an earlier schema and then migrated forward is the
+ * shape a real deployment meets, and a fresh apply never exercises it (the
+ * 3ba769f integration review). A name that is not a migration id is refused
+ * before anything is applied.
+ */
+export async function runMailMigrations(
+  pool: Pool,
+  options: { through?: string } = {},
+): Promise<void> {
+  if (options.through !== undefined && !MIGRATIONS.some((m) => m.id === options.through)) {
+    throw new Error(`runMailMigrations: no migration named ${options.through}`);
+  }
   await pool.query(
     `CREATE TABLE IF NOT EXISTS aaliyah_mail_migrations (
       id text PRIMARY KEY,
@@ -5256,7 +5271,10 @@ export async function runMailMigrations(pool: Pool): Promise<void> {
       .map(migrationOrdinal)
       .reduce((high, ordinal) => (ordinal > high ? ordinal : high), -1);
     for (const migration of MIGRATIONS) {
-      if (applied.has(migration.id)) continue;
+      if (applied.has(migration.id)) {
+        if (migration.id === options.through) break;
+        continue;
+      }
       const ordinal = migrationOrdinal(migration.id);
       if (ordinal < highestApplied) {
         throw new Error(
@@ -5267,6 +5285,7 @@ export async function runMailMigrations(pool: Pool): Promise<void> {
       }
       await client.query(migration.sql);
       await client.query("INSERT INTO aaliyah_mail_migrations (id) VALUES ($1)", [migration.id]);
+      if (migration.id === options.through) break;
     }
     await client.query("COMMIT");
   } catch (error) {

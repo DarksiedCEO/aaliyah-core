@@ -1005,3 +1005,13 @@ The confirming sweep's duplicate verdicts also surfaced two real survivors, G-13
 - **Nature:** a pre-existing time race in a W1.1 test, not W1.3 code and not clock skew. Skew during that run was 10–19 ms.
 - **Fix:** the descendant derives both timestamps from one reading, with the receipt one second old. The contract check is unchanged.
 - **Other gates:** release guards PASS; 22/22 targeted mutants KILLED at `94daf48`.
+
+| Entry | Finding | Remediation | Proven by |
+| --- | --- | --- | --- |
+| W1BR-047 | Integration (3ba769f): migrations 050–053 were never applied over a database populated at 049 | `runMailMigrations(pool, { through })` stops after a named migration; an unknown name is refused before anything is applied. `wave1MemoryUpgradePostgres` runs on its own database and uses the current stores throughout. | U-0: writes rows at 049 and asserts no 050–053 object exists. U-1: upgrades, asserts the three triggers and three helpers exist, and nothing already there is refused. U-2: retires a binding made before 050. U-3: reconciles an alias mutation left UNKNOWN before 052 to COMMITTED_CONFIRMED. U-4: subject-erases a participant bound before the upgrade (envelope, key and index gone). U-5: an unknown target is refused. |
+
+**Remaining limit of W1BR-047: DISCLOSED.** A merge chain that predates 053 is not built.
+- The current store's merge path calls the 053 helper, so this code cannot merge at 049.
+- A chain created by *older* code before 053 is therefore not exercised.
+- 053's guard measures chains only when a new merge edge is inserted, so a pre-existing chain longer than 16 hops is not rewritten. Every further merge onto it is refused, and its identities stay unresolvable by the resolver. This can only arise if older code ran merges past 16 hops.
+- This candidate's first deploy starts from an empty database, so no such chain exists.
