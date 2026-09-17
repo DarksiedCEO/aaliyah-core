@@ -232,6 +232,7 @@ beforeEach(async () => {
               memory_authorization_receipts,
               memory_authorization_nonces,
               memory_mutation_receipts,
+              memory_mutation_attempts,
               memory_tombstones,
               memory_legal_hold_carve_outs,
               memory_legal_hold_records,

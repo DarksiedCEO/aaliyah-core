@@ -165,13 +165,19 @@ export function createPostgresMemoryReconciler(
                 r.target_record_id
            FROM memory_mutation_receipts AS r
           WHERE r.outcome_status = 'UNKNOWN_PENDING_RECONCILIATION'
+            -- Settled only by a COMMITTED terminal. Against b3efc82 this read
+            -- "any terminal that is not UNKNOWN", so an ABORTED row squatting
+            -- the same id hid a genuinely committed mutation from
+            -- reconciliation forever. Migration 045 now refuses ABORTED rows
+            -- in this table; this no longer depends on that.
             AND NOT EXISTS (
               SELECT 1 FROM memory_mutation_receipts AS t
                WHERE t.tenant_id = r.tenant_id
                  AND t.workspace_id = r.workspace_id
                  AND t.mutation_receipt_id = r.mutation_receipt_id
                  AND t.phase = 'terminal'
-                 AND t.outcome_status <> 'UNKNOWN_PENDING_RECONCILIATION')
+                 AND t.outcome_status IN ('COMMITTED_AND_READ_BACK',
+                                          'COMMITTED_READ_BACK_DIVERGED'))
             AND NOT EXISTS (
               SELECT 1 FROM memory_reconciliations AS c
                WHERE c.tenant_id = r.tenant_id
@@ -280,10 +286,51 @@ export function createPostgresMemoryReconciler(
         | undefined;
 
       // ---- WHAT WAS AUTHORIZED ------------------------------------------
+      // Resolved from the STORED unknown receipt, never from the caller's
+      // description of it. Red team M2 against b3efc82: handed an unrelated
+      // authorization id, `reconcile()` turned a correct committed mutation
+      // into a durable COMMITTED_DIVERGED — the strongest alarm in the
+      // system — and the once-only constraint made the wrong verdict permanent.
+      const recorded = await client.query(
+        `SELECT DISTINCT principal_id, user_id, authorization_id, action,
+                target_record_id
+           FROM memory_mutation_receipts
+          WHERE tenant_id = $1 AND workspace_id = $2
+            AND mutation_receipt_id = $3
+            AND outcome_status = 'UNKNOWN_PENDING_RECONCILIATION'`,
+        [scope.tenantId, scope.workspaceId, mutationReceiptId],
+      );
+      if (recorded.rowCount !== 1) {
+        throw new Error(
+          recorded.rowCount === 0
+            ? `reconciliation for ${mutationReceiptId}: no unknown outcome is on record`
+            : `reconciliation for ${mutationReceiptId}: its unknown receipts disagree about the mutation`,
+        );
+      }
+      const stored = recorded.rows[0] as {
+        principal_id: string;
+        user_id: string;
+        authorization_id: string;
+        action: string;
+        target_record_id: string;
+      };
+      if (
+        stored.principal_id !== scope.principalId ||
+        stored.user_id !== scope.userId ||
+        stored.authorization_id !== unresolved.authorizationId ||
+        stored.action !== unresolved.action ||
+        stored.target_record_id !== unresolved.targetRecordId
+      ) {
+        // Nothing is filed. A request that does not describe the mutation on
+        // record is not a request to reconcile it.
+        throw new Error(
+          `reconciliation for ${mutationReceiptId}: the request does not match the unknown outcome on record`,
+        );
+      }
       const authorization = await client.query(
         `SELECT payload FROM memory_authorization_receipts
-          WHERE authorization_id = $1 LIMIT 1`,
-        [unresolved.authorizationId],
+          WHERE tenant_id = $1 AND authorization_id = $2 LIMIT 1`,
+        [scope.tenantId, stored.authorization_id],
       );
       const authorizedDigest =
         ((authorization.rows[0]?.payload as Record<string, unknown> | undefined)?.[

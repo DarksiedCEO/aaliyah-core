@@ -146,6 +146,12 @@ export const TRUSTED_MEMORY_REJECTIONS = [
    * store's lock wait. Nothing was consumed and nothing was written.
    */
   "record_busy",
+  /**
+   * This mutation receipt id already names a mutation on record. An id that
+   * carries a receipt identifies THAT mutation; reusing it for another would
+   * let the second's evidence collide with — or be read as — the first's.
+   */
+  "mutation_receipt_id_reused",
 ] as const;
 export type TrustedMemoryRejection = (typeof TRUSTED_MEMORY_REJECTIONS)[number];
 

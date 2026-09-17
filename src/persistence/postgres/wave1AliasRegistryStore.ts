@@ -12,6 +12,8 @@ import {
 } from "@aaliyah/contracts/v1";
 import type { Pool, PoolClient } from "pg";
 
+import { appendMutationAttempt } from "./memoryMutationAttempts";
+
 import {
   ALIAS_TENANT_SCOPE_KEY,
   AliasCrossWorkspacePolicySchema,
@@ -223,6 +225,8 @@ const ABORT_REASON: Record<string, MemoryAbortReason> = {
   proposed_content_digest_mismatch: "policy_rejected",
   head_mismatch: "head_mismatch",
   storage_rejected: "storage_rejected",
+  record_busy: "storage_rejected",
+  mutation_receipt_id_reused: "policy_rejected",
 };
 
 /** A role name is an SQL IDENTIFIER, so it can never be a bind parameter. */
@@ -445,7 +449,10 @@ export function createPostgresAliasRegistryStore(
         abortReason: ABORT_REASON[rejection] ?? "policy_rejected",
       },
     });
-    await appendTerminal(receipt).catch(() => undefined);
+    // An attempt, not a mutation receipt: see memoryMutationAttempts.ts.
+    await appendMutationAttempt({ pool, role: mutationRole, receipt, rejection }).catch(
+      () => undefined,
+    );
     return { verified: false, rejection, receipt };
   }
 
@@ -807,6 +814,22 @@ export function createPostgresAliasRegistryStore(
       );
       const txNow = (await client.query("SELECT now() AS tx_now")).rows[0]
         .tx_now as Date;
+      // A receipt id already on record names THAT mutation; see the trusted
+      // memory store. Migration 045 refuses the same reuse in the database.
+      const spentReceiptId = await client.query(
+        `SELECT 1 FROM memory_mutation_receipts
+          WHERE tenant_id = $1 AND workspace_id = $2
+            AND mutation_receipt_id = $3
+          LIMIT 1`,
+        [
+          request.actor.tenantId,
+          request.actor.workspaceId,
+          request.mutationReceiptId,
+        ],
+      );
+      if (spentReceiptId.rowCount === 1) {
+        throw new AliasMutationAborted("mutation_receipt_id_reused");
+      }
 
       const resolved = await resolveAuthorization(
         client,
@@ -1142,6 +1165,22 @@ export function createPostgresAliasRegistryStore(
       );
       const txNow = (await client.query("SELECT now() AS tx_now")).rows[0]
         .tx_now as Date;
+      // A receipt id already on record names THAT mutation; see the trusted
+      // memory store. Migration 045 refuses the same reuse in the database.
+      const spentReceiptId = await client.query(
+        `SELECT 1 FROM memory_mutation_receipts
+          WHERE tenant_id = $1 AND workspace_id = $2
+            AND mutation_receipt_id = $3
+          LIMIT 1`,
+        [
+          request.actor.tenantId,
+          request.actor.workspaceId,
+          request.mutationReceiptId,
+        ],
+      );
+      if (spentReceiptId.rowCount === 1) {
+        throw new AliasMutationAborted("mutation_receipt_id_reused");
+      }
 
       const resolved = await resolveAuthorization(
         client,

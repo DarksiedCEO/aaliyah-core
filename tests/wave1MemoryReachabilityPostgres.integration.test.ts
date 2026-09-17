@@ -114,6 +114,7 @@ beforeEach(async () => {
               memory_authorization_receipts,
               memory_authorization_nonces,
               memory_mutation_receipts,
+              memory_mutation_attempts,
               memory_tombstones
      RESTART IDENTITY`,
   );
@@ -686,18 +687,28 @@ test("the reconciler is reachable through the service the server builds at boot"
   assert.equal(settled, 0);
 
   // And it is the real reconciler: give it something unresolved and it
-  // resolves it.
+  // resolves it. The unknown receipt names a REAL authorization in its own
+  // scope: migration 045 binds a mutation receipt to its authorization's
+  // scope, exactly as 044 binds every other row a mutation writes.
+  const unresolvedAuthorization = await issue(
+    authorization({
+      action: "create",
+      targetRecordId: CONTACT,
+      expectedHead: { kind: "no_prior_version" },
+      proposedContent: { never: "committed" },
+    }),
+  );
   await adminPool.query(
     `INSERT INTO memory_mutation_receipts
        (tenant_id, workspace_id, principal_id, user_id, mutation_receipt_id,
         phase, authorization_id, consumed_nonce_digest, action,
         target_record_id, outcome_status, emitted_at, payload)
      VALUES ($1,$2,$3,$4,'mutation.reach.unknown','terminal',
-             'reach-unknown-000000001',$5,'create',$6,
+             $7,$5,'create',$6,
              'UNKNOWN_PENDING_RECONCILIATION', now(),
              jsonb_build_object(
                'mutationReceiptId','mutation.reach.unknown',
-               'authorizationId','reach-unknown-000000001',
+               'authorizationId',$7::text,
                'consumedNonceDigest',$5::text,
                'action','create','targetRecordId',$6::text,
                'scope', jsonb_build_object('tenantId',$1::text,
@@ -713,6 +724,7 @@ test("the reconciler is reachable through the service the server builds at boot"
       SCOPE.userId,
       `sha256:${"b".repeat(64)}`,
       CONTACT,
+      unresolvedAuthorization.authorizationId,
     ],
   );
 

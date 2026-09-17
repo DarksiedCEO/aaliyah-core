@@ -3837,6 +3837,269 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       AFTER INSERT ON memory_identity_edges
       FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_identity_edge_from_owner()`,
   },
+  {
+    // ------------------------------------------------------------------
+    // AN ATTEMPT IS NOT A MUTATION RECEIPT, AND A RECONCILIATION IS NOT AN
+    // OPINION.
+    //
+    // Red team BREAK 1 against b3efc82. Aborted and unresolved attempts were
+    // filed in `memory_mutation_receipts` as TERMINAL rows under the caller's
+    // `mutation_receipt_id`, and that table is UNIQUE on (tenant, workspace,
+    // mutation_receipt_id, phase). So:
+    //
+    //   attempt 1 (stale head)  -> terminal ABORTED_NO_MUTATION
+    //   attempt 2 (same id)     -> commits, reads back, AGREES — then its own
+    //                              terminal row collides, the failure is
+    //                              swallowed, and it reports UNKNOWN
+    //   the reconciler          -> skips it forever: a terminal non-UNKNOWN
+    //                              sibling exists, and it is the ABORTED one
+    //
+    // No attacker needed — that is the ordinary retry W1BR-004 asks callers
+    // to implement. With one, a principal holding NO authorization planted the
+    // ABORTED row under an id a victim later used, and the victim's genuine
+    // genesis was durably filed as never having happened.
+    //
+    // Security MEDIUM against b3efc82: a reconciler-role writer filed
+    // COMMITTED_CONFIRMED for a mutation with no record version at all, and the
+    // database accepted it — the "committed" verdict was enforced only in the
+    // reconciler's control flow. And the reconciler derived its verdict from a
+    // CALLER-supplied authorization id (red team M2).
+    //
+    // This migration:
+    //   - gives attempts their own append-only table, with no uniqueness on the
+    //     receipt id: two failed attempts are two facts;
+    //   - refuses ABORTED_NO_MUTATION in memory_mutation_receipts outright;
+    //   - refuses a PENDING receipt for an id that already has a TERMINAL one
+    //     (the id is spent), and a TERMINAL receipt that disagrees with the
+    //     pending receipt of the same id about who, what, or under which
+    //     authorization;
+    //   - binds memory_mutation_receipts rows to their authorization's scope,
+    //     as 044 does for every other table a mutation writes;
+    //   - makes every reconciliation verdict DERIVABLE from stored state, in
+    //     the database: it must answer an UNKNOWN receipt that exists, agree
+    //     with it on authorization, action, target and scope, and its verdict
+    //     must be exactly the one the pending receipt, the record version and
+    //     the authorized digest imply.
+    // ------------------------------------------------------------------
+    id: "045_memory_attempts_and_derivable_reconciliation",
+    sql: `CREATE TABLE IF NOT EXISTS memory_mutation_attempts (
+      id bigserial PRIMARY KEY,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      principal_id text NOT NULL,
+      user_id text NOT NULL,
+      mutation_receipt_id text NOT NULL,
+      authorization_id text NOT NULL,
+      action text NOT NULL,
+      target_record_id text NOT NULL,
+      rejection text NOT NULL,
+      abort_reason text NOT NULL,
+      attempted_at timestamptz NOT NULL,
+      payload jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT memory_mutation_attempts_action_domain CHECK (action IN (
+        'create','correct','delete','restore','promote',
+        'assign_alias','remove_alias','merge_identity','split_identity')),
+      CONSTRAINT memory_mutation_attempts_abort_reason_domain CHECK (abort_reason IN (
+        'authorization_expired','authorization_revoked',
+        'authorization_already_consumed','head_mismatch','legal_hold_active',
+        'policy_rejected','storage_rejected')),
+      CONSTRAINT memory_mutation_attempts_rejection_form
+        CHECK (rejection ~ '^[a-z][a-z_]{2,63}$'),
+      CONSTRAINT memory_mutation_attempts_payload_object
+        CHECK (jsonb_typeof(payload) = 'object'),
+      CONSTRAINT memory_mutation_attempts_status_is_aborted
+        CHECK (payload->'outcome'->>'status' IS NOT NULL
+               AND payload->'outcome'->>'status' = 'ABORTED_NO_MUTATION'),
+      CONSTRAINT memory_mutation_attempts_receipt_binding
+        CHECK (payload->>'mutationReceiptId' IS NOT NULL
+               AND payload->>'mutationReceiptId' = mutation_receipt_id),
+      CONSTRAINT memory_mutation_attempts_authorization_binding
+        CHECK (payload->>'authorizationId' IS NOT NULL
+               AND payload->>'authorizationId' = authorization_id),
+      CONSTRAINT memory_mutation_attempts_action_binding
+        CHECK (payload->>'action' IS NOT NULL AND payload->>'action' = action),
+      CONSTRAINT memory_mutation_attempts_target_binding
+        CHECK (payload->>'targetRecordId' IS NOT NULL
+               AND payload->>'targetRecordId' = target_record_id),
+      CONSTRAINT memory_mutation_attempts_scope_binding
+        CHECK (payload->'scope'->>'tenantId' IS NOT NULL
+               AND payload->'scope'->>'tenantId' = tenant_id
+               AND payload->'scope'->>'workspaceId' IS NOT NULL
+               AND payload->'scope'->>'workspaceId' = workspace_id
+               AND payload->'scope'->>'principalId' IS NOT NULL
+               AND payload->'scope'->>'principalId' = principal_id
+               AND payload->'scope'->>'userId' IS NOT NULL
+               AND payload->'scope'->>'userId' = user_id),
+      CONSTRAINT memory_mutation_attempts_abort_reason_binding
+        CHECK (payload->'outcome'->>'abortReason' IS NOT NULL
+               AND payload->'outcome'->>'abortReason' = abort_reason)
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_mutation_attempts_receipt
+      ON memory_mutation_attempts (tenant_id, workspace_id, mutation_receipt_id, id);
+    CREATE INDEX IF NOT EXISTS idx_memory_mutation_attempts_actor
+      ON memory_mutation_attempts (tenant_id, workspace_id, principal_id, user_id, id DESC);
+    DROP TRIGGER IF EXISTS memory_mutation_attempts_append_only
+      ON memory_mutation_attempts;
+    CREATE TRIGGER memory_mutation_attempts_append_only
+      BEFORE UPDATE OR DELETE ON memory_mutation_attempts
+      FOR EACH ROW EXECUTE FUNCTION aaliyah_memory_forbid_row_rewrite();
+    DROP TRIGGER IF EXISTS memory_mutation_attempts_exact_numbers
+      ON memory_mutation_attempts;
+    CREATE TRIGGER memory_mutation_attempts_exact_numbers
+      BEFORE INSERT OR UPDATE ON memory_mutation_attempts
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_reject_inexact_numbers();
+    GRANT SELECT, INSERT ON memory_mutation_attempts TO aaliyah_memory_mutator;
+    GRANT USAGE, SELECT ON SEQUENCE memory_mutation_attempts_id_seq
+      TO aaliyah_memory_mutator;
+    GRANT SELECT ON memory_mutation_attempts
+      TO aaliyah_memory_reader, aaliyah_memory_reconciler;
+
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_receipt_id_discipline()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        pending public.memory_mutation_receipts%ROWTYPE;
+      BEGIN
+        IF NEW.outcome_status = 'ABORTED_NO_MUTATION' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: an aborted attempt is not a mutation receipt; it belongs in memory_mutation_attempts'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.phase = 'pending' THEN
+          PERFORM 1 FROM public.memory_mutation_receipts AS t
+           WHERE t.tenant_id = NEW.tenant_id
+             AND t.workspace_id = NEW.workspace_id
+             AND t.mutation_receipt_id = NEW.mutation_receipt_id
+             AND t.phase = 'terminal'
+             AND t.id <> NEW.id
+           LIMIT 1;
+          IF FOUND THEN
+            RAISE EXCEPTION
+              'aaliyah memory: a mutation receipt id that already carries a terminal receipt cannot begin another mutation'
+              USING ERRCODE = 'check_violation';
+          END IF;
+          RETURN NULL;
+        END IF;
+        SELECT * INTO pending FROM public.memory_mutation_receipts AS p
+         WHERE p.tenant_id = NEW.tenant_id
+           AND p.workspace_id = NEW.workspace_id
+           AND p.mutation_receipt_id = NEW.mutation_receipt_id
+           AND p.phase = 'pending'
+         LIMIT 1;
+        IF FOUND AND (pending.principal_id <> NEW.principal_id
+                      OR pending.user_id <> NEW.user_id
+                      OR pending.authorization_id <> NEW.authorization_id
+                      OR pending.action <> NEW.action
+                      OR pending.target_record_id <> NEW.target_record_id) THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a terminal receipt must describe the same mutation as its pending receipt'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_mutation_receipts_id_discipline
+      ON memory_mutation_receipts;
+    -- AFTER, not BEFORE: a BEFORE trigger runs ahead of the table's CHECK
+    -- constraints and would pre-empt every one of them, leaving their own
+    -- refusals — and their killing tests — unreachable.
+    CREATE TRIGGER memory_mutation_receipts_id_discipline
+      AFTER INSERT ON memory_mutation_receipts
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_receipt_id_discipline();
+
+    DROP TRIGGER IF EXISTS memory_mutation_receipts_zz_authorization_scope
+      ON memory_mutation_receipts;
+    CREATE TRIGGER memory_mutation_receipts_zz_authorization_scope
+      AFTER INSERT ON memory_mutation_receipts
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_row_in_authorization_scope();
+
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_reconciliation_derivable()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        pending_present boolean;
+        version_row public.memory_record_versions%ROWTYPE;
+        version_present boolean;
+        authorized_digest text;
+        implied text;
+      BEGIN
+        PERFORM 1 FROM public.memory_mutation_receipts AS r
+         WHERE r.tenant_id = NEW.tenant_id
+           AND r.workspace_id = NEW.workspace_id
+           AND r.mutation_receipt_id = NEW.mutation_receipt_id
+           AND r.outcome_status = 'UNKNOWN_PENDING_RECONCILIATION'
+           AND r.principal_id = NEW.principal_id
+           AND r.user_id = NEW.user_id
+           AND r.authorization_id = NEW.authorization_id
+           AND r.action = NEW.action
+           AND r.target_record_id = NEW.target_record_id
+         LIMIT 1;
+        IF NOT FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a reconciliation must answer an unknown outcome that is on record, as recorded'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        SELECT EXISTS (
+          SELECT 1 FROM public.memory_mutation_receipts AS p
+           WHERE p.tenant_id = NEW.tenant_id
+             AND p.workspace_id = NEW.workspace_id
+             AND p.mutation_receipt_id = NEW.mutation_receipt_id
+             AND p.phase = 'pending') INTO pending_present;
+        SELECT * INTO version_row FROM public.memory_record_versions AS v
+         WHERE v.tenant_id = NEW.tenant_id
+           AND v.workspace_id = NEW.workspace_id
+           AND v.mutation_receipt_id = NEW.mutation_receipt_id
+         LIMIT 1;
+        version_present := FOUND;
+        SELECT a.payload ->> 'proposedContentDigest' INTO authorized_digest
+          FROM public.memory_authorization_receipts AS a
+         WHERE a.tenant_id = NEW.tenant_id
+           AND a.authorization_id = NEW.authorization_id
+         LIMIT 1;
+        IF pending_present AND version_present THEN
+          IF authorized_digest IS NOT NULL
+             AND version_row.content_digest = authorized_digest THEN
+            implied := 'COMMITTED_CONFIRMED';
+          ELSE
+            implied := 'COMMITTED_DIVERGED';
+          END IF;
+        ELSIF NOT pending_present AND NOT version_present THEN
+          implied := 'NOT_COMMITTED';
+        ELSE
+          implied := 'IMPOSSIBLE_STATE';
+        END IF;
+        IF NEW.verdict <> implied THEN
+          RAISE EXCEPTION
+            'aaliyah memory: reconciliation verdict % is not the verdict stored state implies (%)',
+            NEW.verdict, implied
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF implied IN ('COMMITTED_CONFIRMED','COMMITTED_DIVERGED')
+           AND (NEW.observed_version IS DISTINCT FROM version_row.version
+                OR NEW.observed_content_digest IS DISTINCT FROM version_row.content_digest) THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a committed reconciliation must observe the record version that is actually stored'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_reconciliations_derivable
+      ON memory_reconciliations;
+    -- AFTER, for the same reason: the verdict-domain and observes CHECKs keep
+    -- their own refusals. An ON CONFLICT DO NOTHING that inserts nothing
+    -- fires no AFTER ROW trigger, which is correct: nothing was filed.
+    CREATE TRIGGER memory_reconciliations_derivable
+      AFTER INSERT ON memory_reconciliations
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_reconciliation_derivable()`,
+  },
 ];
 
 /**

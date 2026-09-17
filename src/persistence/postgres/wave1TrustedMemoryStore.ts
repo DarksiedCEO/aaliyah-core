@@ -42,6 +42,7 @@ import {
   type TrustedMemoryRejection,
   type TrustedMemoryStore,
 } from "../../application/memory/wave1TrustedMemory";
+import { appendMutationAttempt } from "./memoryMutationAttempts";
 
 /**
  * PostgreSQL trusted-memory mutation service.
@@ -276,6 +277,7 @@ const ABORT_REASON: Record<string, MemoryAbortReason> = {
   // The contract's abort vocabulary has no "busy"; a lock that could not be
   // taken is a refusal by storage, and nothing was mutated or consumed.
   record_busy: "storage_rejected",
+  mutation_receipt_id_reused: "policy_rejected",
 };
 
 /**
@@ -606,6 +608,7 @@ export function createPostgresTrustedMemoryStore(
   async function auditUnresolvedAttempt(
     request: TrustedMemoryMutationRequest,
     action: MemoryAction,
+    rejection: TrustedMemoryRejection,
   ): Promise<void> {
     let fromHead: MemoryExpectedHead;
     if (action === "create") {
@@ -638,7 +641,12 @@ export function createPostgresTrustedMemoryStore(
         abortReason: "policy_rejected",
       },
     });
-    await appendTerminal(receipt).catch(() => undefined);
+    // An ATTEMPT, filed where attempts go — never as a terminal mutation
+    // receipt under an id a later real mutation may carry. See
+    // memoryMutationAttempts.ts.
+    await appendMutationAttempt({ pool, role: mutationRole, receipt, rejection }).catch(
+      () => undefined,
+    );
   }
 
   async function abortResult(
@@ -653,7 +661,7 @@ export function createPostgresTrustedMemoryStore(
     ) {
       // Not enough real stored state to fill a structurally valid receipt for
       // the CALLER. The attempt is still written down.
-      await auditUnresolvedAttempt(request, action);
+      await auditUnresolvedAttempt(request, action, rejection);
       return { verified: false, rejection, receipt: null };
     }
     const at = new Date().toISOString();
@@ -674,7 +682,9 @@ export function createPostgresTrustedMemoryStore(
         abortReason: ABORT_REASON[rejection] ?? "policy_rejected",
       },
     });
-    await appendTerminal(receipt).catch(() => undefined);
+    await appendMutationAttempt({ pool, role: mutationRole, receipt, rejection }).catch(
+      () => undefined,
+    );
     return { verified: false, rejection, receipt };
   }
 
@@ -817,6 +827,28 @@ export function createPostgresTrustedMemoryStore(
       }
       const txNow = (await client.query("SELECT now() AS tx_now")).rows[0]
         .tx_now as Date;
+
+      // ---- A RECEIPT ID NAMES ONE MUTATION ------------------------------
+      // An id that already carries a receipt — pending or terminal — is that
+      // mutation's identity. Reusing it would make this mutation's evidence
+      // collide with the earlier one's, which is exactly how a committed,
+      // read-back-verified mutation was filed as UNKNOWN against b3efc82.
+      // Refused before anything is resolved or spent. Migration 045 refuses
+      // the same reuse in the database.
+      const spentReceiptId = await client.query(
+        `SELECT 1 FROM memory_mutation_receipts
+          WHERE tenant_id = $1 AND workspace_id = $2
+            AND mutation_receipt_id = $3
+          LIMIT 1`,
+        [
+          request.actor.tenantId,
+          request.actor.workspaceId,
+          request.mutationReceiptId,
+        ],
+      );
+      if (spentReceiptId.rowCount === 1) {
+        throw new MutationAborted("mutation_receipt_id_reused");
+      }
 
       // ---- 2. THE AUTHORIZATION IS REAL STORED STATE --------------------
       // Resolved by id ALONE. Not filtered by tenant: if the lookup filtered

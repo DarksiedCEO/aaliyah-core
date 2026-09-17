@@ -65,6 +65,7 @@ beforeEach(async () => {
               memory_authorization_receipts,
               memory_authorization_nonces,
               memory_mutation_receipts,
+              memory_mutation_attempts,
               memory_reconciliations,
               memory_tombstones
      RESTART IDENTITY`,
@@ -501,11 +502,24 @@ test("two concurrent workers on one mutation produce exactly one verdict", async
 });
 
 test("a mutation that already reached a REAL terminal outcome is never reconciled", async () => {
+  // A COMMITTED terminal settles a mutation. Against b3efc82 ANY non-UNKNOWN
+  // terminal did — including an ABORTED row squatting the same receipt id —
+  // which is how a genuinely committed mutation was hidden from
+  // reconciliation forever (red team BREAK 1). ABORTED rows can no longer be
+  // written here at all; see the next test.
+  const content = { note: "settled" };
+  const digest = memoryContentDigest(content);
   const authorizationId = await authorizeAndSpend({
     action: "create",
     recordId: RECORD_ID,
-    proposedContentDigest: memoryContentDigest({ note: "settled" }),
+    proposedContentDigest: digest,
     mutationReceiptId: "mutation.recon.settled",
+  });
+  await seedVersion({
+    authorizationId,
+    mutationReceiptId: "mutation.recon.settled",
+    recordId: RECORD_ID,
+    digest,
   });
   await seedReceipt({
     phase: "pending",
@@ -522,7 +536,7 @@ test("a mutation that already reached a REAL terminal outcome is never reconcile
         target_record_id, outcome_status, emitted_at, payload)
      VALUES ($1::text,$2::text,$3::text,$4::text,'mutation.recon.settled',
              'terminal',$5::text,$6::text,'create',$7::text,
-             'ABORTED_NO_MUTATION', now(),
+             'COMMITTED_AND_READ_BACK', now(),
              jsonb_build_object(
                'mutationReceiptId','mutation.recon.settled',
                'authorizationId',$5::text,
@@ -533,14 +547,14 @@ test("a mutation that already reached a REAL terminal outcome is never reconcile
                                            'workspaceId',$2::text,
                                            'principalId',$3::text,
                                            'userId',$4::text),
-               'outcome', jsonb_build_object('status','ABORTED_NO_MUTATION')))`,
+               'outcome', jsonb_build_object('status','COMMITTED_AND_READ_BACK')))`,
     [
       SCOPE.tenantId,
       SCOPE.workspaceId,
       SCOPE.principalId,
       SCOPE.userId,
       authorizationId,
-      EVIDENCE_DIGEST,
+      memoryContentDigest(authorizationId),
       RECORD_ID,
     ],
   );
@@ -824,4 +838,155 @@ test("R-2 a reconciliation lock held elsewhere fails within the bound instead of
   // Positive control: released, it reconciles.
   const settled = await reconciler().reconcile(unresolved);
   assert.equal(settled.alreadyReconciled, false);
+});
+
+// ---------------------------------------------------------------------------
+// V — A VERDICT IS DERIVED FROM STORED STATE, NOT FROM A CALLER OR A ROLE.
+// ---------------------------------------------------------------------------
+
+/** A committed-but-unconfirmed mutation, exactly as the store leaves one. */
+async function committedUnknown(receiptId: string, content: unknown) {
+  const digest = memoryContentDigest(content);
+  const authorizationId = await authorizeAndSpend({
+    action: "create",
+    recordId: RECORD_ID,
+    proposedContentDigest: digest,
+    mutationReceiptId: receiptId,
+  });
+  await seedVersion({ authorizationId, mutationReceiptId: receiptId, recordId: RECORD_ID, digest });
+  await seedReceipt({ phase: "pending", mutationReceiptId: receiptId, authorizationId, action: "create", recordId: RECORD_ID });
+  return { authorizationId, digest };
+}
+
+test("V-1 M2: reconcile() refuses a request naming a different authorization than the one on record, and files nothing", async () => {
+  // EXECUTED against b3efc82: handed an unrelated authorization id, a correct
+  // committed mutation was filed COMMITTED_DIVERGED, permanently.
+  const { authorizationId, digest } = await committedUnknown("mutation.v1", { note: "real" });
+  const unrelated = await authorizeAndSpend({
+    action: "create",
+    recordId: "record-recon-unrelated",
+    proposedContentDigest: memoryContentDigest({ note: "something else" }),
+    mutationReceiptId: "mutation.v1.unrelated",
+  });
+  const [unresolved] = await reconciler().findUnresolved();
+  assert.equal(unresolved?.mutationReceiptId, "mutation.v1");
+  await assert.rejects(
+    () => reconciler().reconcile({ ...unresolved!, authorizationId: unrelated }),
+    /does not match the unknown outcome on record/,
+  );
+  assert.equal(await countReconciliations(), 0);
+  const honest = await reconciler().reconcile(unresolved!);
+  assert.equal(honest.verdict, "COMMITTED_CONFIRMED");
+  assert.equal(honest.observedContentDigest, digest);
+  assert.equal(honest.authorizationId, authorizationId);
+});
+
+test("V-2 reconcile() refuses a mutation receipt id with no unknown outcome on record", async () => {
+  await assert.rejects(
+    () =>
+      reconciler().reconcile({
+        scope: SCOPE,
+        mutationReceiptId: "mutation.never.existed",
+        authorizationId: "recon-auth-phantom-000001",
+        action: "create",
+        targetRecordId: RECORD_ID,
+      }),
+    /no unknown outcome is on record/,
+  );
+  assert.equal(await countReconciliations(), 0);
+});
+
+async function fileAsReconciler(input: {
+  receiptId: string;
+  authorizationId: string;
+  verdict: string;
+  observedVersion: number | null;
+  observedDigest: string | null;
+}): Promise<void> {
+  await runAs(
+    "aaliyah_memory_reconciler",
+    `INSERT INTO memory_reconciliations
+       (tenant_id, workspace_id, principal_id, user_id, mutation_receipt_id,
+        authorization_id, action, target_record_id, verdict,
+        observed_version, observed_content_digest, reconciled_at, evidence)
+     VALUES ($1,$2,$3,$4,$5,$6,'create',$7,$8,$9,$10, now(),
+             jsonb_build_object('mutationReceiptId',$5::text,'authorizationId',$6::text))`,
+    [
+      SCOPE.tenantId,
+      SCOPE.workspaceId,
+      SCOPE.principalId,
+      SCOPE.userId,
+      input.receiptId,
+      input.authorizationId,
+      RECORD_ID,
+      input.verdict,
+      input.observedVersion,
+      input.observedDigest,
+    ],
+  );
+}
+
+test("V-3 SECURITY MEDIUM: a reconciler-role writer cannot file COMMITTED for a mutation with no record version", async () => {
+  // EXECUTED against b3efc82 as aaliyah_memory_reconciler: accepted.
+  const authorizationId = await authorizeAndSpend({
+    action: "create",
+    recordId: RECORD_ID,
+    proposedContentDigest: memoryContentDigest({ note: "never landed" }),
+    mutationReceiptId: "mutation.v3",
+  });
+  await seedReceipt({ phase: "pending", mutationReceiptId: "mutation.v3", authorizationId, action: "create", recordId: RECORD_ID });
+  await assert.rejects(
+    () =>
+      fileAsReconciler({
+        receiptId: "mutation.v3",
+        authorizationId,
+        verdict: "COMMITTED_CONFIRMED",
+        observedVersion: 1,
+        observedDigest: `sha256:${"a".repeat(64)}`,
+      }),
+    /verdict COMMITTED_CONFIRMED is not the verdict stored state implies \(IMPOSSIBLE_STATE\)/,
+  );
+  assert.equal(await countReconciliations(), 0);
+});
+
+test("V-4 the DATABASE refuses every verdict stored state does not imply, and accepts the one it does", async () => {
+  const { authorizationId, digest } = await committedUnknown("mutation.v4", { note: "landed" });
+  await assert.rejects(
+    () => fileAsReconciler({ receiptId: "mutation.v4", authorizationId, verdict: "NOT_COMMITTED", observedVersion: null, observedDigest: null }),
+    /verdict NOT_COMMITTED is not the verdict stored state implies \(COMMITTED_CONFIRMED\)/,
+  );
+  await assert.rejects(
+    () => fileAsReconciler({ receiptId: "mutation.v4", authorizationId, verdict: "COMMITTED_DIVERGED", observedVersion: 1, observedDigest: digest }),
+    /verdict COMMITTED_DIVERGED is not the verdict stored state implies \(COMMITTED_CONFIRMED\)/,
+  );
+  await assert.rejects(
+    () => fileAsReconciler({ receiptId: "mutation.v4", authorizationId, verdict: "IMPOSSIBLE_STATE", observedVersion: null, observedDigest: null }),
+    /verdict IMPOSSIBLE_STATE is not the verdict stored state implies \(COMMITTED_CONFIRMED\)/,
+  );
+  await assert.rejects(
+    () =>
+      fileAsReconciler({
+        receiptId: "mutation.v4",
+        authorizationId,
+        verdict: "COMMITTED_CONFIRMED",
+        observedVersion: 1,
+        observedDigest: `sha256:${"f".repeat(64)}`,
+      }),
+    /must observe the record version that is actually stored/,
+  );
+  await assert.rejects(
+    () =>
+      fileAsReconciler({
+        receiptId: "mutation.v4.phantom",
+        authorizationId,
+        verdict: "NOT_COMMITTED",
+        observedVersion: null,
+        observedDigest: null,
+      }),
+    /must answer an unknown outcome that is on record, as recorded/,
+  );
+  assert.equal(await countReconciliations(), 0);
+  // Positive control: the implied verdict, observing what is stored.
+  await fileAsReconciler({ receiptId: "mutation.v4", authorizationId, verdict: "COMMITTED_CONFIRMED", observedVersion: 1, observedDigest: digest });
+  assert.equal(await countReconciliations(), 1);
 });

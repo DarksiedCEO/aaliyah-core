@@ -159,6 +159,7 @@ beforeEach(async () => {
               memory_authorization_receipts,
               memory_authorization_nonces,
               memory_mutation_receipts,
+              memory_mutation_attempts,
               memory_tombstones,
               memory_legal_hold_carve_outs,
               memory_legal_hold_records,
@@ -517,6 +518,24 @@ async function nonceConsumedAt(bindingDigest: string): Promise<Date | null> {
     [bindingDigest],
   );
   return (result.rows[0]?.consumed_at as Date | null) ?? null;
+}
+
+/**
+ * The ATTEMPTS filed under a receipt id (migration 045). An attempt that
+ * mutated nothing is recorded here, never as a mutation receipt.
+ */
+async function attemptsFor(
+  mutationReceiptId: string,
+): Promise<Array<{ rejection: string; abortReason: string }>> {
+  const result = await adminPool.query(
+    `SELECT rejection, abort_reason FROM memory_mutation_attempts
+      WHERE mutation_receipt_id = $1 ORDER BY id ASC`,
+    [mutationReceiptId],
+  );
+  return result.rows.map((row: { rejection: string; abort_reason: string }) => ({
+    rejection: row.rejection,
+    abortReason: row.abort_reason,
+  }));
 }
 
 async function receiptStatuses(
@@ -1487,10 +1506,12 @@ test("a storage rejection rolls back the whole transaction and leaves no partial
     [receipt.authorizationId],
   );
   assert.equal(consumed.rows[0].consumed_at, null);
-  assert.deepEqual(
-    (await receiptStatuses("mutation.rollback.1")).map((r) => r.phase),
-    ["terminal"],
-  );
+  // The attempt is recorded as an ATTEMPT; no mutation receipt exists, so the
+  // id stays free for the retry.
+  assert.deepEqual(await receiptStatuses("mutation.rollback.1"), []);
+  assert.deepEqual(await attemptsFor("mutation.rollback.1"), [
+    { rejection: "storage_rejected", abortReason: "storage_rejected" },
+  ]);
   const head = await store().readHead(SCOPE, RECORD_ID);
   assert.equal(head?.version, 1);
 });
@@ -2352,10 +2373,11 @@ test("H-1 a committed outcome cannot be claimed without the record version it cl
   );
 });
 
-test("H-1 an ABORTED attempt is still recordable, so the guard is not a blanket refusal", async () => {
-  // If the outcome guard refused every receipt it would pass the tests above
-  // while destroying the abort trail. ABORTED_NO_MUTATION is exactly the row a
-  // party that consumed nothing MUST be able to write.
+test("H-1 an ABORTED attempt is recordable AS AN ATTEMPT, and refused as a mutation receipt", async () => {
+  // Before migration 045 this row was written to memory_mutation_receipts, and
+  // that was red team BREAK 1: an ABORTED terminal row under a receipt id
+  // collides with a later REAL mutation's terminal row under the same id. The
+  // abort trail is not destroyed — it moved to where attempts belong.
   await seedGenesis({ note: "original" });
   const aborted = {
     schemaVersion: WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION,
@@ -2365,15 +2387,15 @@ test("H-1 an ABORTED attempt is still recordable, so the guard is not a blanket 
     action: "correct",
     scope: SCOPE,
     targetRecordId: RECORD_ID,
-    outcome: { status: "ABORTED_NO_MUTATION" },
+    outcome: { status: "ABORTED_NO_MUTATION", abortReason: "policy_rejected" },
   };
   await asMutator(
-    `INSERT INTO memory_mutation_receipts
+    `INSERT INTO memory_mutation_attempts
        (tenant_id, workspace_id, principal_id, user_id, mutation_receipt_id,
-        phase, authorization_id, consumed_nonce_digest, action,
-        target_record_id, outcome_status, emitted_at, payload)
-     VALUES ($1,$2,$3,$4,$5,'terminal',$6,$7,'correct',$8,
-             'ABORTED_NO_MUTATION', now(), $9)`,
+        authorization_id, action, target_record_id, rejection, abort_reason,
+        attempted_at, payload)
+     VALUES ($1,$2,$3,$4,$5,$6,'correct',$7,'authorization_not_found',
+             'policy_rejected', now(), $8)`,
     [
       SCOPE.tenantId,
       SCOPE.workspaceId,
@@ -2381,14 +2403,37 @@ test("H-1 an ABORTED attempt is still recordable, so the guard is not a blanket 
       SCOPE.userId,
       aborted.mutationReceiptId,
       aborted.authorizationId,
-      aborted.consumedNonceDigest,
       RECORD_ID,
       JSON.stringify(aborted),
     ],
   );
-  assert.deepEqual(await receiptStatuses("mutation.abort.direct"), [
-    { phase: "terminal", status: "ABORTED_NO_MUTATION" },
+  assert.deepEqual(await attemptsFor("mutation.abort.direct"), [
+    { rejection: "authorization_not_found", abortReason: "policy_rejected" },
   ]);
+  await assert.rejects(
+    () =>
+      asMutator(
+        `INSERT INTO memory_mutation_receipts
+           (tenant_id, workspace_id, principal_id, user_id, mutation_receipt_id,
+            phase, authorization_id, consumed_nonce_digest, action,
+            target_record_id, outcome_status, emitted_at, payload)
+         VALUES ($1,$2,$3,$4,$5,'terminal',$6,$7,'correct',$8,
+                 'ABORTED_NO_MUTATION', now(), $9)`,
+        [
+          SCOPE.tenantId,
+          SCOPE.workspaceId,
+          SCOPE.principalId,
+          SCOPE.userId,
+          aborted.mutationReceiptId,
+          aborted.authorizationId,
+          aborted.consumedNonceDigest,
+          RECORD_ID,
+          JSON.stringify(aborted),
+        ],
+      ),
+    /an aborted attempt is not a mutation receipt; it belongs in memory_mutation_attempts/,
+  );
+  assert.deepEqual(await receiptStatuses("mutation.abort.direct"), []);
 });
 
 test("H-1 a version that does not succeed the head is refused, even with a real witness", async () => {
@@ -3136,13 +3181,16 @@ test("L-1 an unknown authorization id leaves a durable, attributable attempt", a
   assert.equal(result.rejection, "authorization_not_found");
   // The CALLER still gets nothing to hide behind.
   assert.equal(result.receipt, null);
-  assert.deepEqual(await receiptStatuses("mutation.enumerate.1"), [
-    { phase: "terminal", status: "ABORTED_NO_MUTATION" },
+  // Recorded as an ATTEMPT (migration 045), not as a mutation receipt.
+  assert.deepEqual(await receiptStatuses("mutation.enumerate.1"), []);
+  assert.deepEqual(await attemptsFor("mutation.enumerate.1"), [
+    { rejection: "authorization_not_found", abortReason: "policy_rejected" },
   ]);
   const row = await adminPool.query(
-    `SELECT tenant_id, principal_id, user_id, consumed_nonce_digest,
-            payload->'outcome'->>'abortReason' AS abort_reason
-       FROM memory_mutation_receipts
+    `SELECT tenant_id, principal_id, user_id,
+            payload->>'consumedNonceDigest' AS consumed_nonce_digest,
+            abort_reason
+       FROM memory_mutation_attempts
       WHERE mutation_receipt_id = 'mutation.enumerate.1'`,
   );
   // Filed under the ACTOR, never under the scope it was reaching for, and
@@ -3739,8 +3787,9 @@ test("a stored create authorization rewritten to name a version is refused as ma
   // The attempt is still written down under the ACTOR's scope. For a `create`
   // this row is reachable even though the record does not exist, because a
   // genesis receipt's `fromHead` is a constant and needs nothing observed.
-  assert.deepEqual(await receiptStatuses("mutation.create.wronghead"), [
-    { phase: "terminal", status: "ABORTED_NO_MUTATION" },
+  assert.deepEqual(await receiptStatuses("mutation.create.wronghead"), []);
+  assert.deepEqual(await attemptsFor("mutation.create.wronghead"), [
+    { rejection: "authorization_malformed", abortReason: "policy_rejected" },
   ]);
 });
 
@@ -4900,4 +4949,225 @@ test("R-1 a lock wait of zero (PostgreSQL's 'forever') cannot be configured", ()
       /lockWaitMs must be a positive integer/,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// N — ONE RECEIPT ID NAMES ONE MUTATION (red team BREAK 1, b3efc82).
+// ---------------------------------------------------------------------------
+
+test("N-1 BREAK 1: the ordinary retry after a stale head COMMITS AND VERIFIES under the same receipt id", async () => {
+  // EXECUTED against b3efc82: attempt 1 wrote a terminal ABORTED row; attempt
+  // 2 committed, read back, agreed — then collided with that row, reported
+  // UNKNOWN, and the reconciler was barred from it forever. No attacker.
+  const genesis = await seedGenesis({ n: 0 });
+  const next = { n: 1 };
+  const stale = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, memoryContentDigest({ n: "stale" })),
+      proposedContent: next,
+    }),
+  );
+  const first = await store().correct({
+    actor: SCOPE,
+    authorizationId: stale.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: next,
+    mutationReceiptId: "mutation.retry.same-id",
+  });
+  assert.equal(first.rejection, "head_mismatch");
+
+  const fresh = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, genesis),
+      proposedContent: next,
+    }),
+  );
+  const second = await store().correct({
+    actor: SCOPE,
+    authorizationId: fresh.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: next,
+    mutationReceiptId: "mutation.retry.same-id",
+  });
+  assert.equal(second.verified, true, second.rejection ?? "");
+  assert.equal(second.receipt?.outcome.status, "COMMITTED_AND_READ_BACK");
+  assert.deepEqual(await receiptStatuses("mutation.retry.same-id"), [
+    { phase: "pending", status: "UNKNOWN_PENDING_RECONCILIATION" },
+    { phase: "terminal", status: "COMMITTED_AND_READ_BACK" },
+  ]);
+  assert.deepEqual(await attemptsFor("mutation.retry.same-id"), [
+    { rejection: "head_mismatch", abortReason: "head_mismatch" },
+  ]);
+});
+
+test("N-2 BREAK 1, cross-principal: an id squatted by an UNAUTHORIZED principal cannot repudiate the victim's genesis", async () => {
+  // EXECUTED against b3efc82: a principal holding no authorization planted a
+  // terminal ABORTED row through the `create` audit path; the victim's real
+  // genesis under the same id committed and was reported unknown.
+  const intruder: MemoryScope = { ...SCOPE, principalId: "principal-intruder", userId: "user-intruder" };
+  const squat = await store().create({
+    actor: intruder,
+    authorizationId: nextAuthorizationId(),
+    recordId: RECORD_ID,
+    proposedContent: { planted: true },
+    mutationReceiptId: "mutation.squatted",
+  });
+  assert.equal(squat.rejection, "authorization_not_found");
+  assert.equal((await attemptsFor("mutation.squatted")).length, 1);
+
+  const content = { note: "the victim's genesis" };
+  const receipt = await issue(
+    authorization({ action: "create", expectedHead: NO_PRIOR_HEAD, proposedContent: content }),
+  );
+  const victim = await store().create({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: content,
+    mutationReceiptId: "mutation.squatted",
+  });
+  assert.equal(victim.verified, true, victim.rejection ?? "");
+  assert.equal(await countVersions(), 1);
+});
+
+test("N-3 a receipt id already on record cannot be reused by another mutation, and the refusal spends nothing", async () => {
+  const genesis = await seedGenesis({ n: 0 });
+  const next = { n: 1 };
+  const firstAuth = await issue(
+    authorization({ action: "correct", expectedHead: headOf(1, genesis), proposedContent: next }),
+  );
+  const first = await store().correct({
+    actor: SCOPE,
+    authorizationId: firstAuth.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: next,
+    mutationReceiptId: "mutation.reused",
+  });
+  assert.equal(first.verified, true);
+
+  const later = { n: 2 };
+  const secondAuth = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(2, memoryContentDigest(next)),
+      proposedContent: later,
+    }),
+  );
+  const reused = await store().correct({
+    actor: SCOPE,
+    authorizationId: secondAuth.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: later,
+    mutationReceiptId: "mutation.reused",
+  });
+  assert.equal(reused.verified, false);
+  assert.equal(reused.rejection, "mutation_receipt_id_reused");
+  assert.equal(await nonceConsumedAt(secondAuth.nonce.bindingDigest), null);
+  assert.equal(await countVersions(), 2);
+  // The first mutation's evidence is untouched.
+  assert.deepEqual(await receiptStatuses("mutation.reused"), [
+    { phase: "pending", status: "UNKNOWN_PENDING_RECONCILIATION" },
+    { phase: "terminal", status: "COMMITTED_AND_READ_BACK" },
+  ]);
+});
+
+/** A receipt row written directly, under the mutation role. */
+async function rawReceipt(input: {
+  phase: "pending" | "terminal";
+  mutationReceiptId: string;
+  authorizationId: string;
+  scope?: MemoryScope;
+}): Promise<void> {
+  const scope = input.scope ?? SCOPE;
+  const payload = {
+    schemaVersion: WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION,
+    mutationReceiptId: input.mutationReceiptId,
+    authorizationId: input.authorizationId,
+    consumedNonceDigest: `sha256:${"5".repeat(64)}`,
+    action: "correct",
+    scope,
+    targetRecordId: RECORD_ID,
+    outcome: { status: "UNKNOWN_PENDING_RECONCILIATION" },
+  };
+  await asMutator(
+    `INSERT INTO memory_mutation_receipts
+       (tenant_id, workspace_id, principal_id, user_id, mutation_receipt_id,
+        phase, authorization_id, consumed_nonce_digest, action,
+        target_record_id, outcome_status, emitted_at, payload)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'correct',$9,
+             'UNKNOWN_PENDING_RECONCILIATION', now(), $10)`,
+    [
+      scope.tenantId,
+      scope.workspaceId,
+      scope.principalId,
+      scope.userId,
+      input.mutationReceiptId,
+      input.phase,
+      input.authorizationId,
+      payload.consumedNonceDigest,
+      RECORD_ID,
+      JSON.stringify(payload),
+    ],
+  );
+}
+
+test("N-4 the DATABASE refuses a new mutation on an id that already carries a terminal receipt", async () => {
+  const genesis = await seedGenesis({ n: 0 });
+  const receipt = await issue(
+    authorization({ action: "correct", expectedHead: headOf(1, genesis), proposedContent: { n: 1 } }),
+  );
+  // An UNKNOWN terminal with no pending row is legitimate: a COMMIT that did
+  // not come back, which did not land. Its id is spent all the same.
+  await rawReceipt({ phase: "terminal", mutationReceiptId: "mutation.spent", authorizationId: receipt.authorizationId });
+  await assert.rejects(
+    () => rawReceipt({ phase: "pending", mutationReceiptId: "mutation.spent", authorizationId: receipt.authorizationId }),
+    /a mutation receipt id that already carries a terminal receipt cannot begin another mutation/,
+  );
+  // The store refuses it first, before anything is spent.
+  const attempt = await store().correct({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: { n: 1 },
+    mutationReceiptId: "mutation.spent",
+  });
+  assert.equal(attempt.rejection, "mutation_receipt_id_reused");
+  assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
+});
+
+test("N-5 the DATABASE refuses a terminal receipt that describes a different mutation than its pending one", async () => {
+  const genesis = await seedGenesis({ n: 0 });
+  const mine = await issue(
+    authorization({ action: "correct", expectedHead: headOf(1, genesis), proposedContent: { n: 1 } }),
+  );
+  const other = await issue(
+    authorization({ action: "correct", expectedHead: headOf(1, genesis), proposedContent: { n: 2 } }),
+  );
+  await rawReceipt({ phase: "pending", mutationReceiptId: "mutation.pair", authorizationId: mine.authorizationId });
+  await assert.rejects(
+    () => rawReceipt({ phase: "terminal", mutationReceiptId: "mutation.pair", authorizationId: other.authorizationId }),
+    /a terminal receipt must describe the same mutation as its pending receipt/,
+  );
+  // Positive control: the matching terminal is accepted.
+  await rawReceipt({ phase: "terminal", mutationReceiptId: "mutation.pair", authorizationId: mine.authorizationId });
+  assert.equal((await receiptStatuses("mutation.pair")).length, 2);
+});
+
+test("N-6 the DATABASE refuses a mutation receipt filed outside its authorization's scope", async () => {
+  const genesis = await seedGenesis({ n: 0 });
+  const receipt = await issue(
+    authorization({ action: "correct", expectedHead: headOf(1, genesis), proposedContent: { n: 1 } }),
+  );
+  await assert.rejects(
+    () =>
+      rawReceipt({
+        phase: "pending",
+        mutationReceiptId: "mutation.elsewhere",
+        authorizationId: receipt.authorizationId,
+        scope: { ...SCOPE, principalId: "principal-elsewhere" },
+      }),
+    /a memory_mutation_receipts row must carry the scope of the authorization that witnesses it/,
+  );
 });
