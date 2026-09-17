@@ -1,4 +1,9 @@
 import type {
+  KeyDestructionObligation,
+  KeyDestructionSettlementRequest,
+  KeyDestructionSettlementResult,
+} from "./wave1KeyDestruction";
+import type {
   TrustedMemoryActor,
   TrustedMemoryRecord,
   TrustedMemoryStore,
@@ -105,7 +110,45 @@ export type Wave1MemoryService = {
    * Destroy alias data keys whose erasure committed but was never confirmed
    * — the other half of a deletion a crash or a provider outage interrupted.
    */
-  completePendingErasures(limit?: number): Promise<{ destroyed: number; pending: number }>;
+  completePendingErasures(limit?: number): Promise<{
+    destroyed: number;
+    /**
+     * Keys whose `key_destroyed` evidence was a FORGERY — the provider said
+     * the key was alive — which this pass then destroyed for real. Counted
+     * apart from `destroyed` because the forged row already occupies the
+     * evidence slot, so the insert conflicts and `destroyed` cannot see it.
+     */
+    repaired: number;
+    /** Contradictions seen between the evidence and the provider. */
+    contradictions: number;
+    pending: number;
+    /**
+     * Of `pending`, how many are unprovable rather than late, and why. Boot
+     * reads this to say WHICH it is, instead of printing a counter that never
+     * moves (founder decision, OPTION B).
+     */
+    notProven: number;
+    notProvenReasons: Record<string, number>;
+  }>;
+  /**
+   * SETTLE one key's destruction on evidence, or record that the evidence did
+   * not settle it.
+   *
+   * The bounded way out of `ERASURE_PENDING_SETTLEMENT`, and NOT an
+   * administrative bypass: evidence-bound, scoped, independently authorized,
+   * independently verified, replay-safe, idempotent, versioned and immutable
+   * once written. Only `PROVEN_DESTROYED` satisfies the key-destruction
+   * portion of a verified erasure; `STILL_UNKNOWN` is a recorded decision
+   * that the question remains open.
+   */
+  settleKeyDestruction(
+    request: KeyDestructionSettlementRequest,
+  ): Promise<KeyDestructionSettlementResult>;
+  /** The unresolved key-destruction obligations an operator has to settle. */
+  listKeyDestructionObligations(input: {
+    actor: TrustedMemoryActor;
+    limit?: number;
+  }): Promise<KeyDestructionObligation[]>;
   /** The canonical identity a record has been merged into, transitively. */
   canonicalIdentity(
     actor: TrustedMemoryActor,
@@ -205,6 +248,14 @@ export function createWave1MemoryService(
 
     completePendingErasures(limit) {
       return deps.store.completePendingAliasErasures(limit);
+    },
+
+    settleKeyDestruction(request) {
+      return deps.store.settleKeyDestruction(request);
+    },
+
+    listKeyDestructionObligations(input) {
+      return deps.store.listKeyDestructionObligations(input);
     },
   };
 }

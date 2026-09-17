@@ -1,4 +1,5 @@
 import type { Pool, PoolClient } from "pg";
+import { enterMemoryRole } from "./pool";
 
 /**
  * RECONCILING AN UNKNOWN OUTCOME.
@@ -144,7 +145,9 @@ export function createPostgresMemoryReconciler(
     if (!/^[a-z_][a-z0-9_]*$/.test(role)) {
       throw new Error(`unsafe reconciler role: ${role}`);
     }
-    await client.query(`SET LOCAL ROLE "${role}"`);
+    // Least privilege AND a pinned search path (K-07): `"$user"` off the
+    // path, `pg_temp` last. One helper, so no call site can forget either.
+    await enterMemoryRole(client, role);
   }
 
   /**

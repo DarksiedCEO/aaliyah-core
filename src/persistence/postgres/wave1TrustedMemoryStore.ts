@@ -45,6 +45,19 @@ import {
 import { appendMutationAttempt } from "./memoryMutationAttempts";
 import { MEMORY_CANONICAL_RESOLUTION_MAX_DEPTH } from "../../application/memory/wave1MemoryService";
 import type { MemoryPiiKeyProvider } from "../../crypto/memoryPiiKeys";
+import {
+  KEY_DESTRUCTION_POLICY_VERSION,
+  SETTLEMENT_DECISION_THAT_SATISFIES,
+  SETTLEMENT_DECISIONS,
+  type KeyDestructionAssessment,
+  type KeyDestructionObligation,
+  type KeyDestructionProof,
+  type KeyDestructionSettlementRequest,
+  type KeyDestructionSettlementResult,
+  type KeyNotProvenReason,
+} from "../../application/memory/wave1KeyDestruction";
+import { enterMemoryRole, isConnectionAmbiguous, releaseClient } from "./pool";
+import * as crypto from "node:crypto";
 
 /**
  * PostgreSQL trusted-memory mutation service.
@@ -244,7 +257,24 @@ class MutationAborted extends Error {
   }
 }
 
-const ABORT_REASON: Record<string, MemoryAbortReason> = {
+/**
+ * EVERY REJECTION THIS STORE CAN EMIT, MAPPED TO THE CONTRACT'S COARSE ABORT
+ * VOCABULARY — AND THE TYPE SYSTEM CHECKS THAT IT IS EVERY ONE.
+ *
+ * Integration review of 8a0bf05, LOW (K-20): this was
+ * `Record<string, MemoryAbortReason>`, whose index signature accepts any key
+ * and therefore requires none. A new rejection code with no entry compiled
+ * cleanly and silently reported `policy_rejected` at runtime — so a caller
+ * would be told "policy" about something that was not policy, and no test
+ * anywhere would notice. `Record<TrustedMemoryRejection, ...>` makes an
+ * unmapped reason fail `tsc` instead, which is how the two reasons this round
+ * adds were forced to declare what they mean.
+ *
+ * Complete, with no `?? "policy_rejected"` fallback at the call site either:
+ * a default there would put the silent misreport straight back, just further
+ * from the table that caused it.
+ */
+const ABORT_REASON: Record<TrustedMemoryRejection, MemoryAbortReason> = {
   identity_order_malformed: "policy_rejected",
   identity_counterparty_invalid: "policy_rejected",
   identity_counterparty_missing: "policy_rejected",
@@ -282,6 +312,23 @@ const ABORT_REASON: Record<string, MemoryAbortReason> = {
   // taken is a refusal by storage, and nothing was mutated or consumed.
   record_busy: "storage_rejected",
   mutation_receipt_id_reused: "policy_rejected",
+  // NOT "not yet erased". The contract's vocabulary has no value for "we
+  // cannot establish what happened", and `storage_rejected` is the honest
+  // coarse answer: this store declined to complete the operation because its
+  // own state is unresolved. The operational detail — which key, and why it
+  // could not be proven — is in the obligation ledger, where an operator can
+  // act on it, rather than flattened into an abort reason.
+  key_destruction_not_proven: "storage_rejected",
+  // Transient: nothing was consumed, nothing was written, and a retry proves
+  // the new key. `storage_rejected` for the same reason `record_busy` is.
+  merged_keys_changed_during_proof: "storage_rejected",
+  // POST-COMMIT VERDICTS, not aborts. They reach this map only through the
+  // abort receipt of a mutation that got as far as committing and then could
+  // not be verified, and in both cases the commit's fate is a STORAGE fact
+  // rather than a policy decision. Mapped explicitly so the exhaustive type
+  // stays exhaustive instead of being narrowed to hide them.
+  read_back_diverged: "storage_rejected",
+  unknown_outcome: "storage_rejected",
 };
 
 /**
@@ -303,6 +350,18 @@ export type TrustedMemoryStoreOptions = {
   /** Role the independent post-commit read-back runs as. SELECT only. */
   readBackRole?: string | null;
   /**
+   * Role a key-destruction SETTLEMENT is written as.
+   *
+   * A different role from `mutationRole`, and that separation is the
+   * enforceable form of "independently authorized": the mutation role can
+   * already write `key_destroyed` evidence — which is precisely why the
+   * provider is asked at all — so if it could also write the artifact that
+   * STANDS IN for the provider, settlement would be a bypass with extra
+   * paperwork. Migration 055 grants INSERT on the settlements table to this
+   * role and to no other.
+   */
+  settlementRole?: string | null;
+  /**
    * How long a mutation waits for ANY lock — the record's advisory lock, a
    * row lock on the nonce — before refusing with `record_busy`. Set on the
    * transaction itself, so it holds whatever pool the store was handed.
@@ -315,10 +374,116 @@ export type TrustedMemoryStoreOptions = {
    * incomplete rather than done.
    */
   piiKeys?: MemoryPiiKeyProvider | null;
+  /**
+   * HOW LONG ONE PROVIDER CALL MAY TAKE before this process stops waiting on
+   * it.
+   *
+   * Reliability review of 8a0bf05, HIGH (K-04): nothing bounded a single
+   * `dataKeyState` or `destroyDataKey` call anywhere. One hung call took a
+   * completion pass to 8010ms — exactly the sum of the two artificial hangs —
+   * and since `src/server.ts` awaits that pass before `app.listen()`, a hung
+   * provider blocked process startup indefinitely.
+   *
+   * Deliberately far below the pool's `connectionTimeoutMillis`: a caller
+   * waiting on a provider must never be the reason another caller cannot get
+   * a database connection.
+   */
+  providerDeadlineMs?: number;
+  /**
+   * HOW MANY ALREADY-DESTROYED KEYS ONE COMPLETION PASS RE-CONFIRMS.
+   *
+   * Reliability review of 8a0bf05, HIGH (K-04): the evidenced-key audit had
+   * no bound at all. 150 honestly erased keys produced exactly 150 provider
+   * calls on every pass, and the same 150 again on the next one, forever,
+   * growing with the store's all-time erasure volume.
+   *
+   * It cannot simply share the pending work's limit either: when it did, 100
+   * settled rows ahead of a forged one kept that forged row out of every pass
+   * (security review of 03581a3, F2). So the audit has its OWN bound and its
+   * own ordering — least recently audited first — which is what makes the cost
+   * constant AND still reaches every key, including one hiding behind volume.
+   */
+  evidencedAuditLimit?: number;
 };
 
 /** Default bound on a mutation's lock waits. */
 export const TRUSTED_MEMORY_LOCK_WAIT_MS = 5_000;
+
+/** Default bound on ONE provider call. See `providerDeadlineMs`. */
+export const PROVIDER_DEADLINE_MS = 5_000;
+
+/** Default bound on how many settled keys one pass re-confirms. */
+export const EVIDENCED_AUDIT_LIMIT = 50;
+
+/** A provider call this process stopped waiting for. */
+export class ProviderDeadlineExceeded extends Error {
+  constructor(readonly label: string, readonly deadlineMs: number) {
+    super(`memory PII key provider: ${label} exceeded ${deadlineMs}ms`);
+    this.name = "ProviderDeadlineExceeded";
+  }
+}
+
+/**
+ * RUN A PROVIDER CALL UNDER A DEADLINE THIS PROCESS ENFORCES.
+ *
+ * It ABANDONS, it does not cancel: there is no cancellation in the provider
+ * interface, so the underlying call may still complete afterwards. That is
+ * acceptable and stated rather than hidden —
+ *
+ *   - for `dataKeyState`, which is a read, a late answer is simply discarded;
+ *   - for `destroyDataKey`, a late completion means the destruction may well
+ *     have happened. Nothing is recorded on that basis: the next pass asks
+ *     the provider again and records destruction only from an answer it
+ *     actually received. Destruction is idempotent, so re-attempting is safe.
+ *
+ * The abandoned promise keeps a rejection handler, because an abandoned
+ * rejection is still an unhandled rejection and would take the process down —
+ * which is the failure mode this whole deadline exists to prevent.
+ */
+async function withProviderDeadline<T>(
+  label: string,
+  deadlineMs: number,
+  run: () => Promise<T>,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const call = run();
+  call.catch(() => undefined);
+  try {
+    return await Promise.race([
+      call,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new ProviderDeadlineExceeded(label, deadlineMs)),
+          deadlineMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** The canonical digest of a settlement's evidence set. */
+export function settlementEvidenceDigest(evidence: unknown): string {
+  return `sha256:${crypto
+    .createHash("sha256")
+    .update(canonicalJson(evidence))
+    .digest("hex")}`;
+}
+
+/**
+ * Key order, so the same evidence set always digests to the same value
+ * whatever order a caller happened to build its object in. A digest that
+ * depends on insertion order proves nothing twice.
+ */
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
+}
 
 /** SQLSTATE `lock_not_available`: a `lock_timeout` expired. */
 const LOCK_NOT_AVAILABLE = "55P03";
@@ -364,22 +529,47 @@ export function createPostgresTrustedMemoryStore(
       : options.readBackRole,
     "readBackRole",
   );
+  const settlementRole = assertRole(
+    options.settlementRole === undefined
+      ? "aaliyah_memory_settler"
+      : options.settlementRole,
+    "settlementRole",
+  );
+  if (settlementRole !== null && settlementRole === mutationRole) {
+    // Refused at construction. A settlement written by the mutation role is
+    // not an independent authorization, whatever the row says.
+    throw new Error(
+      "trusted memory: the settlement role must not be the mutation role",
+    );
+  }
   const lockWaitMs = options.lockWaitMs ?? TRUSTED_MEMORY_LOCK_WAIT_MS;
   const piiKeys = options.piiKeys ?? null;
+  const providerDeadlineMs = options.providerDeadlineMs ?? PROVIDER_DEADLINE_MS;
+  const evidencedAuditLimit = options.evidencedAuditLimit ?? EVIDENCED_AUDIT_LIMIT;
+  if (!Number.isSafeInteger(providerDeadlineMs) || providerDeadlineMs <= 0) {
+    throw new Error("trusted memory: providerDeadlineMs must be a positive integer");
+  }
+  if (!Number.isSafeInteger(evidencedAuditLimit) || evidencedAuditLimit <= 0) {
+    // Zero would silence the audit entirely, which is how a forged
+    // `key_destroyed` row stops being checked. Refused at construction.
+    throw new Error("trusted memory: evidencedAuditLimit must be a positive integer");
+  }
   if (!Number.isSafeInteger(lockWaitMs) || lockWaitMs <= 0) {
     // Zero is PostgreSQL's "wait forever". Refused at construction so it can
     // never be configured by accident.
     throw new Error("trusted memory: lockWaitMs must be a positive integer");
   }
 
+  /**
+   * Least privilege AND a pinned search path, from the one place that carries
+   * that pairing for every store. See `enterMemoryRole` for the shadow-schema
+   * proof of concept it closes (K-07).
+   */
   async function enterRole(
     client: PoolClient,
     role: string | null,
   ): Promise<void> {
-    if (role === null) return;
-    // SET LOCAL, so the privilege drop is scoped to this transaction and is
-    // undone by COMMIT/ROLLBACK rather than leaking onto a pooled connection.
-    await client.query(`SET LOCAL ROLE "${role}"`);
+    await enterMemoryRole(client, role);
   }
 
   function headFromRow(row: RecordRow): TrustedMemoryHead {
@@ -691,7 +881,7 @@ export function createPostgresTrustedMemoryStore(
       outcome: {
         status: "ABORTED_NO_MUTATION",
         abortedAt: at,
-        abortReason: ABORT_REASON[rejection] ?? "policy_rejected",
+        abortReason: ABORT_REASON[rejection],
       },
     });
     await appendMutationAttempt({ pool, role: mutationRole, receipt, rejection }).catch(
@@ -815,6 +1005,54 @@ export function createPostgresTrustedMemoryStore(
         ),
       )
       .sort();
+
+    // ---- PHASE 1: PROVE THE KEYS, WITH NO TRANSACTION OPEN -------------
+    //
+    // A subject erasure of a merge survivor must establish, outside the
+    // database, that every data key in its canonical merge set is really
+    // destroyed. That question involves an EXTERNAL PROVIDER, and it used to
+    // be asked from inside the mutation transaction while holding the
+    // record's advisory lock and a pool connection — which exhausted the
+    // write pool for every tenant during nothing worse than provider latency
+    // (reliability review of 8a0bf05, CRITICAL, K-02).
+    //
+    // Two things make asking it out here safe rather than merely faster:
+    // destruction LATCHES, so a `destroyed` answer cannot go stale; and the
+    // transaction re-reads the key set under the record's lock and refuses any
+    // key this phase did not answer for.
+    //
+    // THE ADVISORY PRE-CHECK IS NOT AN AUTHORIZATION PATH. It exists only so
+    // an unauthenticated or unauthorized caller cannot make this process call
+    // a metered external KMS by naming somebody else's record. It decides
+    // nothing: every refusal it could produce is produced again, atomically,
+    // inside the transaction, which remains the only authority. Deciding
+    // anything here would be a second authorization path without the record
+    // lock, which is the shape of the defect this whole file exists to avoid.
+    const subjectErasureRequested =
+      action === "delete" &&
+      parseDeletionOrder(request.proposedContent)?.reason ===
+        "subject_erasure_request";
+    let keyProof: KeyDestructionAssessment[] = [];
+    if (subjectErasureRequested && (await worthAskingTheProvider(request))) {
+      try {
+        keyProof = await proveInScopeKeys(
+          {
+            tenantId: request.actor.tenantId,
+            workspaceId: request.actor.workspaceId,
+          },
+          request.recordId,
+        );
+      } catch (error) {
+        // The proof phase could not even read the key set. Nothing has been
+        // consumed and nothing written; refuse rather than proceed with an
+        // empty proof, which would let the transaction's subset guard pass
+        // vacuously.
+        if (isConnectionAmbiguous(error)) {
+          return { verified: false, rejection: "record_busy", receipt: null };
+        }
+        return { verified: false, rejection: "storage_rejected", receipt: null };
+      }
+    }
 
     const client = await pool.connect();
     try {
@@ -1012,10 +1250,9 @@ export function createPostgresTrustedMemoryStore(
       // (red team BREAK A against 2b2e554). Without it a merge put the
       // subject's address beyond erasure for good. Migration 051 admits the
       // same single exception in the freeze trigger.
-      const subjectErasure =
-        action === "delete" &&
-        parseDeletionOrder(request.proposedContent)?.reason ===
-          "subject_erasure_request";
+      // Recomputed from the same authorized content the proof phase read, so
+      // the two can never disagree about what kind of deletion this is.
+      const subjectErasure = subjectErasureRequested;
       const mergedAway = await client.query(
         `SELECT 1 FROM memory_identity_edges
           WHERE tenant_id = $1 AND workspace_id = $2
@@ -1045,46 +1282,59 @@ export function createPostgresTrustedMemoryStore(
         if (unerased.rowCount !== 0) {
           throw new MutationAborted("merged_records_not_erased");
         }
-        // The database's answer rests on key_destroyed evidence, which the
-        // mutation role can write. Every data key of a binding erased under
-        // a record merged into this one is asked about, and a key the
-        // provider does not confirm destroyed refuses the erasure (security
-        // review of 03581a3, ATK-C1).
-        const mergedKeys = await client.query(
-          `WITH RECURSIVE absorbed(record_id) AS (
-             SELECT from_record_id FROM memory_identity_edges
-              WHERE tenant_id = $1 AND workspace_id = $2 AND to_record_id = $3 AND kind = 'merged_into'
-             UNION
-             SELECT e.from_record_id FROM memory_identity_edges AS e
-               JOIN absorbed AS a ON e.to_record_id = a.record_id
-              WHERE e.tenant_id = $1 AND e.workspace_id = $2 AND e.kind = 'merged_into'
-           )
-           SELECT DISTINCT b.pii_key_ref AS key_ref
-             FROM memory_alias_bindings AS b
-             JOIN absorbed AS a ON b.canonical_participant_id = a.record_id
-            WHERE b.tenant_id = $1 AND b.workspace_id = $2`,
-          [
-            stored.scope.tenantId,
-            stored.scope.workspaceId,
-            stored.targetRecordId,
-          ],
+        // ---- WHAT THE DATABASE CANNOT ANSWER ---------------------------
+        //
+        // The helper above rests on `key_destroyed` evidence, which the
+        // MUTATION ROLE CAN WRITE. So a forged row makes the database say
+        // "erased" about a key that is alive (security review of 03581a3,
+        // ATK-C1), and something outside the database has to be asked.
+        //
+        // That question is asked BEFORE this transaction opened — see
+        // `proveInScopeKeys` — because asking it here held the record's
+        // advisory lock and a pool connection for the provider's entire
+        // latency and produced a write-path outage for every tenant sharing
+        // the pool (reliability review of 8a0bf05, CRITICAL, K-02).
+        //
+        // What remains here is the part that MUST be atomic: the in-scope key
+        // set is re-read under this record's lock, and every key in it must be
+        // one the proof phase actually answered for. Two distinct refusals,
+        // because they are two distinct situations and collapsing them is what
+        // made a permanent denial look like a transient one:
+        //
+        //   - a key the proof phase could not establish       -> NOT ERASED,
+        //     `key_destruction_not_proven`, recorded as a durable settlement
+        //     obligation (founder decision, OPTION B);
+        //   - a key that appeared since the proof phase ran   -> transient,
+        //     `merged_keys_changed_during_proof`, nothing consumed, retry.
+        const inScopeNow = await readInScopeKeys(
+          client,
+          stored.scope,
+          stored.targetRecordId,
         );
-        for (const row of mergedKeys.rows as Array<{ key_ref: string }>) {
-          const state =
-            piiKeys === null
-              ? null
-              : await piiKeys
-                  .dataKeyState({
-                    scope: {
-                      tenantId: stored.scope.tenantId,
-                      workspaceId: stored.scope.workspaceId,
-                    },
-                    keyRef: row.key_ref,
-                  })
-                  .catch(() => null);
-          if (state !== "destroyed") {
+        const proof = new Map(keyProof.map((a) => [a.keyRef, a.proof]));
+        for (const row of inScopeNow) {
+          const answer = proof.get(row.key_ref);
+          if (answer === "PROVEN_DESTROYED") continue;
+          // ---- THREE REFUSALS, BECAUSE THESE ARE THREE SITUATIONS -------
+          if (answer === undefined) {
+            // Nobody asked about this key: it came into scope after the proof
+            // phase ran. Transient — nothing consumed, nothing written.
+            throw new MutationAborted("merged_keys_changed_during_proof");
+          }
+          if (answer === "PROVEN_NOT_DESTROYED") {
+            // The owning provider says the key is ALIVE. That is not
+            // uncertainty and it is not a settlement's business: the merged-in
+            // record genuinely is not erased, which is exactly what
+            // `merged_records_not_erased` has always meant, and the completion
+            // pass resolves it by destroying the key. Where the database
+            // claimed destruction, this is also a DETECTED FORGERY — X-7
+            // forges `key_destroyed` for a live key and must still be refused
+            // on these terms. Collapsing it into "cannot be proven" would have
+            // offered a SETTLEMENT path for a key we can see is alive, which
+            // is the one thing settlement must never be for.
             throw new MutationAborted("merged_records_not_erased");
           }
+          throw new MutationAborted("key_destruction_not_proven");
         }
       }
 
@@ -1744,6 +1994,20 @@ export function createPostgresTrustedMemoryStore(
     }
 
     if (failure !== null) {
+      // ---- THE UNRESOLVED STATE IS RECORDED, NOT JUST REFUSED ----------
+      // Founder decision, OPTION B: a key whose destruction cannot be proven
+      // leaves the subject in `ERASURE_PENDING_SETTLEMENT`. That state has to
+      // be findable — the whole defect at 8a0bf05 was a refusal with nothing
+      // behind it and no way out (integration K-01, security K-09). Written
+      // AFTER the transaction was rolled back and its connection released, on
+      // its own connection, so bookkeeping can never be the reason a refusal
+      // becomes an error.
+      if (
+        failure.kind === "abort" &&
+        failure.rejection === "key_destruction_not_proven"
+      ) {
+        await recordObligations(keyProof).catch(() => undefined);
+      }
       return failure.kind === "abort"
         ? await abortResult(request, action, stored, failure.rejection)
         : await finishUnknown(request, action, stored, "commit_issued");
@@ -2057,141 +2321,741 @@ export function createPostgresTrustedMemoryStore(
   }
 
   /**
-   * DELETE, WHICH IS ERASURE, AND THEN AN INDEPENDENT READ-BACK OF THE
-   * ACCOUNTING.
+   * IS IT WORTH ASKING A METERED EXTERNAL KMS ABOUT THIS REQUEST AT ALL?
    *
-   * The tombstone is NOT returned from the writing transaction. It is read
-   * back on the read-back pool, on a different connection under the SELECT-only
-   * role, exactly as the head is — because a tombstone the writer hands back
-   * to itself proves only that the writer built one. A verified deletion whose
-   * accounting cannot be read back is reported as `erasure_incomplete` and
-   * never as success.
+   * Purely a rate limiter on provider calls, and deliberately nothing else.
+   * The key proof has to happen outside the mutation transaction (K-02), and
+   * outside the transaction there is no consumption and no lock — so without
+   * this gate any caller could make this process issue provider calls for a
+   * record it has no authorization over, simply by naming it.
+   *
+   * IT DECIDES NOTHING ABOUT THE MUTATION. Every condition it reads is read
+   * again inside the transaction, atomically, against the same stored state,
+   * and the transaction's answer is the only answer. A `false` here costs a
+   * caller nothing but the provider calls: the transaction still runs and
+   * still produces the authoritative refusal, and the subset guard still
+   * refuses any unproven key. Treating this as an authorization check would
+   * make it a second authorization path without the record lock, which is
+   * exactly the class of defect the rest of this file is built against.
    */
+  async function worthAskingTheProvider(
+    request: TrustedMemoryMutationRequest,
+  ): Promise<boolean> {
+    const client = await pool.connect();
+    let ambiguous: unknown;
+    try {
+      await client.query("BEGIN");
+      await enterRole(client, mutationRole);
+      const result = await client.query(
+        `SELECT 1
+           FROM public.memory_authorization_receipts
+          WHERE authorization_id = $1
+            AND tenant_id = $2 AND workspace_id = $3
+            AND action = 'delete'
+            AND target_record_id = $4
+            AND consumed_at IS NULL
+            AND revoked_at IS NULL
+            AND expires_at > now()
+          LIMIT 1`,
+        [
+          request.authorizationId,
+          request.actor.tenantId,
+          request.actor.workspaceId,
+          request.recordId,
+        ],
+      );
+      await client.query("COMMIT");
+      return result.rowCount === 1;
+    } catch (error) {
+      ambiguous = error;
+      await client.query("ROLLBACK").catch(() => undefined);
+      // Unreadable here is not a verdict. Let the transaction decide, and pay
+      // for the proof: refusing to prove would let the subset guard pass
+      // vacuously, which is strictly worse than a wasted provider call.
+      return true;
+    } finally {
+      releaseClient(client, ambiguous);
+    }
+  }
+
+  // ======================================================================
+  // KEY DESTRUCTION: WHAT WE CAN PROVE, AND WHAT WE MUST NOT CLAIM
+  // ======================================================================
+
+  /**
+   * One key the completion pass or a deletion's accounting has to answer for.
+   * `subject_record_id` and `key_version` are known only in the subject-scoped
+   * branch, which is the branch that joins the binding.
+   */
+  type DueKeyRow = {
+    tenant_id: string;
+    workspace_id: string;
+    tombstone_id: string;
+    alias_id: string;
+    binding_mutation_receipt_id: string;
+    key_ref: string;
+    provider_id: string;
+    key_version: number | null;
+    subject_record_id: string | null;
+    evidenced: boolean;
+  };
+
+  /**
+   * WHAT A PASS ACTUALLY ESTABLISHED. `pending` and `notProven` are separate
+   * numbers on purpose: a key whose provider is merely slow is resolved by the
+   * next pass, and a key in `notProven` is resolved by no number of passes.
+   * Reporting one number for both is what made a permanent denial look like a
+   * transient one (integration K-01).
+   */
+  type AliasKeyOutcome = {
+    /** Keys this pass drove from not-evidenced-destroyed to evidenced. */
+    destroyed: number;
+    /**
+     * KEYS WHOSE EVIDENCE ALREADY CLAIMED DESTRUCTION AND WHOSE PROVIDER SAID
+     * OTHERWISE, DESTROYED AND CONFIRMED BY THIS PASS.
+     *
+     * A separate number from `destroyed` because the evidence slot was
+     * already occupied — by a FORGED row — so the insert conflicts and
+     * `destroyed` (which counts rows that actually landed, per K-11) cannot
+     * see it. Reporting it as zero would hide the one event here worth
+     * alerting on: a forged `key_destroyed` row was detected and the real key
+     * really was still alive.
+     */
+    repaired: number;
+    /** Contradictions observed between the evidence and the provider. */
+    contradictions: number;
+    pending: number;
+    notProven: number;
+    notProvenReasons: Record<string, number>;
+    /** In-scope committed erasures: the denominator. */
+    erased: number;
+  };
+
+  type InScopeKeyRow = {
+    tenant_id: string;
+    workspace_id: string;
+    tombstone_id: string;
+    alias_id: string;
+    binding_mutation_receipt_id: string;
+    key_ref: string;
+    provider_id: string;
+    key_version: number;
+    subject_record_id: string;
+    evidenced: boolean;
+  };
+
+  /**
+   * EVERY DATA KEY IN A SUBJECT'S CANONICAL MERGE SET, WHATEVER TOMBSTONE
+   * RECORDED IT AND WHATEVER STATE ITS OWNING RECORD IS NOW IN.
+   *
+   * This query is the erasure completeness DENOMINATOR, and getting its scope
+   * wrong is how a live key stopped being counted at 8a0bf05:
+   *
+   *   - red team B1, HIGH, executed (K-03): `deleteRecord` computed pending
+   *     keys over ITS OWN tombstone only (`c.tombstone_id = $3`). After a
+   *     provider outage left a key pending, a `restore` and a second subject
+   *     erasure recorded NO new `erasure_committed` rows — the alias UPDATE
+   *     only touches bindings where `pii_erased_at IS NULL`, and they were
+   *     already erased — so the second tombstone's denominator was EMPTY and
+   *     the erasure reported `verified:true {0,0,0}` while the key was
+   *     `active` and a pre-erasure ciphertext copy still decrypted to the
+   *     subject's address;
+   *   - founder FIFTH priority: no key may disappear from the denominator
+   *     because its owning record transitioned state.
+   *
+   * So the scope is the SUBJECT — the record and every identity absorbed into
+   * it, recursively — and never a tombstone. `memory_pii_key_erasures` does
+   * not carry the participant, so the binding is joined to supply it, which is
+   * the same join migration 054's helper uses. `pii_key_version` comes from
+   * its column rather than the envelope, because the envelope is NULL after
+   * erasure and a claim that a key is destroyed is a claim about a VERSION.
+   *
+   * There is at most one `erasure_committed` row per key
+   * (`memory_pii_key_erasures_once`), so a key is counted exactly once no
+   * matter how many times its subject is erased and restored.
+   */
+  const IN_SCOPE_KEYS_SQL = `
+    WITH RECURSIVE absorbed(record_id) AS (
+      SELECT $3::text
+      UNION
+      SELECT e.from_record_id
+        FROM public.memory_identity_edges AS e
+        JOIN absorbed AS a ON e.to_record_id = a.record_id
+       WHERE e.tenant_id = $1 AND e.workspace_id = $2 AND e.kind = 'merged_into'
+    )
+    SELECT c.tenant_id, c.workspace_id, c.tombstone_id, c.alias_id,
+           c.binding_mutation_receipt_id, c.key_ref, c.provider_id,
+           b.pii_key_version AS key_version,
+           b.canonical_participant_id AS subject_record_id,
+           EXISTS (
+             SELECT 1 FROM public.memory_pii_key_erasures AS d
+              WHERE d.tenant_id = c.tenant_id AND d.workspace_id = c.workspace_id
+                AND d.key_ref = c.key_ref AND d.event = 'key_destroyed'
+           ) AS evidenced
+      FROM public.memory_pii_key_erasures AS c
+      JOIN public.memory_alias_bindings AS b
+        ON b.tenant_id = c.tenant_id AND b.workspace_id = c.workspace_id
+       AND b.mutation_receipt_id = c.binding_mutation_receipt_id
+       AND b.alias_id = c.alias_id AND b.pii_key_ref = c.key_ref
+      JOIN absorbed AS a ON a.record_id = b.canonical_participant_id
+     WHERE c.tenant_id = $1 AND c.workspace_id = $2
+       AND c.event = 'erasure_committed'
+     ORDER BY c.id`;
+
+  async function readInScopeKeys(
+    runner: { query: PoolClient["query"] },
+    scope: { tenantId: string; workspaceId: string },
+    recordId: string,
+  ): Promise<InScopeKeyRow[]> {
+    const result = await runner.query(IN_SCOPE_KEYS_SQL, [
+      scope.tenantId,
+      scope.workspaceId,
+      recordId,
+    ]);
+    return result.rows as InScopeKeyRow[];
+  }
+
+  /**
+   * ASK THE OWNING PROVIDER, UNDER A DEADLINE, HOLDING NO DATABASE CONNECTION.
+   *
+   * The three-valued answer the provider interface already has — `active`,
+   * `destroyed`, `unknown` — plus the three ways there is no answer at all.
+   * None of them is rounded up.
+   */
+  async function askProvider(
+    row: Pick<InScopeKeyRow, "tenant_id" | "workspace_id" | "key_ref" | "provider_id">,
+  ): Promise<{ proof: KeyDestructionProof; reason: KeyNotProvenReason | null }> {
+    if (piiKeys === null) {
+      // The production wiring today. Not an error, and not a destruction.
+      return { proof: "NOT_PROVEN", reason: "NO_PROVIDER_CONFIGURED" };
+    }
+    if (row.provider_id !== piiKeys.providerId) {
+      // A key this store cannot ask about. Counted as pending rather than
+      // disappearing (security review of 03581a3, F2), and now also named.
+      return { proof: "NOT_PROVEN", reason: "PROVIDER_DOES_NOT_OWN_KEY" };
+    }
+    let state: Awaited<ReturnType<MemoryPiiKeyProvider["dataKeyState"]>>;
+    try {
+      state = await withProviderDeadline(
+        `dataKeyState(${row.key_ref})`,
+        providerDeadlineMs,
+        () =>
+          piiKeys.dataKeyState({
+            scope: { tenantId: row.tenant_id, workspaceId: row.workspace_id },
+            keyRef: row.key_ref,
+          }),
+      );
+    } catch (error) {
+      return {
+        proof: "NOT_PROVEN",
+        reason:
+          error instanceof ProviderDeadlineExceeded
+            ? "PROVIDER_TIMEOUT"
+            : "PROVIDER_UNAVAILABLE",
+      };
+    }
+    if (state === "destroyed") return { proof: "PROVEN_DESTROYED", reason: null };
+    if (state === "active") return { proof: "PROVEN_NOT_DESTROYED", reason: null };
+    // `unknown` is the provider saying it cannot answer. It is NOT "gone".
+    return { proof: "NOT_PROVEN", reason: "PROVIDER_ANSWERED_UNKNOWN" };
+  }
+
+  /**
+   * WHICH OF THESE KEYS AN INDEPENDENTLY VERIFIED SETTLEMENT HAS PROVEN
+   * DESTROYED.
+   *
+   * A settlement stands in ONLY where the provider structurally cannot answer.
+   * The database has already enforced that each row is bound to a real
+   * binding and a really-committed erasure, that its authority and verifier
+   * are different principals, and that it is immutable. This adds the one
+   * check the database cannot make: that the stored digest is actually the
+   * digest of the stored evidence. A settlement whose digest does not match
+   * its own evidence is not weak evidence, it is a contradiction, and it
+   * proves nothing.
+   */
+  async function settlementProven(
+    scope: { tenantId: string; workspaceId: string },
+    keyRefs: readonly string[],
+  ): Promise<Map<string, { receiptId: string; sound: boolean }>> {
+    const proven = new Map<string, { receiptId: string; sound: boolean }>();
+    if (keyRefs.length === 0) return proven;
+    const client = await pool.connect();
+    let ambiguous: unknown;
+    try {
+      await client.query("BEGIN");
+      await enterRole(client, mutationRole);
+      const rows = await client.query(
+        `SELECT settlement_receipt_id, key_ref, evidence, evidence_digest
+           FROM public.memory_key_destruction_settlements
+          WHERE tenant_id = $1 AND workspace_id = $2
+            AND key_ref = ANY($3::text[])
+            AND decision = $4
+          ORDER BY id`,
+        [scope.tenantId, scope.workspaceId, [...keyRefs], SETTLEMENT_DECISION_THAT_SATISFIES],
+      );
+      await client.query("COMMIT");
+      for (const row of rows.rows as Array<{
+        settlement_receipt_id: string;
+        key_ref: string;
+        evidence: unknown;
+        evidence_digest: string;
+      }>) {
+        const sound = settlementEvidenceDigest(row.evidence) === row.evidence_digest;
+        const already = proven.get(row.key_ref);
+        // One unsound settlement taints the key: we do not go looking for a
+        // second opinion that happens to agree with us.
+        proven.set(row.key_ref, {
+          receiptId: row.settlement_receipt_id,
+          sound: sound && (already?.sound ?? true),
+        });
+      }
+    } catch (error) {
+      ambiguous = error;
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      releaseClient(client, ambiguous);
+    }
+    return proven;
+  }
+
+  /**
+   * PROVE, OR FAIL TO PROVE, EVERY KEY IN SCOPE — WITH NO TRANSACTION OPEN AND
+   * NO POOL SLOT HELD WHILE A PROVIDER IS THINKING.
+   *
+   * Reliability review of 8a0bf05, CRITICAL, executed (K-02): these provider
+   * calls used to run INSIDE the mutation transaction, holding the record's
+   * `pg_advisory_xact_lock` and a pool connection, with no application
+   * timeout. probe1 observed the slot held for the provider's full 6029ms —
+   * four seconds AFTER PostgreSQL had already killed the session on
+   * `idle_in_transaction_session_timeout`, because the DB's bound does not
+   * release a connection the client is still awaiting. probe2 then saturated a
+   * three-connection pool with three ordinary authorized erasures and an
+   * unrelated `correct()` on an unlocked record failed outright with "timeout
+   * exceeded when trying to connect". Scaled to production that is a full
+   * write-path outage for every tenant sharing the pool, triggered by nothing
+   * worse than KMS latency and by nothing more privileged than ordinary
+   * GDPR-shaped traffic.
+   *
+   * Asking BEFORE the transaction is sound in the direction that matters:
+   * destruction LATCHES. A key the provider called destroyed at T0 is still
+   * destroyed at T1. The unsound direction — a key appearing in scope after
+   * the question was asked — is closed inside the transaction by re-reading
+   * the set under the record's lock and refusing if it grew. See
+   * `merged_keys_changed_during_proof`.
+   */
+  async function proveInScopeKeys(
+    scope: { tenantId: string; workspaceId: string },
+    recordId: string,
+  ): Promise<KeyDestructionAssessment[]> {
+    const client = await pool.connect();
+    let rows: InScopeKeyRow[];
+    let ambiguous: unknown;
+    try {
+      await client.query("BEGIN");
+      await enterRole(client, mutationRole);
+      rows = await readInScopeKeys(client, scope, recordId);
+      await client.query("COMMIT");
+    } catch (error) {
+      ambiguous = error;
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      // Released BEFORE the first provider call. This one line is the finding.
+      releaseClient(client, ambiguous);
+    }
+    if (rows.length === 0) return [];
+
+    const answers = new Map<
+      string,
+      { proof: KeyDestructionProof; reason: KeyNotProvenReason | null }
+    >();
+    for (const row of rows) {
+      // One question per distinct key, however many bindings name it.
+      if (!answers.has(row.key_ref)) answers.set(row.key_ref, await askProvider(row));
+    }
+    const unproven = [...answers.entries()]
+      .filter(([, answer]) => answer.proof === "NOT_PROVEN")
+      .map(([keyRef]) => keyRef);
+    const settled = await settlementProven(scope, unproven);
+
+    return rows.map((row) => {
+      const answer = answers.get(row.key_ref)!;
+      const settlement = settled.get(row.key_ref);
+      const base = {
+        tenantId: row.tenant_id,
+        workspaceId: row.workspace_id,
+        keyRef: row.key_ref,
+        keyVersion: row.key_version ?? null,
+        providerId: row.provider_id,
+        aliasId: row.alias_id,
+        bindingMutationReceiptId: row.binding_mutation_receipt_id,
+        tombstoneId: row.tombstone_id,
+        subjectRecordId: row.subject_record_id,
+      };
+      if (answer.proof === "PROVEN_DESTROYED") {
+        return { ...base, proof: answer.proof, notProvenReason: null, provenBySettlement: false };
+      }
+      if (answer.proof === "PROVEN_NOT_DESTROYED") {
+        // The provider says the key is ALIVE. Where the database claimed
+        // otherwise, that is a detected forgery, and it must never resolve in
+        // favour of the writable anchor.
+        return {
+          ...base,
+          proof: answer.proof,
+          notProvenReason: row.evidenced ? ("CONTRADICTORY_EVIDENCE" as const) : null,
+          provenBySettlement: false,
+        };
+      }
+      if (settlement !== undefined && settlement.sound) {
+        return {
+          ...base,
+          proof: "PROVEN_DESTROYED" as const,
+          notProvenReason: null,
+          provenBySettlement: true,
+        };
+      }
+      return {
+        ...base,
+        proof: "NOT_PROVEN" as const,
+        notProvenReason:
+          settlement !== undefined && !settlement.sound
+            ? ("CONTRADICTORY_EVIDENCE" as const)
+            : (answer.reason ?? "PROVIDER_ANSWERED_UNKNOWN"),
+        provenBySettlement: false,
+      };
+    });
+  }
+
+  /**
+   * RECORD WHAT COULD NOT BE PROVEN, so "we do not know" is a row an operator
+   * can find and settle rather than a rejection an operator can only guess at.
+   *
+   * Never fatal to the caller's outcome: the mutation has already been refused
+   * by the time this runs, and failing to write the bookkeeping must not turn
+   * a clean refusal into an error that looks like something else.
+   */
+  async function recordObligations(
+    assessments: readonly KeyDestructionAssessment[],
+  ): Promise<void> {
+    const unresolved = assessments.filter(
+      (a) => a.proof === "NOT_PROVEN" || a.notProvenReason === "CONTRADICTORY_EVIDENCE",
+    );
+    if (unresolved.length === 0) return;
+    const client = await pool.connect();
+    let ambiguous: unknown;
+    try {
+      await client.query("BEGIN");
+      await enterRole(client, mutationRole);
+      for (const a of unresolved) {
+        await client.query(
+          `INSERT INTO public.memory_key_destruction_obligations
+             (tenant_id, workspace_id, subject_record_id, alias_id, key_ref,
+              provider_id, binding_mutation_receipt_id, erasure_tombstone_id,
+              state, not_proven_reason)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'KEY_DESTRUCTION_NOT_PROVEN',$9)
+           ON CONFLICT (tenant_id, workspace_id, key_ref) DO UPDATE
+              SET observations = public.memory_key_destruction_obligations.observations + 1,
+                  last_observed_at = now(),
+                  not_proven_reason = EXCLUDED.not_proven_reason
+            WHERE public.memory_key_destruction_obligations.settled_by IS NULL`,
+          [
+            a.tenantId,
+            a.workspaceId,
+            a.subjectRecordId,
+            a.aliasId,
+            a.keyRef,
+            a.providerId,
+            a.bindingMutationReceiptId,
+            a.tombstoneId,
+            a.notProvenReason ?? "PROVIDER_ANSWERED_UNKNOWN",
+          ],
+        );
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      ambiguous = error;
+      await client.query("ROLLBACK").catch(() => undefined);
+      if (isConnectionAmbiguous(error)) throw error;
+    } finally {
+      releaseClient(client, ambiguous);
+    }
+  }
+
   /**
    * DESTROY THE DATA KEYS WHOSE ERASURE COMMITTED, and record each one the
-   * provider CONFIRMS. Filtered to one tombstone after a deletion, or across
-   * the whole store for the boot-time completion pass.
+   * provider CONFIRMS — or record, per key, that its destruction CANNOT BE
+   * PROVEN.
+   *
+   * Scoped to one SUBJECT after a deletion (the record and every identity
+   * merged into it), or across the whole store for the boot-time completion
+   * pass. It used to be scoped to one TOMBSTONE, which is how a live key
+   * stopped being counted at all (red team B1, K-03).
+   *
+   * No provider is ever called while this holds a database connection.
    */
   async function destroyCommittedAliasKeys(filter: {
     tenantId?: string;
     workspaceId?: string;
-    tombstoneId?: string;
+    /**
+     * SUBJECT scope, for a deletion's own accounting — the record and every
+     * identity absorbed into it. Replaces the old `tombstoneId` scope, which
+     * is what let a live key vanish from the denominator entirely (red team
+     * B1, HIGH, K-03: a restore plus a second erasure recorded no new
+     * `erasure_committed` rows, so the new tombstone's scope was empty and
+     * the erasure reported verified while the key was still active).
+     */
+    subjectRecordId?: string;
     limit: number;
-  }): Promise<{ destroyed: number; pending: number; erased: number }> {
+  }): Promise<AliasKeyOutcome> {
     const client = await pool.connect();
-    let due: Array<{
-      tenant_id: string;
-      workspace_id: string;
-      tombstone_id: string;
-      alias_id: string;
-      binding_mutation_receipt_id: string;
-      key_ref: string;
-      provider_id: string;
-      evidenced: boolean;
-    }>;
+    let due: DueKeyRow[];
     let erased = 0;
+    let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       await enterRole(client, mutationRole);
-      const found = await client.query(
-        // Keys NOT yet evidenced destroyed, bounded by the batch limit.
-        `SELECT c.tenant_id, c.workspace_id, c.tombstone_id, c.alias_id,
-                c.binding_mutation_receipt_id, c.key_ref, c.provider_id,
-                false AS evidenced
-           FROM memory_pii_key_erasures AS c
-          WHERE c.event = 'erasure_committed'
-            AND ($1::text IS NULL OR c.tenant_id = $1)
-            AND ($2::text IS NULL OR c.workspace_id = $2)
-            AND ($3::text IS NULL OR c.tombstone_id = $3)
-            AND NOT EXISTS (
-              SELECT 1 FROM memory_pii_key_erasures AS d
-               WHERE d.tenant_id = c.tenant_id AND d.workspace_id = c.workspace_id
-                 AND d.key_ref = c.key_ref AND d.event = 'key_destroyed')
-          ORDER BY c.id
-          LIMIT $4`,
-        [filter.tenantId ?? null, filter.workspaceId ?? null, filter.tombstoneId ?? null, filter.limit],
-      );
-      // Keys already EVIDENCED destroyed, audited against the provider, and
-      // NOT under the batch limit. Red team M2 against 2b2e554: the mutation
-      // role can insert `key_destroyed` for a key that is still alive, and the
-      // database cannot see a key outside it, so the row is not trusted. Red
-      // team F2 and the reliability review against 3ba769f: when the audit
-      // shared one LIMIT with the pending work, 100 settled rows ahead of a
-      // forged one, or 100 pending rows, kept the forged row out of every pass.
-      // Every evidenced key of this provider is asked about on every pass.
-      const evidenced = await client.query(
-        `SELECT c.tenant_id, c.workspace_id, c.tombstone_id, c.alias_id,
-                c.binding_mutation_receipt_id, c.key_ref, c.provider_id,
-                true AS evidenced
-           FROM memory_pii_key_erasures AS c
-          WHERE c.event = 'erasure_committed'
-            AND ($1::text IS NULL OR c.tenant_id = $1)
-            AND ($2::text IS NULL OR c.workspace_id = $2)
-            AND ($3::text IS NULL OR c.tombstone_id = $3)
-            AND EXISTS (
-              SELECT 1 FROM memory_pii_key_erasures AS d
-               WHERE d.tenant_id = c.tenant_id AND d.workspace_id = c.workspace_id
-                 AND d.key_ref = c.key_ref AND d.event = 'key_destroyed')
-          ORDER BY c.id`,
-        // Every provider's evidence, not only this one's: a key this store
-        // cannot ask about stays counted as pending rather than disappearing
-        // (security review of 03581a3, F2).
-        [filter.tenantId ?? null, filter.workspaceId ?? null, filter.tombstoneId ?? null],
-      );
-      due = [...found.rows, ...evidenced.rows];
-      if (filter.tombstoneId !== undefined) {
-        erased = (
-          await client.query(
-            `SELECT count(*)::int AS n FROM memory_pii_key_erasures
-              WHERE tenant_id = $1 AND workspace_id = $2 AND tombstone_id = $3
-                AND event = 'erasure_committed'`,
-            [filter.tenantId, filter.workspaceId, filter.tombstoneId],
-          )
-        ).rows[0].n as number;
+      if (filter.subjectRecordId !== undefined) {
+        // ---- A SUBJECT'S WHOLE CANONICAL MERGE SET, NO BATCH LIMIT -----
+        // Deliberately unbounded: this is an erasure COMPLETENESS question,
+        // and a completeness answer computed over a page of the evidence is
+        // not an answer. It is bounded by the DATA instead — a subject's
+        // bindings, over a merge chain migration 053 caps at 16 hops — rather
+        // than by the store's all-time erasure volume, which is what K-04 is
+        // about for the other branch.
+        const rows = await readInScopeKeys(
+          client,
+          {
+            tenantId: filter.tenantId ?? "",
+            workspaceId: filter.workspaceId ?? "",
+          },
+          filter.subjectRecordId,
+        );
+        due = rows as DueKeyRow[];
+        erased = rows.length;
+      } else {
+        const found = await client.query(
+          // Keys NOT yet evidenced destroyed, bounded by the batch limit.
+          `SELECT c.tenant_id, c.workspace_id, c.tombstone_id, c.alias_id,
+                  c.binding_mutation_receipt_id, c.key_ref, c.provider_id,
+                  NULL::integer AS key_version, NULL::text AS subject_record_id,
+                  false AS evidenced
+             FROM memory_pii_key_erasures AS c
+            WHERE c.event = 'erasure_committed'
+              AND ($1::text IS NULL OR c.tenant_id = $1)
+              AND ($2::text IS NULL OR c.workspace_id = $2)
+              AND NOT EXISTS (
+                SELECT 1 FROM memory_pii_key_erasures AS d
+                 WHERE d.tenant_id = c.tenant_id AND d.workspace_id = c.workspace_id
+                   AND d.key_ref = c.key_ref AND d.event = 'key_destroyed')
+            ORDER BY c.id
+            LIMIT $3`,
+          [filter.tenantId ?? null, filter.workspaceId ?? null, filter.limit],
+        );
+        // ---- THE AUDIT OF KEYS ALREADY EVIDENCED DESTROYED -------------
+        //
+        // The mutation role can insert `key_destroyed` for a key that is
+        // still alive, and the database cannot see a key outside it, so the
+        // row is not trusted and the provider is asked again (red team M2
+        // against 2b2e554).
+        //
+        // BOUNDED, AND ROUND-ROBIN. Two earlier shapes were both wrong:
+        //   - sharing ONE limit with the pending work let 100 settled rows
+        //     ahead of a forged one keep it out of every pass (security
+        //     review of 03581a3, F2);
+        //   - no limit at all made every pass re-confirm every key ever
+        //     erased — 150 seeded keys produced exactly 150 provider calls,
+        //     on every pass, forever, growing with all-time volume, and
+        //     `server.ts` awaits this pass before `app.listen()` (reliability
+        //     review of 8a0bf05, HIGH, K-04).
+        //
+        // So it has its OWN limit and its OWN ordering: least recently
+        // audited first, and a key never audited ahead of every key that has
+        // been. Cost per pass is constant, coverage is still total, and
+        // nothing hides behind volume — volume moves a key TOWARDS the front
+        // of this queue, not away from it.
+        const evidenced = await client.query(
+          `SELECT c.tenant_id, c.workspace_id, c.tombstone_id, c.alias_id,
+                  c.binding_mutation_receipt_id, c.key_ref, c.provider_id,
+                  NULL::integer AS key_version, NULL::text AS subject_record_id,
+                  true AS evidenced
+             FROM memory_pii_key_erasures AS c
+             LEFT JOIN memory_pii_key_audits AS au
+               ON au.tenant_id = c.tenant_id AND au.workspace_id = c.workspace_id
+              AND au.key_ref = c.key_ref
+            WHERE c.event = 'erasure_committed'
+              AND ($1::text IS NULL OR c.tenant_id = $1)
+              AND ($2::text IS NULL OR c.workspace_id = $2)
+              AND EXISTS (
+                SELECT 1 FROM memory_pii_key_erasures AS d
+                 WHERE d.tenant_id = c.tenant_id AND d.workspace_id = c.workspace_id
+                   AND d.key_ref = c.key_ref AND d.event = 'key_destroyed')
+            ORDER BY au.last_audited_at ASC NULLS FIRST, c.id
+            LIMIT $3`,
+          // Every provider's evidence, not only this one's: a key this store
+          // cannot ask about stays counted rather than disappearing (security
+          // review of 03581a3, F2).
+          [filter.tenantId ?? null, filter.workspaceId ?? null, evidencedAuditLimit],
+        );
+        due = [...(found.rows as DueKeyRow[]), ...(evidenced.rows as DueKeyRow[])];
       }
       await client.query("COMMIT");
     } catch (error) {
+      ambiguous = error;
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      // Released BEFORE the first provider call: no pool slot is held while
+      // an external provider is thinking (reliability K-02).
+      releaseClient(client, ambiguous);
     }
 
+    const provenDestroyed: DueKeyRow[] = [];
     let destroyed = 0;
+    let repaired = 0;
+    let contradictions = 0;
     let settled = 0;
+    let notProven = 0;
+    const notProvenReasons: Record<string, number> = {};
+    const audits: Array<{ row: DueKeyRow; state: string }> = [];
+    const unresolved: KeyDestructionAssessment[] = [];
+    const assessmentOf = (
+      row: DueKeyRow,
+      proof: KeyDestructionProof,
+      reason: KeyNotProvenReason | null,
+    ): KeyDestructionAssessment => ({
+      tenantId: row.tenant_id,
+      workspaceId: row.workspace_id,
+      keyRef: row.key_ref,
+      keyVersion: row.key_version ?? null,
+      providerId: row.provider_id,
+      aliasId: row.alias_id,
+      bindingMutationReceiptId: row.binding_mutation_receipt_id,
+      tombstoneId: row.tombstone_id,
+      subjectRecordId: row.subject_record_id ?? filter.subjectRecordId ?? "",
+      proof,
+      notProvenReason: reason,
+      provenBySettlement: false,
+    });
+    const countNotProven = (row: DueKeyRow, reason: KeyNotProvenReason) => {
+      notProven += 1;
+      notProvenReasons[reason] = (notProvenReasons[reason] ?? 0) + 1;
+      unresolved.push(assessmentOf(row, "NOT_PROVEN", reason));
+    };
+
+    // Which unaskable keys an independently verified settlement covers. Asked
+    // once for the whole batch rather than once per key.
+    const unaskable = due
+      .filter((row) => piiKeys === null || row.provider_id !== piiKeys.providerId)
+      .map((row) => row.key_ref);
+    const scope = {
+      tenantId: filter.tenantId ?? due[0]?.tenant_id ?? "",
+      workspaceId: filter.workspaceId ?? due[0]?.workspace_id ?? "",
+    };
+    const settlementProof =
+      unaskable.length > 0 && scope.tenantId !== ""
+        ? await settlementProven(scope, unaskable)
+        : new Map<string, { receiptId: string; sound: boolean }>();
+
     for (const row of due) {
-      if (piiKeys === null || row.provider_id !== piiKeys.providerId) continue;
-      if (row.evidenced) {
-        const claimed = await piiKeys
-          .dataKeyState({
-            scope: { tenantId: row.tenant_id, workspaceId: row.workspace_id },
-            keyRef: row.key_ref,
-          })
-          .catch(() => null);
-        if (claimed === "destroyed") {
+      // ---- A KEY THIS STORE CANNOT ASK ABOUT --------------------------
+      //
+      // `continue` used to be the whole answer here, which is how the count
+      // reported `{destroyed:0, pending:1}` forever with nothing naming why
+      // and nothing able to change it (integration K-01, security K-09).
+      // Under OPTION B it is either proven by a settlement or it is recorded,
+      // by name, as NOT PROVEN.
+      if (piiKeys === null || row.provider_id !== piiKeys.providerId) {
+        const settlement = settlementProof.get(row.key_ref);
+        if (settlement !== undefined && settlement.sound) {
           settled += 1;
+          provenDestroyed.push(row);
           continue;
         }
+        countNotProven(
+          row,
+          settlement !== undefined
+            ? "CONTRADICTORY_EVIDENCE"
+            : piiKeys === null
+              ? "NO_PROVIDER_CONFIGURED"
+              : "PROVIDER_DOES_NOT_OWN_KEY",
+        );
+        continue;
+      }
+      if (row.evidenced) {
+        const claimed = await askProvider(row);
+        if (claimed.proof === "PROVEN_DESTROYED") {
+          settled += 1;
+          provenDestroyed.push(row);
+          audits.push({ row, state: "destroyed" });
+          continue;
+        }
+        if (claimed.proof === "NOT_PROVEN") {
+          audits.push({
+            row,
+            state: claimed.reason === "PROVIDER_ANSWERED_UNKNOWN" ? "unknown" : "unreachable",
+          });
+          countNotProven(row, claimed.reason ?? "PROVIDER_ANSWERED_UNKNOWN");
+          continue;
+        }
+        // The database says destroyed and the provider says ALIVE. That is a
+        // detected forgery between two trust anchors, not a retry, and it
+        // must never resolve in favour of the writable one. Re-destroying
+        // below is the honest response; counting it settled is not.
+        audits.push({ row, state: "active" });
+        contradictions += 1;
+        unresolved.push(
+          assessmentOf(row, "PROVEN_NOT_DESTROYED", "CONTRADICTORY_EVIDENCE"),
+        );
       }
       try {
-        await piiKeys.destroyDataKey({
-          scope: { tenantId: row.tenant_id, workspaceId: row.workspace_id },
-          keyRef: row.key_ref,
-        });
+        await withProviderDeadline(
+          `destroyDataKey(${row.key_ref})`,
+          providerDeadlineMs,
+          () =>
+            piiKeys.destroyDataKey({
+              scope: { tenantId: row.tenant_id, workspaceId: row.workspace_id },
+              keyRef: row.key_ref,
+            }),
+        );
         // Confirmed by asking again, not by trusting the call's return.
-        const state = await piiKeys.dataKeyState({
-          scope: { tenantId: row.tenant_id, workspaceId: row.workspace_id },
-          keyRef: row.key_ref,
-        });
-        if (state !== "destroyed") continue;
-      } catch {
+        const state = await withProviderDeadline(
+          `dataKeyState(${row.key_ref})`,
+          providerDeadlineMs,
+          () =>
+            piiKeys.dataKeyState({
+              scope: { tenantId: row.tenant_id, workspaceId: row.workspace_id },
+              keyRef: row.key_ref,
+            }),
+        );
+        audits.push({ row, state });
+        if (state !== "destroyed") {
+          if (!row.evidenced) {
+            countNotProven(
+              row,
+              state === "unknown" ? "PROVIDER_ANSWERED_UNKNOWN" : "CONTRADICTORY_EVIDENCE",
+            );
+          }
+          continue;
+        }
+      } catch (error) {
+        audits.push({ row, state: "unreachable" });
+        if (!row.evidenced) {
+          countNotProven(
+            row,
+            error instanceof ProviderDeadlineExceeded
+              ? "PROVIDER_TIMEOUT"
+              : "PROVIDER_UNAVAILABLE",
+          );
+        }
         continue;
       }
       const writer = await pool.connect();
+      let writerAmbiguous: unknown;
       try {
         await writer.query("BEGIN");
         await enterRole(writer, mutationRole);
-        await writer.query(
+        const inserted = await writer.query(
           `INSERT INTO memory_pii_key_erasures
              (tenant_id, workspace_id, tombstone_id, alias_id,
               binding_mutation_receipt_id, key_ref, provider_id, event)
@@ -2208,14 +3072,119 @@ export function createPostgresTrustedMemoryStore(
           ],
         );
         await writer.query("COMMIT");
-        destroyed += 1;
-      } catch {
+        // ---- COUNTED FROM WHAT ACTUALLY LANDED ------------------------
+        // Reliability review of 03581a3, MEDIUM (K-11): this added one
+        // unconditionally after `ON CONFLICT DO NOTHING`, so two racing
+        // passes over ten keys reported 15 and 16 destroyed. The ledger was
+        // right and the number this function RETURNED was not — and that
+        // number is what a caller reads to decide whether an erasure
+        // finished.
+        if ((inserted.rowCount ?? 0) > 0) destroyed += 1;
+        else if (row.evidenced) repaired += 1;
+        else settled += 1;
+        provenDestroyed.push(row);
+      } catch (error) {
+        writerAmbiguous = error;
         await writer.query("ROLLBACK").catch(() => undefined);
       } finally {
-        writer.release();
+        releaseClient(writer, writerAmbiguous);
       }
     }
-    return { destroyed, pending: due.length - settled - destroyed, erased };
+
+    await recordAudits(audits).catch(() => undefined);
+    await recordObligations(unresolved).catch(() => undefined);
+    // A key the provider has now confirmed destroyed closes its own
+    // obligation. Without this, every transient outage would leave a row open
+    // forever and an operator could not tell a genuinely unresolved key from
+    // one that healed on the next pass — which would make the ledger the same
+    // kind of uninformative signal the `pending` counter used to be.
+    await clearHealedObligations(provenDestroyed).catch(() => undefined);
+    return {
+      destroyed,
+      repaired,
+      contradictions,
+      pending: due.length - settled - destroyed - repaired,
+      notProven,
+      notProvenReasons,
+      erased,
+    };
+  }
+
+  /**
+   * CLOSE THE OBLIGATIONS OF KEYS THE PROVIDER HAS NOW CONFIRMED DESTROYED.
+   *
+   * The ordinary healing path: a transient outage recorded
+   * `KEY_DESTRUCTION_NOT_PROVEN`, the provider came back, and the completion
+   * pass got its answer. The row is resolved by `PROVIDER`, not by a
+   * settlement, and the ledger says which — because an operator reading it
+   * needs to know whether a human made a judgement or a machine got an answer.
+   *
+   * Never fatal: this is bookkeeping about work already done.
+   */
+  async function clearHealedObligations(
+    rows: ReadonlyArray<DueKeyRow>,
+  ): Promise<void> {
+    if (rows.length === 0) return;
+    const client = await pool.connect();
+    let ambiguous: unknown;
+    try {
+      await client.query("BEGIN");
+      await enterRole(client, mutationRole);
+      for (const row of rows) {
+        await client.query(
+          `UPDATE public.memory_key_destruction_obligations
+              SET state = 'PROVEN_DESTROYED', not_proven_reason = 'SETTLED',
+                  resolved_by = 'PROVIDER', last_observed_at = now()
+            WHERE tenant_id = $1 AND workspace_id = $2 AND key_ref = $3
+              AND state = 'KEY_DESTRUCTION_NOT_PROVEN'`,
+          [row.tenant_id, row.workspace_id, row.key_ref],
+        );
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      ambiguous = error;
+      await client.query("ROLLBACK").catch(() => undefined);
+    } finally {
+      releaseClient(client, ambiguous);
+    }
+  }
+
+  /**
+   * REMEMBER THAT A KEY WAS AUDITED, so the next pass audits a different one.
+   *
+   * This is the state that makes the bounded audit FAIR rather than merely
+   * cheap: without it a `LIMIT` would re-ask about the same first N keys
+   * forever and never reach the rest, which is a different way of not
+   * auditing than the unbounded version but no better.
+   */
+  async function recordAudits(
+    audits: ReadonlyArray<{ row: DueKeyRow; state: string }>,
+  ): Promise<void> {
+    if (audits.length === 0) return;
+    const client = await pool.connect();
+    let ambiguous: unknown;
+    try {
+      await client.query("BEGIN");
+      await enterRole(client, mutationRole);
+      for (const { row, state } of audits) {
+        await client.query(
+          `INSERT INTO memory_pii_key_audits
+             (tenant_id, workspace_id, key_ref, last_audited_at, last_state, audits)
+           VALUES ($1,$2,$3,now(),$4,1)
+           ON CONFLICT (tenant_id, workspace_id, key_ref) DO UPDATE
+              SET last_audited_at = now(),
+                  last_state = EXCLUDED.last_state,
+                  audits = memory_pii_key_audits.audits + 1`,
+          [row.tenant_id, row.workspace_id, row.key_ref, state],
+        );
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      ambiguous = error;
+      await client.query("ROLLBACK").catch(() => undefined);
+    } finally {
+      releaseClient(client, ambiguous);
+    }
   }
 
   /**
@@ -2243,10 +3212,24 @@ export function createPostgresTrustedMemoryStore(
     if (!result.verified) return { ...result, tombstone: null, aliasErasure: null };
     const tombstoneId = request.tombstoneId ?? request.mutationReceiptId;
     const tombstone = await readTombstone(request.actor, tombstoneId).catch(() => null);
+    // ---- SCOPED TO THE SUBJECT, NOT TO THIS TOMBSTONE -----------------
+    // Red team B1, HIGH, executed (K-03). Scoped to `tombstoneId`, a second
+    // subject erasure after a `restore` found an EMPTY denominator — the alias
+    // UPDATE only touches bindings where `pii_erased_at IS NULL`, and they had
+    // already been erased by the first attempt, so no new `erasure_committed`
+    // rows existed under the new tombstone. The result was
+    // `verified:true {0,0,0}` while the subject's own data key was `active`
+    // and a ciphertext copy taken before the erasure still decrypted to the
+    // full address. Nothing in the database contradicted it, because no guard
+    // covered a record's OWN earlier pending keys.
+    //
+    // The subject's canonical merge set is the only scope that answers "is
+    // this subject erased", and a key cannot fall out of it because its owning
+    // record changed state (founder FIFTH priority).
     const keys = await destroyCommittedAliasKeys({
       tenantId: request.actor.tenantId,
       workspaceId: request.actor.workspaceId,
-      tombstoneId,
+      subjectRecordId: request.recordId,
       limit: 10_000,
     }).catch(() => null);
     const aliasErasure =
@@ -2256,11 +3239,21 @@ export function createPostgresTrustedMemoryStore(
             bindingsErased: keys.erased,
             keysDestroyed: keys.erased - keys.pending,
             keysPending: keys.pending,
+            keysNotProven: keys.notProven,
+            notProvenReasons: keys.notProvenReasons,
           };
     if (tombstone === null || aliasErasure === null || aliasErasure.keysPending > 0) {
       return {
         verified: false,
-        rejection: "erasure_incomplete",
+        // A key whose destruction cannot be PROVEN is a different state from a
+        // key that is merely late, and the caller is told which (founder
+        // decision, OPTION B). `erasure_incomplete` means "not finished yet";
+        // `key_destruction_not_proven` means "not finished, and not finishable
+        // without a settlement".
+        rejection:
+          aliasErasure !== null && aliasErasure.keysNotProven > 0
+            ? "key_destruction_not_proven"
+            : "erasure_incomplete",
         receipt: result.receipt,
         tombstone,
         aliasErasure,
@@ -2269,13 +3262,307 @@ export function createPostgresTrustedMemoryStore(
     return { ...result, tombstone, aliasErasure };
   }
 
+  /**
+   * THE BOUNDED WAY OUT OF `ERASURE_PENDING_SETTLEMENT`.
+   *
+   * Founder decision, OPTION B. This is the one path that can satisfy the
+   * key-destruction portion of a verified erasure WITHOUT the provider
+   * answering — and every property that keeps it from being an administrative
+   * bypass is enforced somewhere that a caller cannot reach:
+   *
+   *   evidence-bound        a trigger requires the settlement to name a real
+   *                         binding of that subject, alias and key, and a
+   *                         really-committed erasure under that tombstone;
+   *   scoped                tenant, workspace, subject and key are columns of
+   *                         the row, and the store reads them back by scope;
+   *   action-specific       UNIQUE (tenant, workspace, key_ref,
+   *                         erasure_authorization_id): one authorization
+   *                         settles one key, not a second one later;
+   *   independently         CHECK (settlement_authority_id <>
+   *   authorized/verified   verifier_principal_id), plus a separate database
+   *                         role that owns the table, so the MUTATION role —
+   *                         which can already write erasure evidence — cannot
+   *                         settle anything;
+   *   replay-safe           UNIQUE (tenant_id, nonce);
+   *   idempotent            UNIQUE (settlement_receipt_id), and replaying the
+   *                         same receipt returns `replay: true` rather than a
+   *                         second row or an error;
+   *   auditable/versioned   policy version and both principals on the row;
+   *   immutable             no UPDATE, no DELETE, by trigger.
+   *
+   * And the check the database CANNOT make, made here: that `evidence_digest`
+   * really is the digest of `evidence`. A settlement whose digest does not
+   * match its own evidence set proves nothing, and `settlementProven` refuses
+   * to count it.
+   *
+   * NO SETTLEMENT FABRICATES A PROVIDER ANSWER. A `PROVEN_DESTROYED`
+   * settlement writes destruction evidence that CARRIES ITS RECEIPT ID, so an
+   * auditor can always separate "the provider confirmed this" from "a
+   * settlement stood in for a provider that could not". The five outcomes that
+   * are neither PROVEN_DESTROYED nor PROVEN_NOT_DESTROYED — including
+   * STILL_UNKNOWN — write no evidence and leave the obligation open, which is
+   * what "STILL_UNKNOWN remains unresolved" has to mean if it means anything.
+   */
+  async function settleKeyDestruction(
+    request: KeyDestructionSettlementRequest,
+  ): Promise<KeyDestructionSettlementResult> {
+    const text = (value: unknown): boolean =>
+      typeof value === "string" && value.trim().length > 0 && value.length <= 200;
+    if (
+      !text(request.settlementReceiptId) ||
+      !text(request.tenantId) ||
+      !text(request.workspaceId) ||
+      !text(request.subjectRecordId) ||
+      !text(request.aliasId) ||
+      !text(request.keyRef) ||
+      !text(request.providerId) ||
+      !text(request.bindingMutationReceiptId) ||
+      !text(request.erasureAuthorizationId) ||
+      !text(request.erasureTombstoneId) ||
+      !text(request.destructionAttemptId) ||
+      !text(request.settlementAuthorityId) ||
+      !text(request.verifierPrincipalId) ||
+      !text(request.nonce) ||
+      !Number.isSafeInteger(request.keyVersion) ||
+      request.keyVersion <= 0 ||
+      !(request.decidedAt instanceof Date) ||
+      Number.isNaN(request.decidedAt.getTime()) ||
+      !SETTLEMENT_DECISIONS.includes(request.decision)
+    ) {
+      return { recorded: false, rejection: "settlement_malformed" };
+    }
+    // Refused here as well as by the database, so the rejection a caller sees
+    // names the actual problem instead of a constraint name.
+    if (request.settlementAuthorityId === request.verifierPrincipalId) {
+      return { recorded: false, rejection: "settlement_self_verified" };
+    }
+    const evidenceDigest = settlementEvidenceDigest(request.evidence);
+    const satisfies = request.decision === SETTLEMENT_DECISION_THAT_SATISFIES;
+    const resolves =
+      satisfies || request.decision === "PROVEN_NOT_DESTROYED";
+    const successorState = satisfies
+      ? "PROVEN_DESTROYED"
+      : request.decision === "PROVEN_NOT_DESTROYED"
+        ? "PROVEN_NOT_DESTROYED"
+        : "ERASURE_PENDING_SETTLEMENT";
+
+    const client = await pool.connect();
+    let ambiguous: unknown;
+    try {
+      await client.query("BEGIN");
+      await enterRole(client, settlementRole);
+      // ---- IDEMPOTENCY, BEFORE ANYTHING IS WRITTEN --------------------
+      // Replaying a settlement must be free. Repointing a receipt id at a
+      // DIFFERENT decision must not be, because a receipt that can mean two
+      // things is not a receipt.
+      const existing = await client.query(
+        `SELECT key_ref, provider_id, decision, evidence_digest,
+                settlement_authority_id, verifier_principal_id, nonce
+           FROM public.memory_key_destruction_settlements
+          WHERE settlement_receipt_id = $1
+          LIMIT 1`,
+        [request.settlementReceiptId],
+      );
+      if (existing.rowCount === 1) {
+        const row = existing.rows[0] as Record<string, string>;
+        await client.query("COMMIT");
+        const same =
+          row.key_ref === request.keyRef &&
+          row.provider_id === request.providerId &&
+          row.decision === request.decision &&
+          row.evidence_digest === evidenceDigest &&
+          row.settlement_authority_id === request.settlementAuthorityId &&
+          row.verifier_principal_id === request.verifierPrincipalId &&
+          row.nonce === request.nonce;
+        return same
+          ? { recorded: true, replay: true, evidenceDigest }
+          : { recorded: false, rejection: "settlement_receipt_conflict" };
+      }
+      await client.query(
+        `INSERT INTO public.memory_key_destruction_settlements
+           (settlement_receipt_id, tenant_id, workspace_id, subject_record_id,
+            alias_id, key_ref, key_version, provider_id,
+            binding_mutation_receipt_id, erasure_authorization_id,
+            erasure_tombstone_id, destruction_attempt_id, evidence,
+            evidence_digest, settlement_authority_id, verifier_principal_id,
+            decision, policy_version, nonce, predecessor_state,
+            successor_state, decided_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16,
+                 $17,$18,$19,'ERASURE_PENDING_SETTLEMENT',$20,$21)`,
+        [
+          request.settlementReceiptId,
+          request.tenantId,
+          request.workspaceId,
+          request.subjectRecordId,
+          request.aliasId,
+          request.keyRef,
+          request.keyVersion,
+          request.providerId,
+          request.bindingMutationReceiptId,
+          request.erasureAuthorizationId,
+          request.erasureTombstoneId,
+          request.destructionAttemptId,
+          JSON.stringify(request.evidence ?? null),
+          evidenceDigest,
+          request.settlementAuthorityId,
+          request.verifierPrincipalId,
+          request.decision,
+          KEY_DESTRUCTION_POLICY_VERSION,
+          request.nonce,
+          successorState,
+          request.decidedAt.toISOString(),
+        ],
+      );
+      if (satisfies) {
+        // The destruction evidence a PROVEN_DESTROYED settlement produces,
+        // LABELLED as settled. The trigger on this table refuses the row
+        // unless the settlement above exists with this exact decision — which
+        // is the clause that makes STILL_UNKNOWN structurally unable to become
+        // erased.
+        await client.query(
+          `INSERT INTO public.memory_pii_key_erasures
+             (tenant_id, workspace_id, tombstone_id, alias_id,
+              binding_mutation_receipt_id, key_ref, provider_id, event,
+              settlement_receipt_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'key_destroyed',$8)
+           ON CONFLICT ON CONSTRAINT memory_pii_key_erasures_once DO NOTHING`,
+          [
+            request.tenantId,
+            request.workspaceId,
+            request.erasureTombstoneId,
+            request.aliasId,
+            request.bindingMutationReceiptId,
+            request.keyRef,
+            request.providerId,
+            request.settlementReceiptId,
+          ],
+        );
+      }
+      // The obligation is CLOSED only by a decision that actually resolves the
+      // question. The other five leave it open on purpose.
+      if (resolves) {
+        await client.query(
+          `UPDATE public.memory_key_destruction_obligations
+              SET state = $4, not_proven_reason = 'SETTLED',
+                  resolved_by = 'SETTLEMENT',
+                  settled_by = $5, last_observed_at = now()
+            WHERE tenant_id = $1 AND workspace_id = $2 AND key_ref = $3
+              AND settled_by IS NULL`,
+          [
+            request.tenantId,
+            request.workspaceId,
+            request.keyRef,
+            successorState,
+            request.settlementReceiptId,
+          ],
+        );
+      } else {
+        await client.query(
+          `UPDATE public.memory_key_destruction_obligations
+              SET last_observed_at = now()
+            WHERE tenant_id = $1 AND workspace_id = $2 AND key_ref = $3
+              AND settled_by IS NULL`,
+          [request.tenantId, request.workspaceId, request.keyRef],
+        );
+      }
+      await client.query("COMMIT");
+      return { recorded: true, replay: false, evidenceDigest };
+    } catch (error) {
+      ambiguous = error;
+      await client.query("ROLLBACK").catch(() => undefined);
+      const code = (error as { code?: unknown } | null)?.code;
+      const constraint = String(
+        (error as { constraint?: unknown } | null)?.constraint ?? "",
+      );
+      if (code === "23505") {
+        if (constraint.endsWith("nonce_unique")) {
+          return { recorded: false, rejection: "settlement_nonce_replayed" };
+        }
+        if (constraint.endsWith("scope_unique")) {
+          return { recorded: false, rejection: "settlement_already_resolved" };
+        }
+        if (constraint.endsWith("receipt_unique")) {
+          return { recorded: false, rejection: "settlement_receipt_conflict" };
+        }
+      }
+      if (code === "23514") {
+        // Either a CHECK or one of the triggers raising `check_violation`.
+        return {
+          recorded: false,
+          rejection: constraint.endsWith("independent_verifier")
+            ? "settlement_self_verified"
+            : "settlement_not_evidence_bound",
+        };
+      }
+      if (isConnectionAmbiguous(error)) throw error;
+      return { recorded: false, rejection: "settlement_storage_rejected" };
+    } finally {
+      releaseClient(client, ambiguous);
+    }
+  }
+
+  async function listKeyDestructionObligations(input: {
+    actor: TrustedMemoryActor;
+    limit?: number;
+  }): Promise<KeyDestructionObligation[]> {
+    const limit = input.limit ?? 100;
+    const client = await pool.connect();
+    let ambiguous: unknown;
+    try {
+      await client.query("BEGIN");
+      await enterRole(client, readBackRole);
+      const rows = await client.query(
+        `SELECT tenant_id, workspace_id, subject_record_id, alias_id, key_ref,
+                provider_id, binding_mutation_receipt_id, erasure_tombstone_id,
+                state, not_proven_reason, observations,
+                first_observed_at, last_observed_at, resolved_by, settled_by
+           FROM public.memory_key_destruction_obligations
+          WHERE tenant_id = $1 AND workspace_id = $2
+          ORDER BY first_observed_at, id
+          LIMIT $3`,
+        [input.actor.tenantId, input.actor.workspaceId, limit],
+      );
+      await client.query("COMMIT");
+      return (rows.rows as Array<Record<string, never>>).map((row) => ({
+        tenantId: row.tenant_id as unknown as string,
+        workspaceId: row.workspace_id as unknown as string,
+        subjectRecordId: row.subject_record_id as unknown as string,
+        aliasId: row.alias_id as unknown as string,
+        keyRef: row.key_ref as unknown as string,
+        providerId: row.provider_id as unknown as string,
+        bindingMutationReceiptId: row.binding_mutation_receipt_id as unknown as string,
+        erasureTombstoneId: row.erasure_tombstone_id as unknown as string,
+        state: row.state as unknown as KeyDestructionObligation["state"],
+        notProvenReason: row.not_proven_reason as unknown as KeyNotProvenReason,
+        observations: row.observations as unknown as number,
+        firstObservedAt: row.first_observed_at as unknown as Date,
+        lastObservedAt: row.last_observed_at as unknown as Date,
+        resolvedBy: (row.resolved_by as unknown as KeyDestructionObligation["resolvedBy"]) ?? null,
+        settledBy: (row.settled_by as unknown as string | null) ?? null,
+      }));
+    } catch (error) {
+      ambiguous = error;
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      releaseClient(client, ambiguous);
+    }
+  }
+
   return {
     create: (request) => mutate("create", request),
     correct: (request) => mutate("correct", request),
     delete: deleteRecord,
     completePendingAliasErasures: async (limit = 100) => {
       const done = await destroyCommittedAliasKeys({ limit });
-      return { destroyed: done.destroyed, pending: done.pending };
+      return {
+        destroyed: done.destroyed,
+        repaired: done.repaired,
+        contradictions: done.contradictions,
+        pending: done.pending,
+        notProven: done.notProven,
+        notProvenReasons: done.notProvenReasons,
+      };
     },
     restore: (request) => mutate("restore", request),
     promote: (request) => mutate("promote", request),
@@ -2284,5 +3571,7 @@ export function createPostgresTrustedMemoryStore(
     readHead,
     retrieve,
     readTombstone,
+    settleKeyDestruction,
+    listKeyDestructionObligations,
   };
 }

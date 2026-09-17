@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import test, { after, before, beforeEach } from "node:test";
 import { Pool } from "pg";
 
+import { enterMemoryRole } from "../src/persistence/postgres/pool";
+
 import {
   MEMORY_ALIAS_NORMALIZATION_VERSION,
   MEMORY_AUTHORIZATION_NONCE_SCHEMA_VERSION,
@@ -2510,18 +2512,46 @@ test("a deletion whose accounting cannot be read back independently is NOT a suc
       proposedContent: order,
     }),
   );
-  const blind = createPostgresTrustedMemoryStore(writePool, shadowTombstonePool);
-  const result = await blind.delete({
-    actor: SCOPE,
-    authorizationId: receipt.authorizationId,
-    recordId: RECORD_ID,
-    proposedContent: order,
-    mutationReceiptId: "mutation.blindreadback.1",
-    tombstoneId: "tombstone-blind-001",
-  });
+  // ---- HOW THE READ-BACK IS BLINDED, AND WHY IT CHANGED -------------
+  // This used to point the read-back pool at a shadow schema holding an empty
+  // `memory_tombstones`, via `search_path`. That fixture stopped working
+  // because the defect it relied on was FIXED: `enterMemoryRole` now pins
+  // `search_path` to `pg_catalog, public, pg_temp`, so no injected schema is
+  // on the path at all (red team B2 / security NEW-1, K-07).
+  //
+  // The property under test is unchanged and still load-bearing, so the
+  // blinding is now a PRIVILEGE rather than a name-resolution trick — which is
+  // strictly harder to talk your way around. SELECT on `memory_tombstones` is
+  // revoked from the read-back role for the duration, so the tombstone read is
+  // denied while the head read-back (a different table) still works, which is
+  // exactly the half-blind state the property is about. The whole file holds
+  // the shared-table lock, so this catalog change cannot be observed by
+  // another file on this database.
+  await adminPool.query(
+    `REVOKE SELECT ON memory_tombstones FROM aaliyah_memory_reader`,
+  );
+  let result;
+  try {
+    const blind = createPostgresTrustedMemoryStore(writePool, readPool);
+    result = await blind.delete({
+      actor: SCOPE,
+      authorizationId: receipt.authorizationId,
+      recordId: RECORD_ID,
+      proposedContent: order,
+      mutationReceiptId: "mutation.blindreadback.1",
+      tombstoneId: "tombstone-blind-001",
+    });
+  } finally {
+    await adminPool.query(
+      `GRANT SELECT ON memory_tombstones TO aaliyah_memory_reader`,
+    );
+  }
   assert.equal(result.verified, false);
   assert.equal(result.rejection, "erasure_incomplete");
   assert.equal(result.tombstone, null);
+  // POSITIVE CONTROL: with the grant restored, the very same accounting reads
+  // back — so the refusal above is the blinding and not the deletion.
+  assert.notEqual(await store().readTombstone(SCOPE, "tombstone-blind-001"), null);
   // The row IS on disk in `public`; the point is that the store did not claim
   // success on evidence it could not obtain independently.
   const stored = await adminPool.query(
@@ -3527,7 +3557,13 @@ test("P-1 BREAK 4: a subject erasure destroys the address EVERYWHERE the databas
 
   const { result } = await eraseParticipant("mutation.pii.erase.1", "tombstone-pii-001");
   assert.equal(result.verified, true, result.rejection ?? "");
-  assert.deepEqual(result.aliasErasure, { bindingsErased: 1, keysDestroyed: 1, keysPending: 0 });
+  assert.deepEqual(result.aliasErasure, {
+    bindingsErased: 1,
+    keysDestroyed: 1,
+    keysPending: 0,
+    keysNotProven: 0,
+    notProvenReasons: {},
+  });
 
   // EXECUTED against b3efc82: `resolveAlias` still answered with the address.
   assert.equal(await aliases().resolveAlias(SCOPE, VICTIM_NORMALIZED), null);
@@ -3668,17 +3704,27 @@ test("P-7 an UNAVAILABLE key provider: the database half commits, the deletion i
     TEST_PII_KEYS.setAvailable(true);
   }
   assert.equal(result.verified, false);
-  assert.equal(result.rejection, "erasure_incomplete");
-  assert.deepEqual(result.aliasErasure, { bindingsErased: 1, keysDestroyed: 0, keysPending: 1 });
+  // FOUNDER DECISION, OPTION B: a provider outage is one of the conditions in
+  // which destruction cannot be PROVEN, so the subject is not erased and the
+  // answer says which of the two it is. `erasure_incomplete` would say "not
+  // finished yet" about a state that is "not establishable from here".
+  assert.equal(result.rejection, "key_destruction_not_proven");
+  assert.deepEqual(result.aliasErasure, {
+    bindingsErased: 1,
+    keysDestroyed: 0,
+    keysPending: 1,
+    keysNotProven: 1,
+    notProvenReasons: { PROVIDER_UNAVAILABLE: 1 },
+  });
   // The database has forgotten; the key has not been destroyed yet.
   assert.equal((await bindingState("alias-pii-001")).pii_envelope, null);
   assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "active");
 
   const completed = await store().completePendingAliasErasures();
-  assert.deepEqual(completed, { destroyed: 1, pending: 0 });
+  assert.deepEqual(completed, { destroyed: 1, repaired: 0, contradictions: 0, pending: 0, notProven: 0, notProvenReasons: {} });
   assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "destroyed");
   // Idempotent.
-  assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 0, pending: 0 });
+  assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 0, repaired: 0, contradictions: 0, pending: 0, notProven: 0, notProvenReasons: {} });
 });
 
 test("P-8 the DATABASE refuses to commit a deletion that leaves the subject's alias unerased, whoever writes it", async () => {
@@ -3873,7 +3919,13 @@ test("P-14 erasing ONE subject leaves every other subject's alias intact and res
   await bindVictimAddress2();
   const { result } = await eraseParticipant("mutation.pii.scope", "tombstone-pii-scope");
   assert.equal(result.verified, true);
-  assert.deepEqual(result.aliasErasure, { bindingsErased: 1, keysDestroyed: 1, keysPending: 0 });
+  assert.deepEqual(result.aliasErasure, {
+    bindingsErased: 1,
+    keysDestroyed: 1,
+    keysPending: 0,
+    keysNotProven: 0,
+    notProvenReasons: {},
+  });
   assert.equal(await aliases().resolveAlias(SCOPE, VICTIM_NORMALIZED), null);
   assert.equal((await aliases().resolveAlias(SCOPE, "other.person@example.com"))?.binding.aliasId, "alias-pii-002");
 });
@@ -4185,13 +4237,21 @@ test("C9 a provider that CLAIMS destruction without destroying is caught: the de
     tombstoneId: "tombstone-c9-liar",
   });
   assert.equal(result.verified, false);
-  assert.equal(result.rejection, "erasure_incomplete");
-  assert.deepEqual(result.aliasErasure, { bindingsErased: 1, keysDestroyed: 0, keysPending: 1 });
+  // The lie is a CONTRADICTION, not a delay: `destroyDataKey` returned
+  // success and `dataKeyState` then said the key was alive.
+  assert.equal(result.rejection, "key_destruction_not_proven");
+  assert.deepEqual(result.aliasErasure, {
+    bindingsErased: 1,
+    keysDestroyed: 0,
+    keysPending: 1,
+    keysNotProven: 1,
+    notProvenReasons: { CONTRADICTORY_EVIDENCE: 1 },
+  });
   assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "active");
   const destroyed = await adminPool.query(`SELECT count(*)::int AS n FROM memory_pii_key_erasures WHERE event = 'key_destroyed'`);
   assert.equal(destroyed.rows[0].n, 0);
   // Positive control: the honest provider finishes the same erasure.
-  assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 1, pending: 0 });
+  assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 1, repaired: 0, contradictions: 0, pending: 0, notProven: 0, notProvenReasons: {} });
 });
 
 test("C9 an index entry that matches a lookup but belongs to ANOTHER binding is refused, never resolved", async () => {
@@ -4333,7 +4393,13 @@ test("X-2 the ABSORBED record accepts a subject erasure that destroys its conten
   const before = await bindingState("alias-pii-001");
   const { result } = await eraseRecordAtHead(PARTICIPANT, "mutation.x2.erase.absorbed", "tombstone-x2-absorbed");
   assert.equal(result.verified, true, result.rejection ?? "");
-  assert.deepEqual(result.aliasErasure, { bindingsErased: 1, keysDestroyed: 1, keysPending: 0 });
+  assert.deepEqual(result.aliasErasure, {
+    bindingsErased: 1,
+    keysDestroyed: 1,
+    keysPending: 0,
+    keysNotProven: 0,
+    notProvenReasons: {},
+  });
   const after = await bindingState("alias-pii-001");
   assert.equal(after.pii_envelope, null);
   assert.equal(after.pii_erasure_tombstone_id, "tombstone-x2-absorbed");
@@ -4394,41 +4460,102 @@ test("X-4 the DATABASE freeze admits a deletion on an absorbed record only when 
   });
 });
 
-test("X-5 the DATABASE refuses a survivor's subject-erasure tombstone while a record merged into it is unerased, even past the store's check", async () => {
-  // The store is pointed at an EMPTY shadow of memory_identity_edges, so its
-  // own pre-check sees no merge. The SECURITY DEFINER trigger reads public.
-  await absorbVictim("mutation.x5.merge");
-  await adminPool.query(`DROP SCHEMA IF EXISTS x5_shadow CASCADE`);
-  await adminPool.query(`CREATE SCHEMA x5_shadow`);
-  await adminPool.query(`CREATE TABLE x5_shadow.memory_identity_edges (LIKE public.memory_identity_edges)`);
-  await adminPool.query(`GRANT USAGE ON SCHEMA x5_shadow TO aaliyah_memory_mutator, aaliyah_memory_reader`);
-  await adminPool.query(`GRANT SELECT ON x5_shadow.memory_identity_edges TO aaliyah_memory_mutator, aaliyah_memory_reader`);
-  await adminPool.query(
-    `CREATE FUNCTION x5_shadow.aaliyah_memory_unerased_merged_records(text, text, text)
-       RETURNS SETOF text LANGUAGE sql AS $$ SELECT NULL::text WHERE false $$`,
-  );
-  await adminPool.query(`GRANT EXECUTE ON FUNCTION x5_shadow.aaliyah_memory_unerased_merged_records(text, text, text) TO aaliyah_memory_mutator`);
-  const blind = new Pool({
-    connectionString: DB_URL,
-    max: 2,
-    options: `${process.env.PGOPTIONS ?? ""} -c search_path=x5_shadow,public`,
-  });
+/**
+ * ---- THE DATABASE IS THE BACKSTOP, AND WHY THIS TEST CHANGED SHAPE ------
+ *
+ * X-5 and X-8 used to neutralise the store's own pre-check by starting it on
+ * `search_path=<shadow>,public`, so its unqualified
+ * `aaliyah_memory_unerased_merged_records` call resolved to an empty stub
+ * while the SECURITY DEFINER trigger still read `public`. That fixture no
+ * longer works, and it no longer works because the defect it depended on was
+ * FIXED: `enterMemoryRole` pins `search_path` to `pg_catalog, public, pg_temp`
+ * on every transaction, so `"$user"` and any injected schema are off the path
+ * entirely (red team B2 / security NEW-1, K-07 — where the same shadowing
+ * trick let a survivor's erasure verify over a LIVE key).
+ *
+ * With the path pinned, the store's pre-check and the trigger call the SAME
+ * function and cannot be made to disagree. So the trigger's independent value
+ * is no longer "it catches a store whose check was fooled" — it is the thing
+ * the store's own comment always claimed: it binds A WRITER THAT NEVER COMES
+ * THROUGH THE STORE. That is what these two now test, the same way P-8 tests
+ * the alias guard: a structurally valid tombstone row, written directly as the
+ * mutation role with every unrelated guard stood down, so the merged-erasure
+ * guard is the only thing left that can refuse.
+ *
+ * Each has a POSITIVE CONTROL, because a refusal that fires for every row
+ * proves nothing.
+ */
+async function forgeSurvivorTombstone(
+  targetRecordId: string,
+  tombstoneId: string,
+  copyFrom: string,
+): Promise<void> {
+  // ONE TRANSACTION, ALWAYS ROLLED BACK.
+  //
+  // The merged-erasure guard is an immediate AFTER INSERT trigger, so the
+  // INSERT statement itself is the whole experiment — a COMMIT would add no
+  // evidence and would leave a real tombstone in a database eleven later
+  // tests share. Committing is how the first version of this helper broke
+  // three unrelated tombstone-guard tests: it persisted both the forged rows
+  // and, on the success path, the stood-down triggers.
+  const client = await adminPool.connect();
   try {
-    const { receipt, result } = await eraseRecordAtHead(
-      SURVIVOR,
-      "mutation.x5.erase",
-      "tombstone-x5",
-      "subject_erasure_request",
-      createPostgresTrustedMemoryStore(blind, readPool, { piiKeys: TEST_PII_KEYS }),
+    await client.query("BEGIN");
+    await client.query(`ALTER TABLE memory_tombstones
+      DISABLE TRIGGER memory_tombstones_structural,
+      DISABLE TRIGGER memory_tombstones_zz_authorization_scope`);
+    await client.query(
+      `INSERT INTO memory_tombstones
+         (tenant_id, workspace_id, principal_id, user_id, tombstone_id, target_record_id,
+          target_version, tombstone_version, authorization_id, mutation_receipt_id, reason,
+          effective_at, retain_until, legal_hold_state, cache_index_propagation,
+          restoration_eligibility_kind, tombstone_digest, payload)
+       SELECT tenant_id, workspace_id, principal_id, user_id, $2, $1,
+              target_version, tombstone_version, authorization_id, $2 || '.receipt',
+              'subject_erasure_request',
+              effective_at, retain_until, legal_hold_state, cache_index_propagation,
+              restoration_eligibility_kind, tombstone_digest,
+              jsonb_set(jsonb_set(payload, '{tombstoneId}', to_jsonb($2::text)),
+                        '{targetRecordId}', to_jsonb($1::text))
+         FROM memory_tombstones WHERE tombstone_id = $3`,
+      [targetRecordId, tombstoneId, copyFrom],
     );
-    assert.equal(result.verified, false);
-    assert.equal(result.rejection, "storage_rejected");
-    assert.equal(await nonceConsumed(receipt.authorizationId), false);
-    assert.equal((await store().readHead(SCOPE, SURVIVOR))?.state, "active");
   } finally {
-    await blind.end();
-    await adminPool.query(`DROP SCHEMA IF EXISTS x5_shadow CASCADE`);
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
   }
+}
+
+async function rejectsSurvivorTombstone(
+  targetRecordId: string,
+  tombstoneId: string,
+  copyFrom: string,
+  pattern: RegExp,
+): Promise<void> {
+  await assert.rejects(
+    () => forgeSurvivorTombstone(targetRecordId, tombstoneId, copyFrom),
+    pattern,
+  );
+}
+
+test("X-5 the DATABASE refuses a subject-erasure tombstone for a survivor whose merged-in record is unerased, written by a writer that never came through the store", async () => {
+  await absorbVictim("mutation.x5.merge");
+  // A structurally valid tombstone to copy, from an honest deletion of an
+  // unrelated record.
+  await deleteThen("mutation.x5.other-delete", "tombstone-x5-other");
+  await rejectsSurvivorTombstone(
+    SURVIVOR,
+    "tombstone-x5-forged",
+    "tombstone-x5-other",
+    /a subject erasure may not complete while a record merged into it is not erased/,
+  );
+  assert.equal((await store().readHead(SCOPE, SURVIVOR))?.state, "active");
+
+  // POSITIVE CONTROL: the very same forged write, once the merged-in record
+  // really is erased, is ACCEPTED by the trigger — so the refusal above is
+  // about the merge and not about writing a tombstone directly.
+  await eraseRecordAtHead(PARTICIPANT, "mutation.x5.erase.absorbed", "tombstone-x5-absorbed");
+  await forgeSurvivorTombstone(SURVIVOR, "tombstone-x5-allowed", "tombstone-x5-other");
 });
 
 test("K-5 RED TEAM RT2-H1: a spent CORRECT authorization cannot also witness a binding that resurrects an ERASED participant's address", async () => {
@@ -4501,8 +4628,14 @@ test("K-6 RED TEAM RT2-K1: a key_destroyed row forged for a LIVE key does not st
   } finally {
     TEST_PII_KEYS.setAvailable(true);
   }
-  assert.equal(result.rejection, "erasure_incomplete");
-  assert.deepEqual(result.aliasErasure, { bindingsErased: 1, keysDestroyed: 0, keysPending: 1 });
+  assert.equal(result.rejection, "key_destruction_not_proven");
+  assert.deepEqual(result.aliasErasure, {
+    bindingsErased: 1,
+    keysDestroyed: 0,
+    keysPending: 1,
+    keysNotProven: 1,
+    notProvenReasons: { PROVIDER_UNAVAILABLE: 1 },
+  });
 
   // The key_destroyed guard binds the tombstone as well as the key: evidence
   // naming another tombstone is refused (P6 branch survivor BM4).
@@ -4525,7 +4658,18 @@ test("K-6 RED TEAM RT2-K1: a key_destroyed row forged for a LIVE key does not st
   );
   assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "active");
 
-  assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 1, pending: 0 });
+  assert.deepEqual(await store().completePendingAliasErasures(), {
+    // The forged row already occupied the evidence slot, so the insert
+    // conflicts and `destroyed` (rows that actually landed, K-11) cannot see
+    // it. `repaired` is the number that must not be silent here: a forged
+    // `key_destroyed` was detected and the live key really was destroyed.
+    destroyed: 0,
+    repaired: 1,
+    contradictions: 1,
+    pending: 0,
+    notProven: 0,
+    notProvenReasons: {},
+  });
   assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "destroyed");
   await assert.rejects(
     TEST_PII_KEYS.decrypt({
@@ -4541,7 +4685,7 @@ test("K-6 RED TEAM RT2-K1: a key_destroyed row forged for a LIVE key does not st
     MemoryPiiKeyDestroyed,
   );
   // Idempotent: a second pass finds the evidence true and does nothing.
-  assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 0, pending: 0 });
+  assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 0, repaired: 0, contradictions: 0, pending: 0, notProven: 0, notProvenReasons: {} });
 });
 
 /** Bind `<n>.person@example.com` to its own participant, honestly. */
@@ -4588,7 +4732,8 @@ async function eraseDuringOutage(participant: string, tag: string) {
   TEST_PII_KEYS.setAvailable(false);
   try {
     const { result } = await eraseRecordAtHead(participant, `mutation.starve.${tag}`, `tombstone-starve-${tag}`);
-    assert.equal(result.rejection, "erasure_incomplete");
+    // OPTION B: an outage cannot prove destruction, so it is named as such.
+    assert.equal(result.rejection, "key_destruction_not_proven");
   } finally {
     TEST_PII_KEYS.setAvailable(true);
   }
@@ -4604,11 +4749,22 @@ test("K-7 a forged key_destroyed row is audited on every pass, however many SETT
   await forgeKeyDestroyed("tombstone-starve-victim");
   assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: victim.keyRef }), "active");
 
-  assert.deepEqual(await store().completePendingAliasErasures(1), { destroyed: 1, pending: 0 });
+  assert.deepEqual(await store().completePendingAliasErasures(1), {
+    // The forged row already occupied the evidence slot, so the insert
+    // conflicts and `destroyed` (rows that actually landed, K-11) cannot see
+    // it. `repaired` is the number that must not be silent here: a forged
+    // `key_destroyed` was detected and the live key really was destroyed.
+    destroyed: 0,
+    repaired: 1,
+    contradictions: 1,
+    pending: 0,
+    notProven: 0,
+    notProvenReasons: {},
+  });
   assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: victim.keyRef }), "destroyed");
   // Positive control: the settled key was, and stays, destroyed; a further pass finds nothing to do.
   assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: settled.keyRef }), "destroyed");
-  assert.deepEqual(await store().completePendingAliasErasures(1), { destroyed: 0, pending: 0 });
+  assert.deepEqual(await store().completePendingAliasErasures(1), { destroyed: 0, repaired: 0, contradictions: 0, pending: 0, notProven: 0, notProvenReasons: {} });
 });
 
 test("K-8 a forged key_destroyed row is audited on every pass, however many PENDING erasures are ahead of it", async () => {
@@ -4620,7 +4776,16 @@ test("K-8 a forged key_destroyed row is audited on every pass, however many PEND
   await eraseDuringOutage(victim.participant, "victim4");
   await forgeKeyDestroyed("tombstone-starve-victim4");
 
-  assert.deepEqual(await store().completePendingAliasErasures(1), { destroyed: 2, pending: 0 });
+  assert.deepEqual(await store().completePendingAliasErasures(1), {
+    // The genuinely pending key: a new `key_destroyed` row landed.
+    destroyed: 1,
+    // The forged one: the evidence slot was taken, so this is where it shows.
+    repaired: 1,
+    contradictions: 1,
+    pending: 0,
+    notProven: 0,
+    notProvenReasons: {},
+  });
   assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: victim.keyRef }), "destroyed");
   assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: pending.keyRef }), "destroyed");
 });
@@ -4632,7 +4797,7 @@ test("X-6 SECURITY 03581a3 ATK-C1: a survivor's erasure is refused while a merge
   TEST_PII_KEYS.setAvailable(false);
   try {
     const { result } = await eraseRecordAtHead(PARTICIPANT, "mutation.x6.erase.absorbed", "tombstone-x6-absorbed");
-    assert.equal(result.rejection, "erasure_incomplete");
+    assert.equal(result.rejection, "key_destruction_not_proven");
   } finally {
     TEST_PII_KEYS.setAvailable(true);
   }
@@ -4642,7 +4807,7 @@ test("X-6 SECURITY 03581a3 ATK-C1: a survivor's erasure is refused while a merge
   assert.equal(await nonceConsumed(refused.receipt.authorizationId), false);
   assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "active");
   // Positive control: the completion pass destroys the key; the survivor then erases.
-  assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 1, pending: 0 });
+  assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 1, repaired: 0, contradictions: 0, pending: 0, notProven: 0, notProvenReasons: {} });
   const { result } = await eraseRecordAtHead(SURVIVOR, "mutation.x6.erase.survivor.2", "tombstone-x6-survivor-2");
   assert.equal(result.verified, true, result.rejection ?? "");
   await assert.rejects(
@@ -4666,7 +4831,7 @@ test("X-7 a FORGED key_destroyed row for the merged-in key does not let the surv
   TEST_PII_KEYS.setAvailable(false);
   try {
     const { result } = await eraseRecordAtHead(PARTICIPANT, "mutation.x7.erase.absorbed", "tombstone-x7-absorbed");
-    assert.equal(result.rejection, "erasure_incomplete");
+    assert.equal(result.rejection, "key_destruction_not_proven");
   } finally {
     TEST_PII_KEYS.setAvailable(true);
   }
@@ -4677,41 +4842,149 @@ test("X-7 a FORGED key_destroyed row for the merged-in key does not let the surv
   assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "active");
 });
 
-test("X-8 the DATABASE refuses a survivor's subject-erasure tombstone while a merged-in erasure has no key_destroyed evidence, even past the store's check", async () => {
+test("X-8 the DATABASE refuses a subject-erasure tombstone for a survivor whose merged-in erasure has NO key_destroyed evidence", async () => {
+  // Migration 054's own clause, exercised through a writer that never came
+  // through the store — see the note above `forgeSurvivorTombstone`. The
+  // absorbed record IS erased (its binding has `pii_erased_at`), so 051's
+  // clause is satisfied; only the missing destruction evidence is left.
   await absorbVictim("mutation.x8.merge");
+  await deleteThen("mutation.x8.other-delete", "tombstone-x8-other");
   TEST_PII_KEYS.setAvailable(false);
   try {
     const { result } = await eraseRecordAtHead(PARTICIPANT, "mutation.x8.erase.absorbed", "tombstone-x8-absorbed");
-    assert.equal(result.rejection, "erasure_incomplete");
+    assert.equal(result.rejection, "key_destruction_not_proven");
   } finally {
     TEST_PII_KEYS.setAvailable(true);
   }
-  // A store whose provider says every key is destroyed, and whose pre-check
-  // helper answers nothing: only the database stands between it and success.
-  await adminPool.query(`DROP SCHEMA IF EXISTS x8_shadow CASCADE`);
-  await adminPool.query(`CREATE SCHEMA x8_shadow`);
-  await adminPool.query(
-    `CREATE FUNCTION x8_shadow.aaliyah_memory_unerased_merged_records(text, text, text)
-       RETURNS SETOF text LANGUAGE sql AS $$ SELECT NULL::text WHERE false $$`,
+  const evidence = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_pii_key_erasures
+      WHERE event = 'key_destroyed' AND tombstone_id = 'tombstone-x8-absorbed'`,
   );
-  await adminPool.query(`GRANT USAGE ON SCHEMA x8_shadow TO aaliyah_memory_mutator`);
-  await adminPool.query(`GRANT EXECUTE ON FUNCTION x8_shadow.aaliyah_memory_unerased_merged_records(text, text, text) TO aaliyah_memory_mutator`);
-  const blind = new Pool({ connectionString: DB_URL, max: 2, options: `${process.env.PGOPTIONS ?? ""} -c search_path=x8_shadow,public` });
-  const lying = { ...TEST_PII_KEYS, dataKeyState: async () => "destroyed" as const };
+  assert.equal(evidence.rows[0].n, 0, "precondition: the key must have no destruction evidence");
+
+  await rejectsSurvivorTombstone(
+    SURVIVOR,
+    "tombstone-x8-forged",
+    "tombstone-x8-other",
+    /a subject erasure may not complete while a record merged into it is not erased/,
+  );
+  assert.equal((await store().readHead(SCOPE, SURVIVOR))?.state, "active");
+
+  // POSITIVE CONTROL: the same forged write, once the completion pass has
+  // destroyed the key and recorded it, is accepted. So the refusal is about
+  // the missing destruction evidence specifically — which is the clause
+  // migration 054 adds, and the one a mutant that neuters it must break.
+  const completed = await store().completePendingAliasErasures();
+  assert.equal(completed.pending, 0, JSON.stringify(completed));
+  await forgeSurvivorTombstone(SURVIVOR, "tombstone-x8-allowed", "tombstone-x8-other");
+});
+
+test("ATK-P1 K-07: a mutator that can CREATE a schema named after itself cannot shadow the store's reads", async () => {
+  // ---- THE REPRODUCER, FROM THE SECURITY REVIEW OF 8a0bf05 -----------
+  // NEW-1 / red team B2, MEDIUM, EXECUTED with a working proof of concept.
+  // The store named its tables unqualified under `SET LOCAL ROLE`, on
+  // PostgreSQL's default `"$user", public` path. Granted CREATE on the
+  // database, the mutator created a schema called `aaliyah_memory_mutator` —
+  // which `"$user"` resolves to FIRST — put an empty `memory_identity_edges`
+  // in it, and the survivor's subject erasure then reported `true null` with
+  // the merged-in key still `active` and a ciphertext copy decrypting to
+  // `victim.person@example.com`.
+  //
+  // `enterMemoryRole` now strips `"$user"` from the path. The grant is still
+  // a grant, the schema is still creatable, and the shadow is simply never
+  // consulted.
+  await absorbVictim("mutation.atkp1.merge");
+  const before = await bindingState("alias-pii-001");
+  TEST_PII_KEYS.setAvailable(false);
   try {
-    const { receipt, result } = await eraseRecordAtHead(
-      SURVIVOR,
-      "mutation.x8.erase.survivor",
-      "tombstone-x8-survivor",
-      "subject_erasure_request",
-      createPostgresTrustedMemoryStore(blind, readPool, { piiKeys: lying }),
-    );
-    assert.equal(result.verified, false);
-    assert.equal(result.rejection, "storage_rejected");
-    assert.equal(await nonceConsumed(receipt.authorizationId), false);
+    const { result } = await eraseRecordAtHead(PARTICIPANT, "mutation.atkp1.absorbed", "tombstone-atkp1-absorbed");
+    assert.equal(result.rejection, "key_destruction_not_proven");
   } finally {
-    await blind.end();
-    await adminPool.query(`DROP SCHEMA IF EXISTS x8_shadow CASCADE`);
+    TEST_PII_KEYS.setAvailable(true);
+  }
+  // The forged evidence: the database now says the merged-in key is destroyed.
+  await forgeKeyDestroyed("tombstone-atkp1-absorbed");
+
+  // NEGATIVE CONTROL FIRST, so the refusal below is not just "it was refused
+  // anyway": without the grant, creating the schema is denied outright.
+  await assert.rejects(
+    () => runAs("aaliyah_memory_mutator", `CREATE SCHEMA aaliyah_memory_mutator`),
+    /permission denied/,
+  );
+
+  await adminPool.query(
+    `DO $do$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO aaliyah_memory_mutator', current_database()); END $do$`,
+  );
+  try {
+    // The attacker's own session, as the mutator, exactly as ATK-P1 did it.
+    await runAs("aaliyah_memory_mutator", `CREATE SCHEMA aaliyah_memory_mutator`);
+    await runAs(
+      "aaliyah_memory_mutator",
+      `CREATE TABLE aaliyah_memory_mutator.memory_identity_edges
+         (LIKE public.memory_identity_edges)`,
+    );
+    // FIXTURE PRECONDITION: the shadow really would win on the default path.
+    const shadowed = await adminPool.query(
+      `SELECT to_regclass('memory_identity_edges')::text AS resolved`,
+    );
+    assert.equal(shadowed.rows[0].resolved, "memory_identity_edges");
+
+    const refused = await eraseRecordAtHead(SURVIVOR, "mutation.atkp1.survivor", "tombstone-atkp1-survivor");
+    // The provider is available and says the key is ALIVE, so this is the
+    // honest "merged-in record is not erased" refusal — NOT a settlement
+    // question, and certainly not a success.
+    assert.equal(refused.result.verified, false);
+    assert.equal(refused.result.rejection, "merged_records_not_erased");
+    assert.equal(await nonceConsumed(refused.receipt.authorizationId), false);
+    assert.equal((await store().readHead(SCOPE, SURVIVOR))?.state, "active");
+    assert.equal(
+      await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }),
+      "active",
+    );
+  } finally {
+    await runAs("aaliyah_memory_mutator", `DROP SCHEMA IF EXISTS aaliyah_memory_mutator CASCADE`).catch(
+      () => undefined,
+    );
+    await adminPool.query(`DROP SCHEMA IF EXISTS aaliyah_memory_mutator CASCADE`);
+    await adminPool.query(
+      `DO $do$ BEGIN EXECUTE format('REVOKE CREATE ON DATABASE %I FROM aaliyah_memory_mutator', current_database()); END $do$`,
+    );
+  }
+});
+
+test("K-07: the pinned path drops \"$user\" and pg_temp's precedence, and KEEPS what the operator configured", async () => {
+  // The three properties `enterMemoryRole` exists for, read back from the
+  // SERVER inside the transaction rather than from the string it sent.
+  const probe = new Pool({
+    connectionString: DB_URL,
+    max: 1,
+    options: `${process.env.PGOPTIONS ?? ""} -c search_path="$user",operator_choice,public`,
+  });
+  try {
+    const client = await probe.connect();
+    try {
+      await client.query("BEGIN");
+      const before = (await client.query(`SELECT current_setting('search_path') AS p`)).rows[0].p as string;
+      assert.match(before, /\$user/, "fixture precondition: the session must start with $user on the path");
+      await enterMemoryRole(client, "aaliyah_memory_reader");
+      const after = (await client.query(`SELECT current_setting('search_path') AS p`)).rows[0].p as string;
+      // 1. `"$user"` is GONE — the attack surface ATK-P1 used.
+      assert.doesNotMatch(after, /\$user/, after);
+      // 2. `pg_temp` is LAST, not first-by-omission.
+      assert.match(after, /, pg_temp$/, after);
+      // 3. The operator's own schema is still there, in order. A store that
+      //    silently discarded it would be overriding its operator, and would
+      //    break every read-back-divergence fixture in this repository.
+      assert.equal(after, "pg_catalog, operator_choice, public, pg_temp");
+      await client.query("ROLLBACK");
+      // 4. SET LOCAL: nothing leaked onto the pooled connection.
+      const leaked = (await client.query(`SELECT current_setting('search_path') AS p`)).rows[0].p as string;
+      assert.equal(leaked, before);
+    } finally {
+      client.release();
+    }
+  } finally {
+    await probe.end();
   }
 });
 
@@ -4721,11 +4994,35 @@ test("K-9 SECURITY 03581a3 F2: forged key_destroyed evidence for another provide
   const other = { ...TEST_PII_KEYS, providerId: "other-kms/v1" } as typeof TEST_PII_KEYS;
   const otherStore = createPostgresTrustedMemoryStore(writePool, readPool, { piiKeys: other });
   const { result } = await eraseRecordAtHead(PARTICIPANT, "mutation.k9.erase", "tombstone-k9", "subject_erasure_request", otherStore);
-  assert.equal(result.rejection, "erasure_incomplete");
-  assert.deepEqual(await otherStore.completePendingAliasErasures(), { destroyed: 0, pending: 1 });
+  // The key belongs to `local-test/v1` and this store speaks for
+  // `other-kms/v1`, so it cannot establish anything about it — named as
+  // PROVIDER_DOES_NOT_OWN_KEY rather than silently skipped, which is how the
+  // key used to disappear from the count altogether (F2).
+  assert.equal(result.rejection, "key_destruction_not_proven");
+  const NOT_OURS = {
+    destroyed: 0,
+    repaired: 0,
+    contradictions: 0,
+    pending: 1,
+    notProven: 1,
+    notProvenReasons: { PROVIDER_DOES_NOT_OWN_KEY: 1 },
+  };
+  assert.deepEqual(await otherStore.completePendingAliasErasures(), NOT_OURS);
   await forgeKeyDestroyed("tombstone-k9");
-  assert.deepEqual(await otherStore.completePendingAliasErasures(), { destroyed: 0, pending: 1 });
+  // The forgery does not change the answer: still counted, still named, still
+  // pending. This is F2's property, now with the reason attached.
+  assert.deepEqual(await otherStore.completePendingAliasErasures(), NOT_OURS);
   assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "active");
-  // Positive control: the provider that owns the key destroys it.
-  assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 1, pending: 0 });
+  // Positive control: the provider that owns the key destroys it. The forged
+  // row already holds the evidence slot, so this lands as a `repaired`
+  // forgery rather than a fresh `destroyed` — which is the more useful of the
+  // two facts, and the one that was invisible before.
+  assert.deepEqual(await store().completePendingAliasErasures(), {
+    destroyed: 0,
+    repaired: 1,
+    contradictions: 1,
+    pending: 0,
+    notProven: 0,
+    notProvenReasons: {},
+  });
 });

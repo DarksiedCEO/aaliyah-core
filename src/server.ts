@@ -99,6 +99,20 @@ async function main(): Promise<void> {
       "trusted memory: alias vault NOT configured (no production PII key provider) — aliases are neither stored nor resolved\n",
     );
     const memory = memoryService;
+    // ---- TWO RECOVERY PASSES, TWO INDEPENDENT OUTCOMES -----------------
+    //
+    // Reliability review of 03581a3, MEDIUM (K-10): these two awaits shared
+    // one `try`, so a `reconcilePending()` rejection skipped
+    // `completePendingErasures()` ENTIRELY — and skipped it silently, because
+    // the single catch printed a message about reconciliation and said
+    // nothing about the pass that never ran. A database that was briefly
+    // unreadable at boot therefore left alias data keys unconfirmed with no
+    // trace that anything had been missed, and the next thing to notice would
+    // have been a deletion reporting an erasure it could not finish.
+    //
+    // They are separate concerns — one settles UNKNOWN mutation outcomes, the
+    // other finishes key destruction — so each runs on its own, and each
+    // reports its own result or its own failure.
     try {
       const settled = await memory.reconcilePending();
       process.stdout.write(
@@ -106,17 +120,40 @@ async function main(): Promise<void> {
           ? "trusted memory: no unresolved mutations\n"
           : `trusted memory: reconciled ${settled} unresolved mutation(s)\n`,
       );
-      const erasures = await memory.completePendingErasures().catch(() => null);
-      if (erasures !== null && erasures.pending > 0) {
-        process.stderr.write(
-          `trusted memory: ${erasures.pending} alias key erasure(s) remain unconfirmed\n`,
-        );
-      }
     } catch (error) {
       process.stderr.write(
         `trusted memory: reconciliation pass failed (${
           error instanceof Error ? error.message : String(error)
         }) — unresolved outcomes remain unresolved\n`,
+      );
+    }
+    try {
+      const erasures = await memory.completePendingErasures();
+      if (erasures.pending > 0) {
+        process.stderr.write(
+          `trusted memory: ${erasures.pending} alias key erasure(s) remain unconfirmed\n`,
+        );
+      }
+      // ---- NOT PROVEN IS NOT "PENDING" --------------------------------
+      // Founder decision, OPTION B: a key whose destruction cannot be proven
+      // leaves its subject NOT ERASED and waiting on a SETTLEMENT, not on a
+      // retry. Before this, the only signal was a `pending` counter that
+      // never moved, with nothing naming the cause — which is how a
+      // permanent, unrecoverable state looked like a transient one for as
+      // long as anyone cared to watch it (integration review of 8a0bf05,
+      // CRITICAL, K-01; security review, K-09).
+      if (erasures.notProven > 0) {
+        process.stderr.write(
+          `trusted memory: ${erasures.notProven} data key(s) CANNOT be proven destroyed ` +
+            `(${JSON.stringify(erasures.notProvenReasons)}) — those subjects are NOT ERASED ` +
+            `and stay unresolved until settled; see memory_key_destruction_obligations\n`,
+        );
+      }
+    } catch (error) {
+      process.stderr.write(
+        `trusted memory: alias key completion pass failed (${
+          error instanceof Error ? error.message : String(error)
+        }) — alias data keys remain unconfirmed\n`,
       );
     }
   } else {

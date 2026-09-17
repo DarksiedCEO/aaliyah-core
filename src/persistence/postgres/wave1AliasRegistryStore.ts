@@ -11,6 +11,7 @@ import {
   type MemoryScope,
 } from "@aaliyah/contracts/v1";
 import type { Pool, PoolClient } from "pg";
+import { enterMemoryRole } from "./pool";
 
 import { appendMutationAttempt } from "./memoryMutationAttempts";
 import {
@@ -251,14 +252,27 @@ class AliasMutationAborted extends Error {
  * an alias value can never be quoted back on a receipt. Nearly every alias
  * gate is therefore `policy_rejected`, and the precise name lives only in the
  * returned `rejection`.
+ *
+ * EXHAUSTIVE OVER THE REJECTION ENUM, not `Record<string, ...>`. Integration
+ * review of 8a0bf05, LOW (K-20): an index signature accepts any key and
+ * therefore requires none, so a new rejection code with no entry compiled
+ * cleanly and silently reported `policy_rejected`. Because this list starts
+ * from `TRUSTED_MEMORY_REJECTIONS`, that also means the two reasons added to
+ * the trusted-memory enum this round could not be forgotten here.
+ *
+ * Every value is written out. A spread that defaulted the alias gates to
+ * `policy_rejected` would be shorter and would put the exact defect back: a
+ * missing entry has to fail `tsc`, and it cannot fail if something filled it
+ * in first.
  */
-const ABORT_REASON: Record<string, MemoryAbortReason> = {
+const ABORT_REASON: Record<AliasRegistryRejection, MemoryAbortReason> = {
   request_malformed: "policy_rejected",
   authorization_not_found: "policy_rejected",
   authorization_malformed: "policy_rejected",
   authorization_scope_mismatch: "policy_rejected",
   authorization_action_mismatch: "policy_rejected",
   authorization_target_mismatch: "policy_rejected",
+  record_owner_mismatch: "policy_rejected",
   authorization_expected_head_mismatch: "policy_rejected",
   authorization_expired: "authorization_expired",
   authorization_revoked: "authorization_revoked",
@@ -268,8 +282,50 @@ const ABORT_REASON: Record<string, MemoryAbortReason> = {
   proposed_content_digest_mismatch: "policy_rejected",
   head_mismatch: "head_mismatch",
   storage_rejected: "storage_rejected",
+  read_back_diverged: "storage_rejected",
+  unknown_outcome: "storage_rejected",
+  legal_hold_active: "legal_hold_active",
+  retention_obligation_active: "policy_rejected",
+  deletion_order_malformed: "policy_rejected",
+  restore_head_not_deleted: "policy_rejected",
+  identity_order_malformed: "policy_rejected",
+  identity_counterparty_invalid: "policy_rejected",
+  identity_counterparty_missing: "policy_rejected",
+  identity_counterparty_merged_away: "policy_rejected",
+  record_merged_away: "policy_rejected",
+  merged_records_not_erased: "policy_rejected",
+  identity_chain_too_deep: "policy_rejected",
+  record_deleted: "policy_rejected",
+  erasure_incomplete: "storage_rejected",
   record_busy: "storage_rejected",
   mutation_receipt_id_reused: "policy_rejected",
+  key_destruction_not_proven: "storage_rejected",
+  merged_keys_changed_during_proof: "storage_rejected",
+  // ---- THE ALIAS GATES -------------------------------------------------
+  // Every one of these is a POLICY refusal, and each is listed rather than
+  // defaulted: a default is what let a new code report `policy_rejected`
+  // without anyone choosing that (K-20).
+  alias_malformed: "policy_rejected",
+  alias_scope_mismatch: "policy_rejected",
+  alias_participant_mismatch: "policy_rejected",
+  alias_not_email_shaped: "policy_rejected",
+  alias_normalization_disagreement: "policy_rejected",
+  alias_skeleton_disagreement: "policy_rejected",
+  alias_domain_disagreement: "policy_rejected",
+  alias_mixed_script: "policy_rejected",
+  alias_script_undetermined: "policy_rejected",
+  alias_lookalike_domain: "policy_rejected",
+  alias_disposition_not_acceptable: "policy_rejected",
+  alias_evidence_malformed: "policy_rejected",
+  alias_evidence_subject_mismatch: "policy_rejected",
+  alias_evidence_disagreement: "policy_rejected",
+  alias_evidence_stale: "policy_rejected",
+  alias_scope_policy_missing: "policy_rejected",
+  alias_already_bound: "policy_rejected",
+  alias_skeleton_collision: "policy_rejected",
+  alias_not_bound: "policy_rejected",
+  alias_pii_vault_unavailable: "policy_rejected",
+  alias_plaintext_in_record_content: "policy_rejected",
 };
 
 /** A role name is an SQL IDENTIFIER, so it can never be a bind parameter. */
@@ -350,8 +406,10 @@ export function createPostgresAliasRegistryStore(
     client: PoolClient,
     role: string | null,
   ): Promise<void> {
-    if (role === null) return;
-    await client.query(`SET LOCAL ROLE "${role}"`);
+    // Least privilege AND a pinned search path (K-07). Called even for a null
+    // role: the early return that used to sit above this skipped the path
+    // pinning too, and the pinning matters whether or not a role is entered.
+    await enterMemoryRole(client, role);
   }
 
   function evidenceRef(mutationReceiptId: string, kind: string): string {
@@ -497,7 +555,7 @@ export function createPostgresAliasRegistryStore(
       outcome: {
         status: "ABORTED_NO_MUTATION",
         abortedAt: at,
-        abortReason: ABORT_REASON[rejection] ?? "policy_rejected",
+        abortReason: ABORT_REASON[rejection],
       },
     });
     // An attempt, not a mutation receipt: see memoryMutationAttempts.ts.

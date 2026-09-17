@@ -668,7 +668,13 @@ test("the pipeline distinguishes 'no memory for this contact' from 'memory unava
             return 0;
           },
           async completePendingErasures() {
-            return { destroyed: 0, pending: 0 };
+            return { destroyed: 0, repaired: 0, contradictions: 0, pending: 0, notProven: 0, notProvenReasons: {} };
+          },
+          async settleKeyDestruction() {
+            throw new Error("not used by this fixture");
+          },
+          async listKeyDestructionObligations() {
+            return [];
           },
           async canonicalIdentity(_a, id) {
             return id;

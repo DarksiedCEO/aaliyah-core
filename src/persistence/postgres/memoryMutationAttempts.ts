@@ -1,4 +1,5 @@
 import type { MemoryMutationReceipt } from "@aaliyah/contracts/v1";
+import { enterMemoryRole } from "./pool";
 import type { Pool } from "pg";
 
 /**
@@ -39,7 +40,9 @@ export async function appendMutationAttempt(input: {
       if (!/^[a-z][a-z0-9_]{0,62}$/u.test(input.role)) {
         throw new Error("memory attempts: role is not a valid identifier");
       }
-      await client.query(`SET LOCAL ROLE "${input.role}"`);
+      // Least privilege AND a pinned search path (K-07): `"$user"` off the
+      // path, `pg_temp` last. One helper, so no call site can forget either.
+      await enterMemoryRole(client, input.role);
     }
     await client.query(
       `INSERT INTO memory_mutation_attempts

@@ -99,6 +99,80 @@ export function boundedQuery(
 }
 
 /**
+ * ENTER A LEAST-PRIVILEGE ROLE ON A PINNED SEARCH PATH.
+ *
+ * ONE function, used by every store, because the property it carries is one a
+ * caller must not be able to forget.
+ *
+ * Red team B2 / security NEW-1 against 8a0bf05, MEDIUM, with a working proof
+ * of concept (K-07): the stores name their tables UNQUALIFIED under
+ * `SET LOCAL ROLE`, on PostgreSQL's default search path of `"$user", public`.
+ * With `GRANT CREATE ON DATABASE`, the mutator can create a schema called
+ * `aaliyah_memory_mutator` — which `"$user"` resolves to FIRST. `ATK-P1` did
+ * exactly that, shadowed `memory_identity_edges`, and a survivor's subject
+ * erasure then verified over a LIVE data key with forged evidence: key
+ * `active`, and a ciphertext copy still decrypting to the subject's address.
+ * The declared privilege map could not see the grant either, so the
+ * regression would not have been caught by the test that exists for it.
+ *
+ * Qualifying every identifier closes it one statement at a time and reopens
+ * the moment somebody adds the next one. This closes it for every statement,
+ * including the ones not written yet.
+ *
+ * ---- WHAT IS REMOVED, AND WHAT IS DELIBERATELY KEPT --------------------
+ *
+ * Exactly two entries are stripped, and neither is something an operator ever
+ * chooses:
+ *
+ *   `"$user"`  is the attack. It is on PostgreSQL's DEFAULT path, it resolves
+ *              to a schema named after the CURRENT ROLE, and a role holding
+ *              CREATE on the database can therefore create its own shadow of
+ *              any table this store reads — which is precisely what ATK-P1
+ *              did. `SET LOCAL ROLE` does not apply a role's own `ALTER ROLE
+ *              ... SET search_path`, so with `"$user"` gone the entered role
+ *              has no way to influence name resolution at all.
+ *   `pg_temp`  is searched FIRST when it is not named, so it is re-appended
+ *              LAST instead — the same reason every SECURITY DEFINER guard
+ *              from migration 048 onward spells it out. Red team B2 created
+ *              `pg_temp.memory_identity_edges` and had it resolve unqualified.
+ *
+ * Every OTHER schema the session was configured with is KEPT, in order. That
+ * is not a concession: an explicit schema list on a connection string is set
+ * by whoever deploys the process, and a store that silently discarded it would
+ * be overriding its operator rather than defending against an attacker. It is
+ * also what lets a read-back pool be pointed at a deliberately divergent
+ * schema — the mechanism a dozen tests use to prove this store never reports
+ * success on a read-back that disagrees with the commit, which is the single
+ * most important property in this file.
+ *
+ * Computed in ONE statement, inside the transaction, so there is no extra
+ * round trip on the hot path and no window where the path is the default one.
+ * `SET LOCAL` / `set_config(..., true)` throughout, so neither the role nor
+ * the path leaks onto a pooled connection when the transaction ends.
+ */
+const PINNED_SEARCH_PATH_SQL = `
+  SELECT set_config('search_path',
+    'pg_catalog, ' ||
+    COALESCE(NULLIF((
+      -- WITH ORDINALITY and an explicit ORDER BY: a search path is an ORDERED
+      -- list, and string_agg without one is not obliged to preserve it.
+      SELECT string_agg(btrim(part), ', ' ORDER BY ord)
+        FROM unnest(string_to_array(current_setting('search_path'), ','))
+               WITH ORDINALITY AS t(part, ord)
+       WHERE btrim(part) NOT IN ('"$user"', '$user', 'pg_catalog', 'pg_temp')
+         AND btrim(part) <> ''
+    ), ''), 'public') || ', pg_temp', true)`;
+
+export async function enterMemoryRole(
+  client: { query: (sql: string) => Promise<unknown> },
+  role: string | null,
+): Promise<void> {
+  await client.query(PINNED_SEARCH_PATH_SQL);
+  if (role === null) return;
+  await client.query(`SET LOCAL ROLE "${role}"`);
+}
+
+/**
  * A CONNECTION WHOSE LAST QUERY'S OUTCOME IS UNKNOWN IS NOT REUSABLE.
  *
  * Three shapes, all of which leave bytes that belong to an abandoned query

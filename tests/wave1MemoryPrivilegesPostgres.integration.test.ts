@@ -44,6 +44,23 @@ after(async () => {
 });
 
 test("the privilege map of every memory role equals the declared map, section by section", async () => {
+  // ---- WHY THIS TAKES THE SHARED-TABLE LOCK -------------------------
+  // The map now scans EVERY non-public schema, because objects hidden in
+  // another schema were one of the widenings it could not see (red team B2
+  // W2/W3, K-08). Several other memory files legitimately create shadow
+  // schemas as fixtures — that is how they prove this store never reports
+  // success on a read-back that disagrees with the commit — and they hold this
+  // lock for their whole run. Comparing without it would read another file's
+  // fixture as a privilege widening, which is a flake AND a false accusation.
+  const lock = await lockSharedMemoryTables(pool);
+  try {
+    await compareDeclaredMap();
+  } finally {
+    await lock.release();
+  }
+});
+
+async function compareDeclaredMap(): Promise<void> {
   const actual = await memoryPrivilegeMap(pool);
   for (const section of Object.keys(EXPECTED)) {
     const want = new Set(EXPECTED[section]);
@@ -53,9 +70,12 @@ test("the privilege map of every memory role equals the declared map, section by
     assert.deepEqual({ section, widened, narrowed }, { section, widened: [], narrowed: [] });
   }
   assert.deepEqual(Object.keys(actual).sort(), Object.keys(EXPECTED).sort());
-});
+}
 
 test("the declared map itself keeps the boundaries the register relies on", () => {
+  // Entries are `role schema.object privileges`: the schema is part of the
+  // identity now, because an object of the same name in ANOTHER schema was one
+  // of the widenings the first map could not see (K-08).
   const tables = new Map(
     EXPECTED.tables!.map((entry) => {
       const [role, table, privileges] = entry.split(" ");
@@ -63,7 +83,25 @@ test("the declared map itself keeps the boundaries the register relies on", () =
     }),
   );
   const holds = (role: string, table: string, privilege: string) =>
-    tables.get(`${role} ${table}`)?.has(privilege) ?? false;
+    tables.get(`${role} public.${table}`)?.has(privilege) ?? false;
+  // AND NOTHING LIVES OUTSIDE `public`. The migrations create every memory
+  // object there, so a declared entry in another schema is either a fixture
+  // that leaked into the declaration or a real widening — W2's falsifier.
+  for (const section of ["tables", "columns", "sequences", "functions", "securityDefiner", "functionOwners", "triggers"]) {
+    for (const entry of EXPECTED[section]!) {
+      assert.ok(
+        entry.includes("public."),
+        `${section} entry outside public: ${entry}`,
+      );
+    }
+  }
+  // EVERY GUARD IS TURNED ON. `O` is enabled-for-origin; anything else means a
+  // trigger was left disabled, which is how a committed `ALTER TABLE ...
+  // DISABLE TRIGGER` in a test helper silently stood two tombstone guards down
+  // during this round's own remediation.
+  for (const entry of EXPECTED.triggers!) {
+    assert.ok(entry.endsWith(" O"), `trigger not enabled: ${entry}`);
+  }
   // W1BR-034: the reconciler learns an alias effect through one function, never the binding table.
   assert.equal(holds("aaliyah_memory_reconciler", "memory_alias_bindings", "SELECT"), false);
   // Positive control on the same role: what it must read, it can.
@@ -87,6 +125,11 @@ test("the declared map itself keeps the boundaries the register relies on", () =
   assert.equal(holds("aaliyah_memory_mutator", "memory_authorization_receipts", "INSERT"), false);
   for (const entry of EXPECTED.tables!) {
     if (entry.startsWith("aaliyah_memory_reader ")) assert.equal(entry.split(" ")[2], "SELECT", entry);
+    if (entry.startsWith("aaliyah_memory_settler ")) {
+      // The settler writes settlements and the destruction evidence a
+      // PROVEN_DESTROYED settlement produces, and reads nothing else.
+      assert.match(entry, /^aaliyah_memory_settler public\.(memory_key_destruction_settlements|memory_key_destruction_obligations|memory_pii_key_erasures) /, entry);
+    }
   }
   // No memory role is a member of another.
   assert.deepEqual(EXPECTED.memberships, []);
@@ -105,10 +148,21 @@ test("the declared map itself keeps the boundaries the register relies on", () =
   for (const entry of EXPECTED.roleAttributes!) {
     assert.doesNotMatch(entry, /SUPERUSER|CREATEROLE|CREATEDB|LOGIN|REPLICATION|BYPASSRLS/, entry);
   }
-  for (const fn of EXPECTED.securityDefiner!) assert.match(fn, /^aaliyah_/, fn);
+  for (const fn of EXPECTED.securityDefiner!) assert.match(fn, /^public\.aaliyah_/, fn);
+  // A SECURITY DEFINER function runs with its OWNER's privileges, so an owner
+  // that is not the table owner is a privilege change with no ACL diff (W5).
+  for (const fn of EXPECTED.securityDefiner!) {
+    assert.match(fn, / OWNER postgres$/, `unexpected SECURITY DEFINER owner: ${fn}`);
+  }
+  // The database grants nothing beyond PostgreSQL's own default. `CREATE ON
+  // DATABASE` is the grant that made ATK-P1 work, and it must show up here.
+  assert.deepEqual(EXPECTED.databases, ["PUBLIC <current> CONNECT,TEMPORARY"]);
+  // No catalog function has been granted to a memory role (W4:
+  // `pg_read_file` reached the reader exactly that way).
+  assert.deepEqual(EXPECTED.catalogFunctions, []);
   // Each new helper is executable only by the one role that needs it.
   const executes = (fn: string) =>
-    EXPECTED.functions!.filter((entry) => entry.endsWith(` ${fn}`)).map((entry) => entry.split(" ")[0]).sort();
+    EXPECTED.functions!.filter((entry) => entry.endsWith(` public.${fn}`)).map((entry) => entry.split(" ")[0]).sort();
   assert.deepEqual(executes("aaliyah_memory_alias_effect_present(text,text,text,text,text,text)"), ["aaliyah_memory_reconciler"]);
   assert.deepEqual(executes("aaliyah_memory_unerased_merged_records(text,text,text)"), ["aaliyah_memory_mutator"]);
   assert.deepEqual(executes("aaliyah_memory_merge_chain_hops(text,text,text,text)"), ["aaliyah_memory_mutator"]);
@@ -119,13 +173,49 @@ test("POSITIVE CONTROL: each widening the first map could not see IS reported, t
   // surviving, plus the grant option and role attribute from the security
   // review. Each is applied, must change the map, and is reverted.
   const widenings: Array<{ apply: string; revert: string; section: string; entry: string }> = [
-    { apply: `GRANT SELECT ON memory_authorization_receipts TO PUBLIC`, revert: `REVOKE SELECT ON memory_authorization_receipts FROM PUBLIC`, section: "tables", entry: "PUBLIC memory_authorization_receipts SELECT" },
-    { apply: `GRANT INSERT ON memory_tombstones TO PUBLIC`, revert: `REVOKE INSERT ON memory_tombstones FROM PUBLIC`, section: "tables", entry: "PUBLIC memory_tombstones INSERT" },
-    { apply: `GRANT UPDATE (state) ON memory_record_versions TO PUBLIC`, revert: `REVOKE UPDATE (state) ON memory_record_versions FROM PUBLIC`, section: "columns", entry: "PUBLIC memory_record_versions.state UPDATE" },
+    { apply: `GRANT SELECT ON memory_authorization_receipts TO PUBLIC`, revert: `REVOKE SELECT ON memory_authorization_receipts FROM PUBLIC`, section: "tables", entry: "PUBLIC public.memory_authorization_receipts SELECT" },
+    { apply: `GRANT INSERT ON memory_tombstones TO PUBLIC`, revert: `REVOKE INSERT ON memory_tombstones FROM PUBLIC`, section: "tables", entry: "PUBLIC public.memory_tombstones INSERT" },
+    { apply: `GRANT UPDATE (state) ON memory_record_versions TO PUBLIC`, revert: `REVOKE UPDATE (state) ON memory_record_versions FROM PUBLIC`, section: "columns", entry: "PUBLIC public.memory_record_versions.state UPDATE" },
     { apply: `GRANT CREATE ON SCHEMA public TO aaliyah_memory_reader`, revert: `REVOKE CREATE ON SCHEMA public FROM aaliyah_memory_reader`, section: "schemas", entry: "aaliyah_memory_reader public CREATE" },
     { apply: `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO aaliyah_memory_mutator`, revert: `ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE SELECT ON TABLES FROM aaliyah_memory_mutator`, section: "defaultPrivileges", entry: "postgres public r aaliyah_memory_mutator SELECT" },
-    { apply: `GRANT SELECT ON memory_alias_bindings TO aaliyah_memory_issuer WITH GRANT OPTION`, revert: `REVOKE GRANT OPTION FOR SELECT ON memory_alias_bindings FROM aaliyah_memory_issuer`, section: "tables", entry: "aaliyah_memory_issuer memory_alias_bindings SELECT*" },
+    { apply: `GRANT SELECT ON memory_alias_bindings TO aaliyah_memory_issuer WITH GRANT OPTION`, // The FULL revoke, not just the option: migration 056 trimmed the
+      // issuer's SELECT on bindings away entirely (security F5, K-17), so
+      // revoking only the grant option would leave a privilege behind that
+      // the declared map no longer contains — and the next run of the
+      // comparison test would report it as a widening this test caused.
+      revert: `REVOKE SELECT ON memory_alias_bindings FROM aaliyah_memory_issuer`, section: "tables", entry: "aaliyah_memory_issuer public.memory_alias_bindings SELECT*" },
     { apply: `ALTER ROLE aaliyah_memory_reconciler BYPASSRLS`, revert: `ALTER ROLE aaliyah_memory_reconciler NOBYPASSRLS`, section: "roleAttributes", entry: "aaliyah_memory_reconciler BYPASSRLS,INHERIT" },
+
+    // ---- THE FIVE THE SECOND MAP COULD NOT SEE EITHER ----------------
+    // Red team B2 and security map2.ts against 8a0bf05 (K-08). Each of these
+    // produced NO DIFF AT ALL, and W1 is the one that let a survivor's
+    // erasure verify over a live key.
+    //
+    // W1: CREATE ON DATABASE. The grant that makes a `"$user"` shadow schema
+    // possible in the first place, and the reason `enterMemoryRole` now
+    // strips `"$user"` from the path.
+    {
+      apply: `DO $do$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO aaliyah_memory_mutator', current_database()); END $do$`,
+      revert: `DO $do$ BEGIN EXECUTE format('REVOKE CREATE ON DATABASE %I FROM aaliyah_memory_mutator', current_database()); END $do$`,
+      section: "databases",
+      entry: "aaliyah_memory_mutator <current> CREATE",
+    },
+    // W4: a pg_catalog function granted deliberately. `pg_read_file` reached
+    // the reader exactly this way and read 29,950 bytes of postgresql.conf.
+    {
+      apply: `GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO aaliyah_memory_reader`,
+      revert: `REVOKE EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) FROM aaliyah_memory_reader`,
+      section: "catalogFunctions",
+      entry: "aaliyah_memory_reader pg_read_file(text)",
+    },
+    // W5: an OWNER change on a SECURITY DEFINER function. No ACL moves, and
+    // the function now runs with a different role's privileges.
+    {
+      apply: `ALTER FUNCTION public.aaliyah_memory_unerased_merged_records(text, text, text) OWNER TO aaliyah_memory_reader`,
+      revert: `ALTER FUNCTION public.aaliyah_memory_unerased_merged_records(text, text, text) OWNER TO postgres`,
+      section: "securityDefiner",
+      entry: "public.aaliyah_memory_unerased_merged_records(text,text,text) OWNER aaliyah_memory_reader",
+    },
   ];
   const sharedTableLock = await lockSharedMemoryTables(pool);
   try {
@@ -148,6 +238,57 @@ test("POSITIVE CONTROL: each widening the first map could not see IS reported, t
   }
 });
 
+test("POSITIVE CONTROL: W2/W3 — an object HIDDEN IN ANOTHER SCHEMA is reported, then removed", async () => {
+  // Red team B2 against 8a0bf05 (K-08). Both of these produced NO DIFF while
+  // every section of the map filtered `nspname = 'public'`, and both WORKED:
+  // the reconciler read the view, and the reader executed the function.
+  const lock = await lockSharedMemoryTables(pool);
+  try {
+    await pool.query(`DROP SCHEMA IF EXISTS w23_probe CASCADE`);
+    await pool.query(`CREATE SCHEMA w23_probe`);
+    await pool.query(`GRANT USAGE ON SCHEMA w23_probe TO aaliyah_memory_reconciler, aaliyah_memory_reader`);
+    // W2: a view over the binding table, in another schema.
+    await pool.query(
+      `CREATE VIEW w23_probe.borrowed_bindings AS SELECT * FROM public.memory_alias_bindings`,
+    );
+    await pool.query(`GRANT SELECT ON w23_probe.borrowed_bindings TO aaliyah_memory_reconciler`);
+    // W3: a SECURITY DEFINER function, in another schema.
+    await pool.query(
+      `CREATE FUNCTION w23_probe.borrowed_reader() RETURNS bigint
+         LANGUAGE sql SECURITY DEFINER
+         SET search_path = pg_catalog, public, pg_temp
+         AS $fn$ SELECT count(*) FROM public.memory_alias_bindings $fn$`,
+    );
+    await pool.query(`GRANT EXECUTE ON FUNCTION w23_probe.borrowed_reader() TO aaliyah_memory_reader`);
+
+    const actual = await memoryPrivilegeMap(pool);
+    assert.ok(
+      actual.tables!.includes("aaliyah_memory_reconciler w23_probe.borrowed_bindings SELECT"),
+      `W2 not reported: ${JSON.stringify(actual.tables!.filter((e) => e.includes("w23_probe")))}`,
+    );
+    assert.ok(
+      actual.functions!.includes("aaliyah_memory_reader w23_probe.w23_probe.borrowed_reader()") ||
+        actual.functions!.some((e) => e.startsWith("aaliyah_memory_reader ") && e.includes("borrowed_reader")),
+      `W3 not reported in functions: ${JSON.stringify(actual.functions!.filter((e) => e.includes("borrowed")))}`,
+    );
+    assert.ok(
+      actual.securityDefiner!.some((e) => e.includes("w23_probe.borrowed_reader")),
+      `W3 not reported in securityDefiner: ${JSON.stringify(actual.securityDefiner!.filter((e) => e.includes("borrowed")))}`,
+    );
+    // And none of it is in the DECLARED map.
+    for (const section of ["tables", "functions", "securityDefiner"]) {
+      for (const entry of EXPECTED[section]!) {
+        assert.ok(!entry.includes("w23_probe"), `declared map already contains ${entry}`);
+      }
+    }
+  } finally {
+    await pool.query(`DROP SCHEMA IF EXISTS w23_probe CASCADE`);
+    await lock.release();
+  }
+  // Removed: the map is back to the declared one.
+  await compareDeclaredMap();
+});
+
 test("POSITIVE CONTROL: a widened grant IS reported as a difference, then removed", async () => {
   // A GRANT rewrites the table's catalog row. Under the suite's shared
   // memory-table lock, like every file that changes shared tables, so it never
@@ -156,11 +297,14 @@ test("POSITIVE CONTROL: a widened grant IS reported as a difference, then remove
   await pool.query(`GRANT SELECT ON memory_alias_bindings TO aaliyah_memory_reconciler`);
   try {
     const actual = await memoryPrivilegeMap(pool);
-    assert.ok(actual.tables!.includes("aaliyah_memory_reconciler memory_alias_bindings SELECT"));
-    assert.ok(!EXPECTED.tables!.includes("aaliyah_memory_reconciler memory_alias_bindings SELECT"));
+    assert.ok(
+      actual.tables!.includes("aaliyah_memory_reconciler public.memory_alias_bindings SELECT"),
+      JSON.stringify(actual.tables),
+    );
+    assert.ok(!EXPECTED.tables!.includes("aaliyah_memory_reconciler public.memory_alias_bindings SELECT"));
   } finally {
     await pool.query(`REVOKE SELECT ON memory_alias_bindings FROM aaliyah_memory_reconciler`);
     await sharedTableLock.release();
   }
-  assert.ok(!(await memoryPrivilegeMap(pool)).tables!.includes("aaliyah_memory_reconciler memory_alias_bindings SELECT"));
+  assert.ok(!(await memoryPrivilegeMap(pool)).tables!.includes("aaliyah_memory_reconciler public.memory_alias_bindings SELECT"));
 });

@@ -5,6 +5,7 @@ import {
   type MemoryAction,
 } from "@aaliyah/contracts/v1";
 import type { Pool, PoolClient } from "pg";
+import { enterMemoryRole } from "./pool";
 
 import {
   MemoryRetentionObligationSchema,
@@ -107,8 +108,11 @@ export function createPostgresLegalHoldStore(
     client: PoolClient,
     role: string | null,
   ): Promise<void> {
-    if (role === null) return;
-    await client.query(`SET LOCAL ROLE "${role}"`);
+    // Least privilege AND a pinned search path (K-07): `"$user"` off the
+    // path, `pg_temp` last. The null-role early return that used to sit above
+    // this skipped the path pinning too — and the pinning is the part that
+    // matters even when no role is dropped into.
+    await enterMemoryRole(client, role);
   }
 
   async function inWriteTransaction<T>(

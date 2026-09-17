@@ -268,7 +268,18 @@ test("boot's recovery passes against a reachable but WEDGED database are refused
     await wedge.query("ROLLBACK");
     // Positive control: with the wedge gone, both passes complete.
     assert.equal(typeof (await service.reconcilePending()), "number");
-    assert.deepEqual(Object.keys(await service.completePendingErasures()).sort(), ["destroyed", "pending"]);
+    assert.deepEqual(Object.keys(await service.completePendingErasures()).sort(), [
+      // `notProven` and its reasons are what make an unprovable key
+      // distinguishable from a late one (founder decision, OPTION B), and
+      // `repaired`/`contradictions` are what make a detected forged
+      // `key_destroyed` row visible at all.
+      "contradictions",
+      "destroyed",
+      "notProven",
+      "notProvenReasons",
+      "pending",
+      "repaired",
+    ]);
   } finally {
     await wedge.query("ROLLBACK").catch(() => undefined);
     wedge.release();

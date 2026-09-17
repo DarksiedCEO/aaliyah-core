@@ -5276,6 +5276,427 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
     GRANT EXECUTE ON FUNCTION public.aaliyah_memory_unerased_merged_records(text, text, text)
       TO aaliyah_memory_mutator;`,
   },
+  {
+    // ------------------------------------------------------------------
+    // AN UNPROVABLE KEY IS UNRESOLVED, NOT ERASED — AND IT HAS A WAY OUT.
+    //
+    // Founder decision, OPTION B, locked: when a merged-in key cannot be
+    // authoritatively confirmed destroyed, the subject MUST NOT be
+    // represented as erased. Before this migration the store had only two
+    // answers, and both were wrong for that case:
+    //
+    //   - integration review of 8a0bf05, CRITICAL, executed (K-01): with
+    //     `piiKeys: null` — the ACTUAL production wiring at src/server.ts,
+    //     because no production KMS is provisioned — `state` is forced to
+    //     null, null is never 'destroyed', and every survivor of a merge
+    //     whose absorbed record ever carried a PII binding is refused
+    //     `merged_records_not_erased` PERMANENTLY, including erasure of the
+    //     survivor's OWN content, even when the merged-in key was genuinely
+    //     destroyed years ago with matching evidence;
+    //   - security review of 8a0bf05, LOW, undisclosed (K-09): the same
+    //     permanent refusal for a lost key or a provider migration, where the
+    //     store's provider answers `unknown`.
+    //
+    // A permanent refusal is not "fail closed". It is an unresolved state
+    // that lies about being a decision, with no operator path and — as both
+    // reviewers noted — no disclosure.
+    //
+    // THREE THINGS THIS ADDS, AND WHAT EACH IS FOR.
+    //
+    // 1. `memory_key_destruction_obligations` — the durable unresolved state.
+    //    KEY_DESTRUCTION_NOT_PROVEN is recorded per key, with WHY it could not
+    //    be proven, so "we do not know" is a row an operator can find rather
+    //    than a rejection an operator can only guess at. It never satisfies
+    //    anything.
+    //
+    // 2. `memory_key_destruction_settlements` — the bounded way out. NOT an
+    //    administrative bypass: a settlement is evidence-bound, scoped,
+    //    independently authorized, independently verified, replay-safe,
+    //    idempotent, versioned and immutable once written, and only its
+    //    PROVEN_DESTROYED decision may satisfy the key-destruction portion of
+    //    a verified erasure. STILL_UNKNOWN stays unresolved BY CONSTRUCTION:
+    //    it cannot produce destruction evidence, because the trigger below
+    //    refuses it.
+    //
+    //    No self-verification, as a CHECK and not as a convention: the
+    //    settling authority and the verifier are different principals, and a
+    //    row that names one principal as both is refused by the database.
+    //    A separate role owns the table, so the mutation role — which can
+    //    already write erasure evidence, which is why the provider is asked
+    //    at all — cannot settle anything.
+    //
+    // 3. `memory_pii_key_audits` — round-robin audit state, so the completion
+    //    pass's re-confirmation of historically destroyed keys is BOUNDED
+    //    (reliability review of 8a0bf05, HIGH, K-04: 150 seeded keys produced
+    //    exactly 150 provider calls on every pass, forever, and server.ts
+    //    awaits that pass before app.listen()). Ordering by least-recently
+    //    audited is what keeps it honest: a forged row cannot hide behind
+    //    volume the way it did when the audit shared one LIMIT with the
+    //    pending work (security review of 03581a3, F2).
+    //
+    // DATABASE EVIDENCE ALONE STILL DOES NOT SUBSTITUTE FOR PROOF. A
+    // `key_destroyed` row remains writable by the mutation role, which is
+    // exactly why the store asks the provider. A settlement-sourced row is
+    // DISTINGUISHABLE — it carries `settlement_receipt_id` — so an auditor can
+    // always tell a provider confirmation from a settled one, and the store
+    // treats them differently: the provider's own answer always wins, and a
+    // settlement stands in only where the provider structurally cannot answer.
+    // ------------------------------------------------------------------
+    id: "055_memory_key_destruction_settlement",
+    sql: `CREATE TABLE IF NOT EXISTS memory_key_destruction_settlements (
+      id bigserial PRIMARY KEY,
+      settlement_receipt_id text NOT NULL,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      subject_record_id text NOT NULL,
+      alias_id text NOT NULL,
+      key_ref text NOT NULL,
+      key_version integer NOT NULL,
+      provider_id text NOT NULL,
+      binding_mutation_receipt_id text NOT NULL,
+      erasure_authorization_id text NOT NULL,
+      erasure_tombstone_id text NOT NULL,
+      destruction_attempt_id text NOT NULL,
+      evidence jsonb NOT NULL,
+      evidence_digest text NOT NULL,
+      settlement_authority_id text NOT NULL,
+      verifier_principal_id text NOT NULL,
+      decision text NOT NULL,
+      policy_version text NOT NULL,
+      nonce text NOT NULL,
+      predecessor_state text NOT NULL,
+      successor_state text NOT NULL,
+      decided_at timestamptz NOT NULL,
+      recorded_at timestamptz NOT NULL DEFAULT now(),
+      -- The seven outcomes the founder decision enumerates. Only the first
+      -- may satisfy the key-destruction portion of a verified erasure.
+      CONSTRAINT memory_key_destruction_settlements_decision_domain
+        CHECK (decision IN ('PROVEN_DESTROYED','PROVEN_NOT_DESTROYED','STILL_UNKNOWN',
+                            'RETENTION_BLOCKED','PROVIDER_UNAVAILABLE',
+                            'EVIDENCE_INSUFFICIENT','CONTRADICTORY_EVIDENCE')),
+      -- NO SELF-VERIFICATION. Enforced here rather than trusted to a caller:
+      -- the whole point of a settlement is that someone other than the
+      -- settling authority checked the evidence.
+      CONSTRAINT memory_key_destruction_settlements_independent_verifier
+        CHECK (settlement_authority_id <> verifier_principal_id),
+      -- A settlement always MOVES a state, and never to the state it came from.
+      CONSTRAINT memory_key_destruction_settlements_state_transition
+        CHECK (predecessor_state <> successor_state),
+      -- A digest is a digest. Free text here would be a place for a subject's
+      -- address to survive a settlement.
+      CONSTRAINT memory_key_destruction_settlements_digest_shape
+        CHECK (evidence_digest ~ '^sha256:[0-9a-f]{64}$'),
+      -- IDEMPOTENT: replaying the same settlement receipt is the same row.
+      CONSTRAINT memory_key_destruction_settlements_receipt_unique
+        UNIQUE (settlement_receipt_id),
+      -- REPLAY-SAFE: a nonce is spent once per tenant, whatever it is aimed at.
+      CONSTRAINT memory_key_destruction_settlements_nonce_unique
+        UNIQUE (tenant_id, nonce),
+      -- ACTION-SPECIFIC: one settlement per key per erasure request, so a
+      -- single authorization cannot be reused to settle a second key.
+      CONSTRAINT memory_key_destruction_settlements_scope_unique
+        UNIQUE (tenant_id, workspace_id, key_ref, erasure_authorization_id)
+    );
+    -- IMMUTABLE AFTER COMPLETION. A settlement that could be rewritten is a
+    -- settlement that proves whatever the last writer wanted it to.
+    DROP TRIGGER IF EXISTS memory_key_destruction_settlements_append_only
+      ON memory_key_destruction_settlements;
+    CREATE TRIGGER memory_key_destruction_settlements_append_only
+      BEFORE UPDATE OR DELETE ON memory_key_destruction_settlements
+      FOR EACH ROW EXECUTE FUNCTION aaliyah_memory_forbid_row_rewrite();
+
+    -- A settlement must name a key that REALLY was erased under that tombstone
+    -- and really does belong to that provider and version. Otherwise a
+    -- settlement is a free-standing assertion about nothing, and "evidence
+    -- bound" is a word rather than a property.
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_settlement_binds_real_key()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      -- pg_temp LAST, EXPLICITLY: PostgreSQL searches it FIRST when it is
+      -- not named, and migration 048 ALTERs every aaliyah_* function to say
+      -- so. A later CREATE OR REPLACE carrying the older header silently
+      -- reverts that hardening — which is W1BR-014's whole class of defect,
+      -- and T-1 caught this exact revert in review.
+      SET search_path = pg_catalog, public, pg_temp
+      AS $fn$
+      BEGIN
+        PERFORM 1
+           FROM public.memory_alias_bindings AS b
+          WHERE b.tenant_id = NEW.tenant_id
+            AND b.workspace_id = NEW.workspace_id
+            AND b.mutation_receipt_id = NEW.binding_mutation_receipt_id
+            AND b.alias_id = NEW.alias_id
+            AND b.pii_key_ref = NEW.key_ref
+            AND b.canonical_participant_id = NEW.subject_record_id;
+        IF NOT FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a settlement must name a real binding of that subject, alias and key'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        PERFORM 1
+           FROM public.memory_pii_key_erasures AS c
+          WHERE c.tenant_id = NEW.tenant_id
+            AND c.workspace_id = NEW.workspace_id
+            AND c.key_ref = NEW.key_ref
+            AND c.provider_id = NEW.provider_id
+            AND c.tombstone_id = NEW.erasure_tombstone_id
+            AND c.event = 'erasure_committed';
+        IF NOT FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a settlement must name a key whose erasure actually committed under that tombstone'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_key_destruction_settlements_bound
+      ON memory_key_destruction_settlements;
+    CREATE TRIGGER memory_key_destruction_settlements_bound
+      AFTER INSERT ON memory_key_destruction_settlements
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_settlement_binds_real_key();
+
+    -- THE UNRESOLVED STATE, AS A ROW.
+    CREATE TABLE IF NOT EXISTS memory_key_destruction_obligations (
+      id bigserial PRIMARY KEY,
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      subject_record_id text NOT NULL,
+      alias_id text NOT NULL,
+      key_ref text NOT NULL,
+      provider_id text NOT NULL,
+      binding_mutation_receipt_id text NOT NULL,
+      erasure_tombstone_id text NOT NULL,
+      state text NOT NULL,
+      not_proven_reason text NOT NULL,
+      observations integer NOT NULL DEFAULT 1,
+      first_observed_at timestamptz NOT NULL DEFAULT now(),
+      last_observed_at timestamptz NOT NULL DEFAULT now(),
+      -- HOW an obligation stopped being unresolved. There are exactly two
+      -- ways, and conflating them was the first version's mistake: a
+      -- SETTLEMENT is the bounded operator path, and a PROVIDER answer is the
+      -- ordinary case where a transient outage ends and the completion pass
+      -- simply gets its answer. A ledger that could only record the first
+      -- would leave every provider-healed row sitting open forever, and an
+      -- operator could not tell a real unresolved state from a stale one.
+      resolved_by text,
+      settled_by text,
+      CONSTRAINT memory_key_destruction_obligations_state_domain
+        CHECK (state IN ('KEY_DESTRUCTION_NOT_PROVEN','PROVEN_DESTROYED','PROVEN_NOT_DESTROYED')),
+      CONSTRAINT memory_key_destruction_obligations_reason_domain
+        CHECK (not_proven_reason IN ('NO_PROVIDER_CONFIGURED','PROVIDER_UNAVAILABLE',
+                                     'PROVIDER_TIMEOUT','PROVIDER_DOES_NOT_OWN_KEY',
+                                     'PROVIDER_ANSWERED_UNKNOWN','CONTRADICTORY_EVIDENCE',
+                                     'SETTLED')),
+      -- An unresolved obligation names one key once. Observing it again bumps
+      -- the count; it does not accumulate rows nobody can reconcile.
+      CONSTRAINT memory_key_destruction_obligations_key_unique
+        UNIQUE (tenant_id, workspace_id, key_ref),
+      -- A row may not claim to be resolved without naming HOW, and a
+      -- settlement resolution must name WHICH settlement.
+      CONSTRAINT memory_key_destruction_obligations_resolution_named
+        CHECK (
+          (state = 'KEY_DESTRUCTION_NOT_PROVEN'
+             AND resolved_by IS NULL AND settled_by IS NULL)
+          OR (state <> 'KEY_DESTRUCTION_NOT_PROVEN'
+             AND resolved_by IN ('PROVIDER', 'SETTLEMENT')
+             AND (resolved_by = 'SETTLEMENT') = (settled_by IS NOT NULL))
+        )
+    );
+
+    -- ROUND-ROBIN AUDIT STATE. A key with no row here sorts ahead of every key
+    -- that has one, so a key never audited is always audited next.
+    CREATE TABLE IF NOT EXISTS memory_pii_key_audits (
+      tenant_id text NOT NULL,
+      workspace_id text NOT NULL,
+      key_ref text NOT NULL,
+      last_audited_at timestamptz NOT NULL DEFAULT now(),
+      last_state text NOT NULL,
+      audits integer NOT NULL DEFAULT 1,
+      PRIMARY KEY (tenant_id, workspace_id, key_ref),
+      CONSTRAINT memory_pii_key_audits_state_domain
+        CHECK (last_state IN ('active','destroyed','unknown','unreachable'))
+    );
+
+    -- A SETTLEMENT-SOURCED DESTRUCTION IS LABELLED AS ONE.
+    ALTER TABLE memory_pii_key_erasures
+      ADD COLUMN IF NOT EXISTS settlement_receipt_id text;
+
+    -- ... and it may only exist where a PROVEN_DESTROYED settlement for that
+    -- exact key exists. This is the clause that makes STILL_UNKNOWN unable to
+    -- become erased: there is no way to write destruction evidence from it.
+    CREATE OR REPLACE FUNCTION public.aaliyah_pii_key_erasure_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      -- pg_temp LAST, EXPLICITLY: PostgreSQL searches it FIRST when it is
+      -- not named, and migration 048 ALTERs every aaliyah_* function to say
+      -- so. A later CREATE OR REPLACE carrying the older header silently
+      -- reverts that hardening — which is W1BR-014's whole class of defect,
+      -- and T-1 caught this exact revert in review.
+      SET search_path = pg_catalog, public, pg_temp
+      AS $fn$
+      BEGIN
+        IF NEW.event = 'erasure_committed' THEN
+          IF NEW.settlement_receipt_id IS NOT NULL THEN
+            RAISE EXCEPTION
+              'aaliyah memory: a committed erasure is not settled evidence'
+              USING ERRCODE = 'check_violation';
+          END IF;
+          PERFORM 1 FROM public.memory_alias_bindings AS b
+           WHERE b.tenant_id = NEW.tenant_id
+             AND b.workspace_id = NEW.workspace_id
+             AND b.mutation_receipt_id = NEW.binding_mutation_receipt_id
+             AND b.alias_id = NEW.alias_id
+             AND b.pii_key_ref = NEW.key_ref
+             AND b.pii_erasure_tombstone_id = NEW.tombstone_id
+             AND b.pii_envelope IS NULL;
+          IF NOT FOUND THEN
+            RAISE EXCEPTION
+              'aaliyah memory: a committed erasure must name a binding erased under that tombstone and key'
+              USING ERRCODE = 'check_violation';
+          END IF;
+        ELSE
+          PERFORM 1 FROM public.memory_pii_key_erasures AS e
+           WHERE e.tenant_id = NEW.tenant_id
+             AND e.workspace_id = NEW.workspace_id
+             AND e.key_ref = NEW.key_ref
+             AND e.tombstone_id = NEW.tombstone_id
+             AND e.event = 'erasure_committed';
+          IF NOT FOUND THEN
+            RAISE EXCEPTION
+              'aaliyah memory: a key is recorded destroyed only after its erasure committed'
+              USING ERRCODE = 'check_violation';
+          END IF;
+          IF NEW.settlement_receipt_id IS NOT NULL THEN
+            PERFORM 1 FROM public.memory_key_destruction_settlements AS s
+             WHERE s.settlement_receipt_id = NEW.settlement_receipt_id
+               AND s.tenant_id = NEW.tenant_id
+               AND s.workspace_id = NEW.workspace_id
+               AND s.key_ref = NEW.key_ref
+               AND s.provider_id = NEW.provider_id
+               AND s.decision = 'PROVEN_DESTROYED';
+            IF NOT FOUND THEN
+              RAISE EXCEPTION
+                'aaliyah memory: settled destruction evidence needs a PROVEN_DESTROYED settlement for that exact key'
+                USING ERRCODE = 'check_violation';
+            END IF;
+          END IF;
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+
+    -- A SETTLER IS NOT A MUTATOR. The mutation role can already write erasure
+    -- evidence — that is the whole reason the provider is asked — so it must
+    -- not also be able to write the artifact that stands in for the provider.
+    DO $do$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aaliyah_memory_settler') THEN
+        CREATE ROLE aaliyah_memory_settler NOLOGIN;
+      END IF;
+    END
+    $do$;
+
+    -- ---- GRANTS: EXACTLY WHAT THE CODE USES, AND NOTHING NEAR IT --------
+    -- Security review F5 (K-17) confirmed by execution that the existing
+    -- grants were wider than the callers needed. These are written against
+    -- the call sites rather than against the tables: the mutation role runs
+    -- the store's proof and completion passes, the read-back role serves
+    -- listKeyDestructionObligations, and the settler runs settlement. No
+    -- role gets a table it never names.
+
+    -- The store asks, under the MUTATION role, whether a settlement proves a
+    -- key it could not ask the provider about. It reads settlements; it can
+    -- never write one.
+    GRANT SELECT ON memory_key_destruction_settlements TO aaliyah_memory_mutator;
+    -- Only the settler writes settlements, and it must read them back for
+    -- idempotency.
+    GRANT SELECT, INSERT ON memory_key_destruction_settlements
+      TO aaliyah_memory_settler;
+    GRANT USAGE, SELECT ON SEQUENCE memory_key_destruction_settlements_id_seq
+      TO aaliyah_memory_settler;
+    -- The destruction evidence a PROVEN_DESTROYED settlement produces. The
+    -- settler needs SELECT alongside INSERT for the ON CONFLICT path.
+    GRANT SELECT, INSERT ON memory_pii_key_erasures TO aaliyah_memory_settler;
+    GRANT USAGE, SELECT ON SEQUENCE memory_pii_key_erasures_id_seq
+      TO aaliyah_memory_settler;
+    -- The obligation ledger: the store records what it could not prove, the
+    -- settler closes rows out, and the SELECT-only read-back role lists them
+    -- for an operator.
+    GRANT SELECT, INSERT ON memory_key_destruction_obligations
+      TO aaliyah_memory_mutator;
+    GRANT UPDATE (state, not_proven_reason, observations, last_observed_at,
+                  resolved_by, settled_by)
+      ON memory_key_destruction_obligations TO aaliyah_memory_mutator;
+    GRANT SELECT ON memory_key_destruction_obligations
+      TO aaliyah_memory_reader, aaliyah_memory_settler;
+    GRANT UPDATE (state, not_proven_reason, resolved_by, settled_by, last_observed_at)
+      ON memory_key_destruction_obligations TO aaliyah_memory_settler;
+    GRANT USAGE, SELECT ON SEQUENCE memory_key_destruction_obligations_id_seq
+      TO aaliyah_memory_mutator;
+    -- Round-robin audit state, maintained only by the pass that audits.
+    GRANT SELECT, INSERT ON memory_pii_key_audits TO aaliyah_memory_mutator;
+    GRANT UPDATE (last_audited_at, last_state, audits) ON memory_pii_key_audits
+      TO aaliyah_memory_mutator`,
+  },
+  {
+    // ------------------------------------------------------------------
+    // PUBLIC EXECUTE ON A SECURITY DEFINER FUNCTION IS A READ PRIMITIVE.
+    //
+    // Security review of 8a0bf05, F4, CONFIRMED by execution (K-16): with
+    // `proacl` NULL, EXECUTE is PUBLIC by default, and two SECURITY DEFINER
+    // helpers return data rather than a trigger. A role created with NO GRANTS
+    // AT ALL (atk_outsider) called them and got:
+    //
+    //   aaliyah_memory_restricting_hold  -> 'hold-secret-matter-777', the hold
+    //                                       id for a held participant, while
+    //                                       SELECT on memory_legal_holds was
+    //                                       denied;
+    //   aaliyah_memory_spent_nonce       -> the full nonce row for a known
+    //                                       (tenant, authorization, receipt)
+    //                                       triple — action, target record id,
+    //                                       binding digest, consumed_at —
+    //                                       while SELECT on the nonce table
+    //                                       was denied.
+    //
+    // Rated LOW because it needs a database login and known or guessed ids.
+    // It is still a SECURITY DEFINER function handing rows to a principal the
+    // table privileges refuse, which is the definition of a privilege boundary
+    // that is not where it is documented to be.
+    //
+    // WHO ACTUALLY NEEDS THEM, from the call sites rather than from the tables:
+    //   - `aaliyah_memory_restricting_hold` is called directly by the trusted
+    //     memory store under the MUTATION role and by the legal-hold store's
+    //     read path under the READER role;
+    //   - `aaliyah_memory_spent_nonce` is called from nowhere but inside other
+    //     SECURITY DEFINER guards, which run as the function OWNER and so need
+    //     no grant at all. No memory role gets it.
+    //
+    // Also here: security review F5, CONFIRMED by execution (K-17). The
+    // reconciler's SELECT on `memory_alias_blind_indexes` and
+    // `memory_pii_key_erasures`, and the issuer's and revoker's SELECT on
+    // bindings, blind indexes and key erasures, were revoked and the suites
+    // ran 266/266. No runtime code in src/ uses the issuer or revoker roles at
+    // all. The reconciler keeps its erasure SELECT: it resolves alias
+    // mutations and reads that evidence.
+    //
+    // And the new settlement guard, revoked from PUBLIC for the same reason as
+    // every other trigger function — it returns `trigger` and cannot be called
+    // usefully, but "cannot be called usefully today" is not a boundary.
+    // ------------------------------------------------------------------
+    id: "056_memory_least_privilege_trim",
+    sql: `REVOKE ALL ON FUNCTION public.aaliyah_memory_restricting_hold(text, text, text, text, text)
+      FROM PUBLIC;
+    GRANT EXECUTE ON FUNCTION public.aaliyah_memory_restricting_hold(text, text, text, text, text)
+      TO aaliyah_memory_mutator, aaliyah_memory_reader, aaliyah_memory_hold_officer;
+    REVOKE ALL ON FUNCTION public.aaliyah_memory_spent_nonce(text, text, text) FROM PUBLIC;
+    REVOKE ALL ON FUNCTION public.aaliyah_memory_settlement_binds_real_key() FROM PUBLIC;
+
+    REVOKE SELECT ON memory_alias_blind_indexes FROM aaliyah_memory_reconciler;
+    REVOKE SELECT ON memory_alias_bindings, memory_alias_blind_indexes, memory_pii_key_erasures
+      FROM aaliyah_memory_issuer, aaliyah_memory_revoker`,
+  },
 ];
 
 /**

@@ -304,7 +304,17 @@ test("POSITIVE CONTROL: bare concurrent CREATE TABLE IF NOT EXISTS really does c
 for (const concurrency of [2, 3, 5]) {
   test(`${concurrency} concurrent migrators on a FRESH database ALL fulfil, and the ledger is applied exactly once`, async () => {
     await withFreshDatabase(`n${concurrency}`, async (url) => {
-      const pools = Array.from({ length: concurrency }, () => new Pool({ connectionString: url, max: 2 }));
+      const pools = Array.from({ length: concurrency }, () => {
+        const pool = new Pool({ connectionString: url, max: 2 });
+        // `pool.end()` can resolve before every socket has finished closing,
+        // and the NEXT case's `DROP DATABASE ... WITH (FORCE)` then terminates
+        // the leftovers — which arrives as a stray `error` event on an
+        // already-ended pool and, with no listener, as an uncaught throw
+        // attributed to whichever test happens to be running. src/ handles
+        // this with `guardPoolErrors`; these bare test pools need the same.
+        pool.on("error", () => undefined);
+        return pool;
+      });
       try {
         const results = await Promise.allSettled(pools.map((p) => runMailMigrations(p)));
         const rejected = results.filter((r) => r.status === "rejected");
@@ -314,6 +324,7 @@ for (const concurrency of [2, 3, 5]) {
           "no migrator may be crashed by another migrator",
         );
         const check = new Pool({ connectionString: url, max: 1 });
+        check.on("error", () => undefined);
         try {
           const ledger = await check.query(
             `SELECT count(*)::int AS n, count(DISTINCT id)::int AS d FROM aaliyah_mail_migrations`,

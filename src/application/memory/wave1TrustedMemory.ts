@@ -14,6 +14,12 @@ import {
 } from "@aaliyah/contracts/v1";
 import { z } from "zod";
 
+import type {
+  KeyDestructionObligation,
+  KeyDestructionSettlementRequest,
+  KeyDestructionSettlementResult,
+} from "./wave1KeyDestruction";
+
 /**
  * Wave 1.3 TRUSTED MEMORY — the Core-side vocabulary.
  *
@@ -164,6 +170,39 @@ export const TRUSTED_MEMORY_REJECTIONS = [
    * let the second's evidence collide with — or be read as — the first's.
    */
   "mutation_receipt_id_reused",
+  /**
+   * AN IN-SCOPE DATA KEY'S DESTRUCTION COULD NOT BE PROVEN, so this subject
+   * is not erased — and is not refused forever either.
+   *
+   * Founder decision, OPTION B. Distinct from `merged_records_not_erased` on
+   * purpose, and the distinction is the whole finding: that reason means a
+   * merged-in record is GENUINELY still unerased, which the completion pass
+   * resolves on its own. This one means every in-scope erasure did commit and
+   * we CANNOT ESTABLISH what happened to a key — no provider is configured,
+   * the provider does not own the key, it is unreachable, or it answered
+   * `unknown`. Collapsing the two made a permanent, unrecoverable, undisclosed
+   * refusal look like an ordinary "not yet" (integration review of 8a0bf05,
+   * CRITICAL, K-01; security review, K-09).
+   *
+   * The state behind it is `ERASURE_PENDING_SETTLEMENT`, recorded per key with
+   * the reason it could not be proven, and resolvable only by an
+   * evidence-bound, independently verified settlement. It NEVER becomes
+   * `ERASED` through elapsed time, a spent retry budget, an absent provider or
+   * a database row.
+   */
+  "key_destruction_not_proven",
+  /**
+   * A new in-scope key appeared between proving the keys and committing.
+   *
+   * The provider is asked OUTSIDE the mutation transaction, because asking it
+   * inside one held a pool slot for the provider's full latency and exhausted
+   * the write pool for every tenant (reliability review of 8a0bf05, CRITICAL,
+   * K-02). The transaction therefore re-reads the in-scope key set under the
+   * record's lock and refuses if it grew: a key nobody asked about must never
+   * pass for a key that answered. Transient by construction — nothing was
+   * consumed and nothing was written, and a retry proves the new key.
+   */
+  "merged_keys_changed_during_proof",
 ] as const;
 export type TrustedMemoryRejection = (typeof TRUSTED_MEMORY_REJECTIONS)[number];
 
@@ -246,6 +285,21 @@ export type TrustedMemoryDeleteResult = TrustedMemoryMutationResult & {
     bindingsErased: number;
     keysDestroyed: number;
     keysPending: number;
+    /**
+     * OF THE PENDING KEYS, HOW MANY ARE NOT MERELY LATE BUT UNPROVABLE by this
+     * process — and why. `keysPending` counts both; a key whose provider is
+     * simply slow is resolved by the next completion pass, and a key in
+     * `notProven` is not resolved by any number of passes.
+     *
+     * Non-zero here means the subject's state is
+     * `ERASURE_PENDING_SETTLEMENT`: NOT erased, and waiting on a settlement
+     * rather than on a retry. Surfaced so a caller can tell the two apart
+     * instead of watching a counter that never moves (integration review of
+     * 8a0bf05, K-01).
+     */
+    keysNotProven: number;
+    /** The reason for each unprovable key, keyed by reason. No key material. */
+    notProvenReasons: Record<string, number>;
   } | null;
 };
 
@@ -297,8 +351,58 @@ export interface TrustedMemoryStore {
    */
   completePendingAliasErasures(limit?: number): Promise<{
     destroyed: number;
+    /**
+     * Keys whose `key_destroyed` evidence was a FORGERY — the provider said
+     * the key was alive — which this pass then destroyed for real. Counted
+     * apart from `destroyed` because the forged row already occupies the
+     * evidence slot, so the insert conflicts and `destroyed` cannot see it.
+     */
+    repaired: number;
+    /** Contradictions seen between the evidence and the provider. */
+    contradictions: number;
     pending: number;
+    /**
+     * Of `pending`, how many are UNPROVABLE rather than late, and why.
+     *
+     * Reported so a caller — including `src/server.ts` at boot — can tell a
+     * provider that is temporarily slow from a key no pass will ever resolve.
+     * Without it, `{destroyed:0, pending:1}` was the only signal, forever,
+     * with nothing naming the cause (integration review of 8a0bf05, K-01;
+     * security review, K-09).
+     */
+    notProven: number;
+    notProvenReasons: Record<string, number>;
   }>;
+  /**
+   * SETTLE one key's destruction on evidence — the bounded way out of
+   * `ERASURE_PENDING_SETTLEMENT`, and the ONLY way out that does not require
+   * the provider to answer.
+   *
+   * NOT an administrative bypass. The database enforces what the founder
+   * decision requires and this signature cannot: that the settling authority
+   * and the verifier are different principals, that the settlement names a
+   * real binding and a really-committed erasure, that its nonce is spent once,
+   * that its receipt id is idempotent, and that it is immutable afterwards.
+   * The store adds the one check the database cannot make — that the stored
+   * digest really is the digest of the stored evidence.
+   *
+   * Only `PROVEN_DESTROYED` satisfies the key-destruction portion of a
+   * verified erasure. No settlement fabricates a provider answer: a settlement
+   * is its own, separately labelled artifact, and destruction evidence written
+   * from one carries its receipt id so an auditor can always tell the two
+   * apart.
+   */
+  settleKeyDestruction(
+    request: KeyDestructionSettlementRequest,
+  ): Promise<KeyDestructionSettlementResult>;
+  /**
+   * The unresolved obligations, so "we cannot prove this key is gone" is
+   * something an operator can list rather than infer from a rejection.
+   */
+  listKeyDestructionObligations(input: {
+    actor: TrustedMemoryActor;
+    limit?: number;
+  }): Promise<KeyDestructionObligation[]>;
   /**
    * Return a deleted record to an active state under a SEPARATE `restore`
    * authorization. It does NOT return the destroyed payload — that is gone,

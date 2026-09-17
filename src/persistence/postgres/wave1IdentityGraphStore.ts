@@ -1,4 +1,5 @@
 import type { Pool } from "pg";
+import { enterMemoryRole } from "./pool";
 
 import {
   createWave1MemoryService,
@@ -39,9 +40,11 @@ export function createPostgresIdentityGraph(
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
-        if (readerRole !== null) {
-          await client.query(`SET LOCAL ROLE "${readerRole}"`);
-        }
+        // Least privilege AND a pinned search path (K-07): `"$user"` off the
+        // path, `pg_temp` last. Called UNCONDITIONALLY — the null-role guard
+        // that used to wrap this skipped the path pinning too, which is the
+        // one part that matters even when no role is dropped into.
+        await enterMemoryRole(client, readerRole);
         const result = await client.query(
           `SELECT to_record_id
              FROM memory_identity_edges
