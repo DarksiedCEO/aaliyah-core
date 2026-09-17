@@ -443,6 +443,13 @@ test("executor throw and ambiguous result never report success", async () => {
 });
 
 test("execution remains unsuccessful until independent read-back verifies it", async () => {
+  // ONE clock reading. The verifier used to stamp `verifiedAt` with a fresh
+  // Date AFTER `nowMs` was read, so whenever the millisecond ticked in between,
+  // the receipt was 1ms "from the future" and correctly refused — an
+  // intermittent failure seen twice under load during W1.3 freezes (3ba769f,
+  // 94daf48). The receipt is now one second old by construction.
+  const nowMs = Date.now();
+  const verifiedAtMs = nowMs - 1_000;
   const executor = async (_candidate: unknown, options: {
     taskId: string;
     idempotencyKey: string;
@@ -478,7 +485,7 @@ test("execution remains unsuccessful until independent read-back verifies it", a
     createdAt: "2026-04-18T12:00:00.000Z",
   };
   await assert.rejects(
-    () => verifyPostconditions(task, result, { nowMs: Date.now() }),
+    () => verifyPostconditions(task, result, { nowMs }),
     /postcondition_verifier_unavailable/,
   );
 
@@ -494,11 +501,11 @@ test("execution remains unsuccessful until independent read-back verifies it", a
     externalRefs: ["provider:receipt-1"],
     verifierId: "test-readback",
     verificationMethod: "independent_readback",
-    verifiedAt: new Date().toISOString(),
+    verifiedAt: new Date(verifiedAtMs).toISOString(),
     reason: "read-back mismatch",
   });
   await assert.rejects(
-    () => verifyPostconditions(task, result, { nowMs: Date.now() }, mismatchVerifier),
+    () => verifyPostconditions(task, result, { nowMs }, mismatchVerifier),
     /Invalid input/,
   );
 
@@ -514,10 +521,10 @@ test("execution remains unsuccessful until independent read-back verifies it", a
     externalRefs: ["provider:different-receipt"],
     verifierId: "test-readback",
     verificationMethod: "independent_readback",
-    verifiedAt: new Date().toISOString(),
+    verifiedAt: new Date(verifiedAtMs).toISOString(),
   });
   await assert.rejects(
-    () => verifyPostconditions(task, result, { nowMs: Date.now() }, partialVerifier),
+    () => verifyPostconditions(task, result, { nowMs }, partialVerifier),
     /postcondition_verification_ref_coverage_invalid/,
   );
 
@@ -533,10 +540,10 @@ test("execution remains unsuccessful until independent read-back verifies it", a
     externalRefs: ["provider:receipt-1"],
     verifierId: "test-readback",
     verificationMethod: "independent_readback",
-    verifiedAt: new Date().toISOString(),
+    verifiedAt: new Date(verifiedAtMs).toISOString(),
   });
   assert.equal(
-    (await verifyPostconditions(task, result, { nowMs: Date.now() }, exactVerifier)).verified,
+    (await verifyPostconditions(task, result, { nowMs }, exactVerifier)).verified,
     true,
   );
 
@@ -545,7 +552,7 @@ test("execution remains unsuccessful until independent read-back verifies it", a
     verifierId: result.executorId,
   });
   await assert.rejects(
-    () => verifyPostconditions(task, result, { nowMs: Date.now() }, selfVerifier),
+    () => verifyPostconditions(task, result, { nowMs }, selfVerifier),
     /verifier must be independent from executor/,
   );
 
@@ -554,7 +561,7 @@ test("execution remains unsuccessful until independent read-back verifies it", a
     taskId: "550e8400-e29b-41d4-a716-446655440999",
   });
   await assert.rejects(
-    () => verifyPostconditions(task, result, { nowMs: Date.now() }, forgedVerifier),
+    () => verifyPostconditions(task, result, { nowMs }, forgedVerifier),
     /postcondition_verification_binding_invalid/,
   );
 
@@ -563,7 +570,7 @@ test("execution remains unsuccessful until independent read-back verifies it", a
     verifiedAt: "2020-01-01T00:00:00.000Z",
   });
   await assert.rejects(
-    () => verifyPostconditions(task, result, { nowMs: Date.now() }, staleVerifier),
+    () => verifyPostconditions(task, result, { nowMs }, staleVerifier),
     /postcondition_verification_receipt_stale/,
   );
 });

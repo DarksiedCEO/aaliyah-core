@@ -998,3 +998,10 @@ The confirming sweep's duplicate verdicts also surfaced two real survivors, G-13
 - **Process:** the implementer ran `git checkout -- src/persistence/postgres/migrations.ts` in the implementation worktree to revert its own uncommitted, never-committed `through` option. No other change was in that file, and no work was lost. This still violates the worktree doctrine, and it is recorded here.
 
 **Freeze of `3569122`: FAIL, 1007/1008.** The new privilege test's positive control changed a GRANT on a shared table without the suite's shared memory-table lock, and collided with another file's catalog change ("tuple concurrently updated"). This was a defect in the test, not load. The descendant takes the lock for that control. At `3569122` all 22 targeted mutants were KILLED: G-01..G-19 by the privilege map alone, plus H-01 (audit under the batch limit), H-02 (audit removed) and H-03 (TS_NODE_* inherited).
+
+**Freeze of `94daf48`: FAIL, 1007/1008.**
+- **Failure:** `decision-engine.test.ts` "execution remains unsuccessful until independent read-back verifies it", with `postcondition_verification_receipt_from_future`. The same test failed in the first `3ba769f` attempt.
+- **Why:** the test read `nowMs` and then had the verifier stamp `verifiedAt` with a fresh clock reading. Whenever the millisecond ticked between the two, the receipt was correctly refused as 1 ms in the future.
+- **Nature:** a pre-existing time race in a W1.1 test, not W1.3 code and not clock skew. Skew during that run was 10–19 ms.
+- **Fix:** the descendant derives both timestamps from one reading, with the receipt one second old. The contract check is unchanged.
+- **Other gates:** release guards PASS; 22/22 targeted mutants KILLED at `94daf48`.
