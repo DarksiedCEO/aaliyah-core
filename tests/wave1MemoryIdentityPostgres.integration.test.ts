@@ -25,6 +25,7 @@ import {
   lockSharedMemoryTables,
   type SharedTableLock,
 } from "./support/sharedMemoryTables";
+import { assertUniqueIndexKills } from "./support/uniquenessDestroyer";
 
 /**
  * IDENTITY MERGE AND SPLIT, AGAINST A REAL DATABASE.
@@ -959,11 +960,11 @@ test("a written identity edge cannot be rewritten or deleted, by anyone", async 
       adminPool.query(
         `UPDATE memory_identity_edges SET to_record_id = 'record-identity-third'`,
       ),
-    /append-only|forbid|rewrite/i,
+    /UPDATE on memory_identity_edges is forbidden; this table is append-only/,
   );
   await assert.rejects(
     () => adminPool.query(`DELETE FROM memory_identity_edges`),
-    /append-only|forbid|rewrite/i,
+    /DELETE on memory_identity_edges is forbidden; this table is append-only/,
   );
   assert.equal((await edgesFor(ALIAS_OF_ALICE)).length, 1);
 });
@@ -1642,4 +1643,194 @@ test("C4-4 the scope binding is attached, enabled, and last-firing on every tabl
         AND t.tgname = 'memory_alias_bindings_removal_authorization_scope'`,
   );
   assert.equal(removal.rows[0]?.tgenabled, "O");
+});
+
+test("U-2 both identity-edge unique indexes refuse the one duplicate each exists for", async () => {
+  await createRecord(ALICE, { name: "Alice" });
+  const absorbed = await createRecord(ALIAS_OF_ALICE, { name: "A. Smith" });
+  const { result } = await runIdentity({
+    action: "merge_identity",
+    targetRecordId: ALIAS_OF_ALICE,
+    headVersion: 1,
+    headDigest: absorbed,
+    order: mergeOrder(ALICE),
+    mutationReceiptId: "mutation.unique.edge",
+  });
+  assert.equal(result.verified, true);
+  await createRecord("record-identity-third", { name: "Third" });
+
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_identity_edges",
+    index: "memory_identity_edges_merged_once",
+    where: "mutation_receipt_id = $1",
+    params: ["mutation.unique.edge"],
+    freshen: () => ({ mutation_receipt_id: "mutation.unique.edge.dup", to_record_id: "record-identity-third", payload: { toRecordId: "record-identity-third" } }),
+    positive: () => ({
+      mutation_receipt_id: "mutation.unique.edge.dup",
+      from_record_id: "record-identity-third",
+      payload: { fromRecordId: "record-identity-third" },
+    }),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_identity_edges",
+    index: "memory_identity_edges_receipt_unique",
+    where: "mutation_receipt_id = $1",
+    params: ["mutation.unique.edge"],
+    // A SPLIT edge from another record: neither the merged-once index nor the
+    // self-edge check can be what refuses it.
+    freshen: () => ({
+      kind: "split_to",
+      from_record_id: "record-identity-third",
+      payload: { kind: "split_to", fromRecordId: "record-identity-third" },
+    }),
+    positive: () => ({
+      kind: "split_to",
+      from_record_id: "record-identity-third",
+      mutation_receipt_id: "mutation.unique.edge.dup",
+      payload: { kind: "split_to", fromRecordId: "record-identity-third" },
+    }),
+  });
+});
+
+test("C6 M4: every identity-edge payload binding refuses an ABSENT and a NULL member, not only a different one", async () => {
+  // Executed against b3efc82: `CHECK (payload ->> 'kind' = kind)` passed for a
+  // payload with no `kind`, and for `kind: null`.
+  const bob = "record-identity-bob";
+  const alice = await createRecord(ALICE, { name: "Alice" });
+  await createRecord(bob, { name: "Bob" });
+  const authorizationId = await spendAuthorization({
+    action: "merge_identity",
+    targetRecordId: ALICE,
+    expectedHead: { kind: "version", version: 1, contentDigest: alice },
+    proposedContent: mergeOrder(bob),
+    mutationReceiptId: "mutation.c6.bindings",
+  });
+  const full = {
+    kind: "merged_into",
+    fromRecordId: ALICE,
+    toRecordId: bob,
+    authorizationId,
+  };
+  const insertWith = (payload: Record<string, unknown>) =>
+    runAs(
+      "aaliyah_memory_mutator",
+      `INSERT INTO memory_identity_edges
+         (tenant_id, workspace_id, principal_id, user_id, kind,
+          from_record_id, to_record_id, from_version, authorization_id,
+          mutation_receipt_id, reason, reason_evidence_ref, effective_at,
+          payload)
+       VALUES ($1,$2,$3,$4,'merged_into',$5,$6,2,$7,'mutation.c6.bindings',
+               'duplicate_participant','matter:identity-merge/0006', now(), $8)`,
+      [
+        SCOPE.tenantId,
+        SCOPE.workspaceId,
+        SCOPE.principalId,
+        SCOPE.userId,
+        ALICE,
+        bob,
+        authorizationId,
+        JSON.stringify(payload),
+      ],
+    );
+  const members: Array<[keyof typeof full, string]> = [
+    ["kind", "memory_identity_edges_kind_binding"],
+    ["fromRecordId", "memory_identity_edges_from_binding"],
+    ["toRecordId", "memory_identity_edges_to_binding"],
+    ["authorizationId", "memory_identity_edges_authorization_binding"],
+  ];
+  for (const [member, constraint] of members) {
+    const absent: Record<string, unknown> = { ...full };
+    delete absent[member];
+    await assert.rejects(() => insertWith(absent), new RegExp(constraint));
+    await assert.rejects(() => insertWith({ ...full, [member]: null }), new RegExp(constraint));
+  }
+  // Positive control: the complete payload passes every binding and lands.
+  await insertWith(full);
+  assert.equal((await edgesFor(ALICE)).length, 1);
+});
+
+test("C4-5 the scope binding refuses a mismatch in ONE dimension at a time: principal, user, workspace", async () => {
+  // Each dimension is its own conjunct in the trigger; a test that changed
+  // principal and user together could not tell whether either was checked.
+  const cases: Array<[string, MemoryScope]> = [
+    ["principal", { ...SCOPE, principalId: "principal-only-other" }],
+    ["user", { ...SCOPE, userId: "user-only-other" }],
+    ["workspace", { ...SCOPE, workspaceId: "workspace-only-other" }],
+  ];
+  for (const [dimension, authorizationScope] of cases) {
+    const target = `record-identity-scope-${dimension}`;
+    const digest = await createRecord(target, { name: dimension });
+    const authorizationId = await spendScoped({
+      scope: authorizationScope,
+      action: "correct",
+      targetRecordId: target,
+      expectedHead: { kind: "version", version: 1, contentDigest: digest },
+      proposedContent: { name: dimension, edited: true },
+      mutationReceiptId: `mutation.c4.dimension.${dimension}`,
+    });
+    await assert.rejects(
+      () =>
+        runAs(
+          "aaliyah_memory_mutator",
+          `INSERT INTO memory_record_versions
+             (tenant_id, workspace_id, principal_id, user_id, record_id, version,
+              state, content_digest, predecessor_digest, authorization_id,
+              mutation_receipt_id, payload)
+           VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,2,'active',
+                   $6::text,$7::text,$8::text,$9::text,
+                   jsonb_build_object(
+                     'recordId',$5::text,'version','2','state','active',
+                     'contentDigest',$6::text,'predecessorDigest',$7::text,
+                     'authorizationId',$8::text,
+                     'mutationReceiptId',$9::text,
+                     'scope', jsonb_build_object('tenantId',$1::text,
+                                                 'workspaceId',$2::text,
+                                                 'principalId',$3::text,
+                                                 'userId',$4::text)))`,
+          [
+            SCOPE.tenantId,
+            SCOPE.workspaceId,
+            SCOPE.principalId,
+            SCOPE.userId,
+            target,
+            memoryContentDigest({ name: dimension, edited: true }),
+            digest,
+            authorizationId,
+            `mutation.c4.dimension.${dimension}`,
+          ],
+        ),
+      /a memory_record_versions row must carry the scope of the authorization that witnesses it/,
+      `a ${dimension}-only mismatch was accepted`,
+    );
+  }
+});
+
+test("C4-6 an edge's FROM owner is checked on principal AND user independently", async () => {
+  for (const [dimension, ownerScope] of [
+    ["principal", { ...SCOPE, principalId: "principal-owner-other" }],
+    ["user", { ...SCOPE, userId: "user-owner-other" }],
+  ] as Array<[string, MemoryScope]>) {
+    const foreignRecord = `record-identity-owner-${dimension}`;
+    const mine = `record-identity-mine-${dimension}`;
+    const foreignDigest = await createRecord(foreignRecord, { name: dimension }, ownerScope);
+    await createRecord(mine, { name: "mine" });
+    const authorizationId = await spendScoped({
+      scope: SCOPE,
+      action: "merge_identity",
+      targetRecordId: foreignRecord,
+      expectedHead: { kind: "version", version: 1, contentDigest: foreignDigest },
+      proposedContent: mergeOrder(mine),
+      mutationReceiptId: `mutation.c4.owner.${dimension}`,
+    });
+    await assert.rejects(
+      () =>
+        runAs(
+          "aaliyah_memory_mutator",
+          RAW_EDGE_SQL,
+          scopedEdgeParams(SCOPE, foreignRecord, mine, authorizationId, `mutation.c4.owner.${dimension}`),
+        ),
+      /an identity edge may only leave a record its owner holds/,
+      `a ${dimension}-only owner mismatch was accepted`,
+    );
+  }
 });

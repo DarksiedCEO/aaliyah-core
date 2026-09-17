@@ -4100,6 +4100,39 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       AFTER INSERT ON memory_reconciliations
       FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_reconciliation_derivable()`,
   },
+  {
+    // ------------------------------------------------------------------
+    // THE IDENTITY-EDGE PAYLOAD BINDINGS WERE VACUOUS AGAINST A NULL MEMBER.
+    //
+    // Red team M4 against b3efc82. Migration 041 wrote four bindings as
+    // `CHECK (payload ->> 'x' = col)`. A CHECK passes when its expression is
+    // NULL, and `payload ->> 'x'` is NULL when the member is absent or JSON
+    // null — so an edge whose payload omitted `kind`, `fromRecordId`,
+    // `toRecordId` or `authorizationId` satisfied the binding it claimed to
+    // carry. Executed: both an absent and a null `kind` passed. Every
+    // equivalent binding on the other memory tables carries the
+    // `IS NOT NULL AND` prefix; these four did not, on the table W1.3 itself
+    // introduced. Re-created with it.
+    // ------------------------------------------------------------------
+    id: "046_memory_identity_edge_bindings_not_vacuous",
+    sql: `ALTER TABLE memory_identity_edges
+      DROP CONSTRAINT IF EXISTS memory_identity_edges_kind_binding,
+      DROP CONSTRAINT IF EXISTS memory_identity_edges_from_binding,
+      DROP CONSTRAINT IF EXISTS memory_identity_edges_to_binding,
+      DROP CONSTRAINT IF EXISTS memory_identity_edges_authorization_binding;
+    ALTER TABLE memory_identity_edges
+      ADD CONSTRAINT memory_identity_edges_kind_binding
+        CHECK (payload ->> 'kind' IS NOT NULL AND payload ->> 'kind' = kind),
+      ADD CONSTRAINT memory_identity_edges_from_binding
+        CHECK (payload ->> 'fromRecordId' IS NOT NULL
+               AND payload ->> 'fromRecordId' = from_record_id),
+      ADD CONSTRAINT memory_identity_edges_to_binding
+        CHECK (payload ->> 'toRecordId' IS NOT NULL
+               AND payload ->> 'toRecordId' = to_record_id),
+      ADD CONSTRAINT memory_identity_edges_authorization_binding
+        CHECK (payload ->> 'authorizationId' IS NOT NULL
+               AND payload ->> 'authorizationId' = authorization_id)`,
+  },
 ];
 
 /**

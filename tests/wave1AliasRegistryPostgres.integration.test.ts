@@ -44,6 +44,7 @@ import {
   lockSharedMemoryTables,
   type SharedTableLock,
 } from "./support/sharedMemoryTables";
+import { assertUniqueIndexKills } from "./support/uniquenessDestroyer";
 
 /**
  * Wave 1.3 Part D — THE AUTHORITATIVE ALIAS REGISTRY, against a REAL
@@ -3759,4 +3760,97 @@ test("C4-A a binding cannot be RETIRED under an authorization issued to another 
     /may only be retired under the scope of the authorization that retires it/,
   );
   assert.equal(await activeBindings(), 1);
+});
+
+test("U-4 every alias-binding and protected-domain unique index refuses the one duplicate it exists for", async () => {
+  await protectDomain(SCOPE, "acme-unique.example");
+  await bindThen("alias-unique-active", "ceo@example.com", VICTIM, "mutation.unique.alias.active");
+  // A retired binding, for the removal-receipt index.
+  // A second participant: `bindThen` seeds its participant's genesis.
+  const retired = await bindThen("alias-unique-retired", "cfo@example.com", "record-alias-unique-second", "mutation.unique.alias.retired");
+  assert.equal(typeof retired.headDigest, "string");
+  await adminPool.query(`ALTER TABLE memory_alias_bindings DISABLE TRIGGER USER`);
+  try {
+    await adminPool.query(
+      `UPDATE memory_alias_bindings
+          SET removed_at = now(), removed_by_mutation_receipt_id = 'mutation.unique.alias.removal',
+              removed_authorization_id = 'auth-unique-removal-0000000'
+        WHERE alias_id = 'alias-unique-retired'`,
+    );
+  } finally {
+    await adminPool.query(`ALTER TABLE memory_alias_bindings ENABLE TRIGGER USER`);
+  }
+
+  const other = (label: string) => ({
+    alias_id: `alias-unique-${label}`,
+    normalized_alias: `${label}@example.com`,
+    skeleton: `${label}@example.com`,
+    mutation_receipt_id: `mutation.unique.alias.${label}`,
+    payload: {
+      aliasId: `alias-unique-${label}`,
+      normalizedAlias: `${label}@example.com`,
+      skeleton: `${label}@example.com`,
+      mutationReceiptId: `mutation.unique.alias.${label}`,
+    },
+  });
+  const without = (fields: readonly string[], label: string) => {
+    const base = other(label) as Record<string, unknown> & { payload: Record<string, unknown> };
+    const payloadKey: Record<string, string> = {
+      alias_id: "aliasId",
+      normalized_alias: "normalizedAlias",
+      skeleton: "skeleton",
+      mutation_receipt_id: "mutationReceiptId",
+    };
+    for (const field of fields) {
+      delete base[field];
+      delete base.payload[payloadKey[field]!];
+    }
+    return base;
+  };
+  const active = { where: "alias_id = $1", params: ["alias-unique-active"] };
+
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_alias_bindings",
+    index: "memory_alias_bindings_alias_id_unique",
+    ...active,
+    freshen: () => without(["alias_id"], "a"),
+    positive: () => other("a"),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_alias_bindings",
+    index: "memory_alias_bindings_alias_unique",
+    ...active,
+    freshen: () => without(["normalized_alias"], "b"),
+    positive: () => other("b"),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_alias_bindings",
+    index: "memory_alias_bindings_skeleton_unique",
+    ...active,
+    freshen: () => without(["skeleton"], "c"),
+    positive: () => other("c"),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_alias_bindings",
+    index: "memory_alias_bindings_receipt_unique",
+    ...active,
+    freshen: () => without(["mutation_receipt_id"], "d"),
+    positive: () => other("d"),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_alias_bindings",
+    index: "memory_alias_bindings_removal_receipt_unique",
+    where: "alias_id = $1",
+    params: ["alias-unique-retired"],
+    freshen: () => other("e"),
+    positive: () => ({ ...other("e"), removed_by_mutation_receipt_id: "mutation.unique.alias.removal.2" }),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_alias_protected_domains",
+    index: "memory_alias_protected_domains_unique",
+    where: "registrable_domain = $1",
+    params: ["acme-unique.example"],
+    freshen: () => ({}),
+    positive: () => ({ registrable_domain: "acme-unique-other.example" }),
+  });
 });

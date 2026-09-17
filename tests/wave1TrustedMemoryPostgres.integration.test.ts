@@ -27,6 +27,7 @@ import {
   lockSharedMemoryTables,
   type SharedTableLock,
 } from "./support/sharedMemoryTables";
+import { assertUniqueIndexKills } from "./support/uniquenessDestroyer";
 
 /**
  * Wave 1.3 trusted memory, against a REAL PostgreSQL 16.
@@ -5170,4 +5171,208 @@ test("N-6 the DATABASE refuses a mutation receipt filed outside its authorizatio
       }),
     /a memory_mutation_receipts row must carry the scope of the authorization that witnesses it/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// U — THE UNIQUE INDEXES THE PROTOCOL RESTS ON, EACH ONE DESTROYABLE.
+// See tests/support/uniquenessDestroyer.ts for the method.
+// ---------------------------------------------------------------------------
+
+test("U-1 every unique index on versions, authorizations, nonces and receipts refuses the one duplicate it exists for", async () => {
+  // Real rows: a genesis and a verified correction through the store.
+  const genesis = await seedGenesis({ n: 0 });
+  const next = { n: 1 };
+  const receipt = await issue(
+    authorization({ action: "correct", expectedHead: headOf(1, genesis), proposedContent: next }),
+  );
+  const done = await store().correct({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: next,
+    mutationReceiptId: "mutation.unique.1",
+  });
+  assert.equal(done.verified, true);
+  const fresh = (s: string) => `${s}.fresh`;
+
+  // THE CAS INDEX. Two writers landing version N of one record is exactly
+  // what the advisory lock is supposed to make impossible; this is the index
+  // that makes it impossible when the lock is not there.
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_record_versions",
+    index: "memory_record_versions_tenant_id_workspace_id_record_id_ver_key",
+    where: "record_id = $1 AND version = 2",
+    params: [RECORD_ID],
+    freshen: () => ({
+      mutation_receipt_id: "mutation.unique.dup",
+      payload: { mutationReceiptId: "mutation.unique.dup" },
+    }),
+    positive: () => ({
+      mutation_receipt_id: "mutation.unique.dup",
+      version: 3,
+      payload: { mutationReceiptId: "mutation.unique.dup", version: 3 },
+    }),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_record_versions",
+    index: "memory_record_versions_receipt_unique",
+    where: "record_id = $1 AND version = 2",
+    params: [RECORD_ID],
+    freshen: () => ({ version: 3, payload: { version: 3 } }),
+    positive: () => ({
+      version: 3,
+      mutation_receipt_id: "mutation.unique.dup",
+      payload: { version: 3, mutationReceiptId: "mutation.unique.dup" },
+    }),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_authorization_nonces",
+    index: "memory_authorization_nonces_authorization_unique",
+    where: "authorization_id = $1",
+    params: [receipt.authorizationId],
+    freshen: () => ({ binding_digest: `sha256:${"e".repeat(64)}` }),
+    positive: (row) => ({
+      binding_digest: `sha256:${"e".repeat(64)}`,
+      authorization_id: fresh(String(row.authorization_id)),
+    }),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_authorization_nonces",
+    index: "memory_authorization_nonces_unique",
+    where: "authorization_id = $1",
+    params: [receipt.authorizationId],
+    freshen: (row) => ({ authorization_id: fresh(String(row.authorization_id)) }),
+    positive: (row) => ({
+      authorization_id: fresh(String(row.authorization_id)),
+      binding_digest: `sha256:${"e".repeat(64)}`,
+    }),
+  });
+  // The global id: collided from ANOTHER WORKSPACE, so the (tenant,
+  // workspace, authorization) key cannot be what refuses it.
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_authorization_receipts",
+    index: "memory_authorization_receipts_global_id",
+    where: "authorization_id = $1",
+    params: [receipt.authorizationId],
+    freshen: () => ({ workspace_id: "workspace-elsewhere", payload: { scope: { workspaceId: "workspace-elsewhere" } } }),
+    positive: (row) => ({
+      workspace_id: "workspace-elsewhere",
+      authorization_id: fresh(String(row.authorization_id)),
+      payload: { scope: { workspaceId: "workspace-elsewhere" }, authorizationId: fresh(String(row.authorization_id)) },
+    }),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_mutation_receipts",
+    index: "memory_mutation_receipts_tenant_id_workspace_id_mutation_re_key",
+    where: "mutation_receipt_id = $1 AND phase = 'terminal'",
+    params: ["mutation.unique.1"],
+    freshen: () => ({}),
+    positive: () => ({
+      mutation_receipt_id: "mutation.unique.dup",
+      payload: { mutationReceiptId: "mutation.unique.dup" },
+    }),
+  });
+});
+
+test("U-1 memory_authorization_receipts (tenant, workspace, authorization) is STRUCTURALLY REDUNDANT, and that is proven rather than assumed", async () => {
+  // A duplicate on (tenant, workspace, authorization_id) is necessarily a
+  // duplicate on authorization_id, which `_global_id` already refuses — so no
+  // row can reach the composite index alone, and dropping it cannot turn any
+  // test red. Reported as a disclosed survivor. What IS pinned is the premise
+  // the disclosure rests on: the global index exists, is unique, and covers
+  // exactly authorization_id.
+  const found = await adminPool.query(
+    `SELECT ix.indisunique, pg_get_indexdef(ix.indexrelid) AS def
+       FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid
+      WHERE i.relname = 'memory_authorization_receipts_global_id'`,
+  );
+  assert.equal(found.rows[0]?.indisunique, true);
+  assert.match(found.rows[0]?.def as string, /\(authorization_id\)$/);
+});
+
+test("U-1 the numeric-domain trigger guards MUTATION RECEIPTS too, not only its siblings", async () => {
+  // The b3efc82 sweep dropped `memory_mutation_receipts_exact_numbers` with
+  // nothing going red: only the versions, authorizations and tombstones
+  // siblings had a test.
+  const genesis = await seedGenesis({ n: 0 });
+  const receipt = await issue(
+    authorization({ action: "correct", expectedHead: headOf(1, genesis), proposedContent: { n: 1 } }),
+  );
+  const payload = {
+    schemaVersion: WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION,
+    mutationReceiptId: "mutation.inexact",
+    authorizationId: receipt.authorizationId,
+    consumedNonceDigest: `sha256:${"6".repeat(64)}`,
+    action: "correct",
+    scope: SCOPE,
+    targetRecordId: RECORD_ID,
+    outcome: { status: "UNKNOWN_PENDING_RECONCILIATION" },
+    ratio: 0.1,
+  };
+  const insert = (body: unknown) =>
+    asMutator(
+      `INSERT INTO memory_mutation_receipts
+         (tenant_id, workspace_id, principal_id, user_id, mutation_receipt_id,
+          phase, authorization_id, consumed_nonce_digest, action,
+          target_record_id, outcome_status, emitted_at, payload)
+       VALUES ($1,$2,$3,$4,'mutation.inexact','terminal',$5,$6,'correct',$7,
+               'UNKNOWN_PENDING_RECONCILIATION', now(), $8)`,
+      [
+        SCOPE.tenantId,
+        SCOPE.workspaceId,
+        SCOPE.principalId,
+        SCOPE.userId,
+        receipt.authorizationId,
+        payload.consumedNonceDigest,
+        RECORD_ID,
+        JSON.stringify(body),
+      ],
+    );
+  await assert.rejects(() => insert(payload), /outside the exact numeric domain/);
+  // Positive control: an exact integer lands.
+  await insert({ ...payload, ratio: 1 });
+});
+
+test("C6 A14: a nonce row naming a different TARGET than its receipt is refused, with every other field agreeing", async () => {
+  // The b3efc82 sweep removed `nonceRow.target_record_id !== stored.targetRecordId`
+  // and nothing went red: its three sibling conjuncts had tests, this one did
+  // not.
+  const genesis = await seedGenesis({ note: "original" });
+  const next = { note: "corrected" };
+  const receipt = await issue(
+    authorization({ action: "correct", expectedHead: headOf(1, genesis), proposedContent: next }),
+    { nonceTargetRecordId: "record-memory-elsewhere" },
+  );
+  const result = await store().correct({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: next,
+    mutationReceiptId: "mutation.disagree.target",
+  });
+  assert.equal(result.rejection, "nonce_disagrees_with_receipt");
+  assert.equal(await countVersions(), 1);
+  assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
+});
+
+test("C6 an ATTEMPT cannot be rewritten or deleted, by anyone", async () => {
+  await seedGenesis({ note: "original" });
+  const refused = await store().correct({
+    actor: SCOPE,
+    authorizationId: nextAuthorizationId(),
+    recordId: RECORD_ID,
+    proposedContent: { note: "x" },
+    mutationReceiptId: "mutation.attempt.immutable",
+  });
+  assert.equal(refused.rejection, "authorization_not_found");
+  assert.equal((await attemptsFor("mutation.attempt.immutable")).length, 1);
+  await assert.rejects(
+    () => adminPool.query(`UPDATE memory_mutation_attempts SET rejection = 'head_mismatch'`),
+    /UPDATE on memory_mutation_attempts is forbidden; this table is append-only/,
+  );
+  await assert.rejects(
+    () => adminPool.query(`DELETE FROM memory_mutation_attempts`),
+    /DELETE on memory_mutation_attempts is forbidden; this table is append-only/,
+  );
+  assert.equal((await attemptsFor("mutation.attempt.immutable")).length, 1);
 });

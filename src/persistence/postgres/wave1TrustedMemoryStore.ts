@@ -1724,6 +1724,17 @@ export function createPostgresTrustedMemoryStore(
       return { verified: false, rejection: "read_back_diverged", receipt };
     }
 
+    // DISCLOSED UNREACHABLE CONJUNCTS. Four of the nine comparisons below can
+    // never be false by the time they run, and no test can kill them — the
+    // b3efc82 mutation sweep confirmed each survives (A54 recordId, A55
+    // version, A59 tenantId, A60 workspaceId). `recordId`, `tenantId` and
+    // `workspaceId` are the read-back query's own WHERE predicates, bound to
+    // exactly these values; `version` is refused earlier, above, by
+    // `observed.version !== nextVersion`. They are kept because the receipt
+    // they gate states all nine, and a later change to the read-back query
+    // would otherwise silently drop a comparison nobody could see was implied.
+    // The five REACHABLE conjuncts — content digest, predecessor digest,
+    // state, principal and user — each have a killing test (W1BR-013).
     const postStateAgrees =
       observed.recordId === authorized.targetRecordId &&
       observed.version === nextVersion &&

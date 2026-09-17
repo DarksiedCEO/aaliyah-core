@@ -53,6 +53,7 @@ import {
   lockSharedMemoryTables,
   type SharedTableLock,
 } from "./support/sharedMemoryTables";
+import { assertUniqueIndexKills } from "./support/uniquenessDestroyer";
 
 /**
  * Wave 1.3 PART F — LEGAL HOLDS AND REAL ERASURE, against a REAL PostgreSQL 16.
@@ -3255,4 +3256,130 @@ test("B3 Part F's action-state guard still ALLOWS the four bindings it exists to
     rows.map((row) => row.state),
     ["active", "active", "deleted", "active"],
   );
+});
+
+test("U-3 every tombstone, legal-hold and retention unique index refuses the one duplicate it exists for", async () => {
+  // Real rows: an honest deletion, three holds covering records, subjects and
+  // a carve-out, and a retention obligation — each through its own store.
+  await deleteThen("mutation.unique.delete", "tombstone-unique-001");
+  await placeHold(legalHold({ coverage: { kind: "records", recordIds: [FREE_RECORD_ID] }, holdId: "hold-unique-records", carveOutActions: ["promote"] }));
+  await placeHold(legalHold({ coverage: { kind: "subjects", canonicalParticipantIds: ["participant-unique-001"] }, holdId: "hold-unique-subjects" }));
+  const imposed = await holds().imposeRetention(SCOPE, {
+    obligationId: "retention-unique-001",
+    recordId: FREE_RECORD_ID,
+    policyRef: "policy:retention/seven-years",
+    imposingAuthorityId: "authority.records-manager",
+    imposedAt: isoOffset(-60_000),
+    retainUntil: isoOffset(3_600_000),
+  });
+  assert.equal(imposed.rejection, null);
+
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_tombstones",
+    index: "memory_tombstones_unique",
+    where: "tombstone_id = $1",
+    params: ["tombstone-unique-001"],
+    freshen: (row) => ({
+      mutation_receipt_id: "mutation.unique.dup",
+      tombstone_version: Number(row.tombstone_version) + 10,
+      target_version: Number(row.target_version) + 10,
+      payload: { tombstoneVersion: Number(row.tombstone_version) + 10, targetVersion: Number(row.target_version) + 10 },
+    }),
+    positive: (row) => ({
+      mutation_receipt_id: "mutation.unique.dup",
+      tombstone_version: Number(row.tombstone_version) + 10,
+      target_version: Number(row.target_version) + 10,
+      tombstone_id: "tombstone-unique-dup",
+      payload: { tombstoneVersion: Number(row.tombstone_version) + 10, targetVersion: Number(row.target_version) + 10, tombstoneId: "tombstone-unique-dup" },
+    }),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_tombstones",
+    index: "memory_tombstones_version_unique",
+    where: "tombstone_id = $1",
+    params: ["tombstone-unique-001"],
+    freshen: () => ({ mutation_receipt_id: "mutation.unique.dup", tombstone_id: "tombstone-unique-dup", payload: { tombstoneId: "tombstone-unique-dup" } }),
+    positive: (row) => ({
+      mutation_receipt_id: "mutation.unique.dup",
+      tombstone_id: "tombstone-unique-dup",
+      tombstone_version: Number(row.tombstone_version) + 10,
+      target_version: Number(row.target_version) + 10,
+      payload: { tombstoneId: "tombstone-unique-dup", tombstoneVersion: Number(row.tombstone_version) + 10, targetVersion: Number(row.target_version) + 10 },
+    }),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_tombstones",
+    index: "memory_tombstones_receipt_unique",
+    where: "tombstone_id = $1",
+    params: ["tombstone-unique-001"],
+    freshen: (row) => ({
+      tombstone_id: "tombstone-unique-dup",
+      tombstone_version: Number(row.tombstone_version) + 10,
+      target_version: Number(row.target_version) + 10,
+      payload: { tombstoneId: "tombstone-unique-dup", tombstoneVersion: Number(row.tombstone_version) + 10, targetVersion: Number(row.target_version) + 10 },
+    }),
+    positive: (row) => ({
+      tombstone_id: "tombstone-unique-dup",
+      tombstone_version: Number(row.tombstone_version) + 10,
+      target_version: Number(row.target_version) + 10,
+      mutation_receipt_id: "mutation.unique.dup",
+      payload: { tombstoneId: "tombstone-unique-dup", tombstoneVersion: Number(row.tombstone_version) + 10, targetVersion: Number(row.target_version) + 10 },
+    }),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_legal_holds",
+    index: "memory_legal_holds_unique",
+    where: "hold_id = $1",
+    params: ["hold-unique-records"],
+    freshen: () => ({}),
+    positive: () => ({ hold_id: "hold-unique-dup", payload: { holdId: "hold-unique-dup" } }),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_legal_hold_records",
+    index: "memory_legal_hold_records_unique",
+    where: "hold_id = $1",
+    params: ["hold-unique-records"],
+    freshen: () => ({}),
+    positive: () => ({ record_id: "record-unique-other" }),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_legal_hold_subjects",
+    index: "memory_legal_hold_subjects_unique",
+    where: "hold_id = $1",
+    params: ["hold-unique-subjects"],
+    freshen: () => ({}),
+    positive: () => ({ canonical_participant_id: "participant-unique-other" }),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_legal_hold_carve_outs",
+    index: "memory_legal_hold_carve_outs_unique",
+    where: "hold_id = $1",
+    params: ["hold-unique-records"],
+    freshen: () => ({}),
+    positive: () => ({ action: "restore" }),
+  });
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_retention_obligations",
+    index: "memory_retention_obligations_unique",
+    where: "obligation_id = $1",
+    params: ["retention-unique-001"],
+    freshen: () => ({}),
+    positive: () => ({ obligation_id: "retention-unique-dup" }),
+  });
+});
+
+test("U-3 memory_legal_holds_fk_target is STRUCTURALLY REDUNDANT as a uniqueness control, and the premise is pinned", async () => {
+  // (tenant, workspace, hold_id, coverage_kind) is a superset of
+  // `memory_legal_holds_unique`'s (tenant, workspace, hold_id): no duplicate
+  // can reach it alone. It exists as the target of the coverage-kind foreign
+  // keys, which is proven by those foreign keys refusing a mismatched child —
+  // not by uniqueness. Disclosed survivor for a DROP INDEX; the premise is
+  // what is pinned here.
+  const found = await adminPool.query(
+    `SELECT pg_get_indexdef(ix.indexrelid) AS def, ix.indisunique
+       FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid
+      WHERE i.relname = 'memory_legal_holds_unique'`,
+  );
+  assert.equal(found.rows[0]?.indisunique, true);
+  assert.match(found.rows[0]?.def as string, /\(tenant_id, workspace_id, hold_id\)$/);
 });

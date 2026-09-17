@@ -10,6 +10,7 @@ import {
   lockSharedMemoryTables,
   type SharedTableLock,
 } from "./support/sharedMemoryTables";
+import { assertUniqueIndexKills } from "./support/uniquenessDestroyer";
 
 /**
  * RECONCILING UNKNOWN OUTCOMES, AGAINST A REAL DATABASE.
@@ -730,11 +731,11 @@ test("a written reconciliation cannot be rewritten or deleted, by anyone", async
       adminPool.query(
         `UPDATE memory_reconciliations SET verdict = 'COMMITTED_CONFIRMED'`,
       ),
-    /append-only|forbid|rewrite/i,
+    /UPDATE on memory_reconciliations is forbidden; this table is append-only/,
   );
   await assert.rejects(
     () => adminPool.query(`DELETE FROM memory_reconciliations`),
-    /append-only|forbid|rewrite/i,
+    /DELETE on memory_reconciliations is forbidden; this table is append-only/,
   );
   assert.equal(await countReconciliations(), 1);
 });
@@ -989,4 +990,24 @@ test("V-4 the DATABASE refuses every verdict stored state does not imply, and ac
   // Positive control: the implied verdict, observing what is stored.
   await fileAsReconciler({ receiptId: "mutation.v4", authorizationId, verdict: "COMMITTED_CONFIRMED", observedVersion: 1, observedDigest: digest });
   assert.equal(await countReconciliations(), 1);
+});
+
+test("U-5 memory_reconciliations_once refuses a second verdict for one mutation, index-first", async () => {
+  const { authorizationId } = await committedUnknown("mutation.unique.recon", { note: "once" });
+  const [unresolved] = await reconciler().findUnresolved();
+  assert.ok(unresolved);
+  const settled = await reconciler().reconcile(unresolved);
+  assert.equal(settled.verdict, "COMMITTED_CONFIRMED");
+  assert.equal(settled.authorizationId, authorizationId);
+  await assertUniqueIndexKills(adminPool, {
+    table: "memory_reconciliations",
+    index: "memory_reconciliations_once",
+    where: "mutation_receipt_id = $1",
+    params: ["mutation.unique.recon"],
+    freshen: () => ({}),
+    positive: () => ({
+      mutation_receipt_id: "mutation.unique.recon.dup",
+      evidence: { mutationReceiptId: "mutation.unique.recon.dup" },
+    }),
+  });
 });
