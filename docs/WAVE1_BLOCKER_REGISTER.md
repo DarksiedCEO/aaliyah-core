@@ -924,3 +924,29 @@ These are stated as dispositions, not as fixes.
 - **Red Team, watchdog limit: DISCLOSED.**
   - What happens: a test file that registers tests after a promise that never settles, with no live handle, reports only the tests it registered.
   - Why this is a limit, not a fix: the watchdog cannot know tests it was never told about. A hostile test author has simpler ways to write a vacuous test.
+
+### The confirming sweep at `f59a6f7`, and its survivors
+
+This sweep ran before any review of `f59a6f7`, on 350 mutants:
+- the live catalog: 279 controls;
+- 19 grant mutants;
+- 28 source mutants that revert each remediation above;
+- the earlier vault, route and migration mutants;
+- the red team's branch mutants;
+- the test reviewer's CAS mutant.
+
+It ran on eight disposable workers, each with its own database, with every mutant reached from both ends of the list. That makes most verdicts independent duplicates.
+
+Real survivors, each closed with a falsifier that carries both a negative and a positive control:
+
+| Entry | Survivor | Closed by |
+| --- | --- | --- |
+| W1BR-040 | `FX-04`: migration 051's live-head check was masked by its binding check. X-1 always bound an alias. | `14df48d` — X-1b: a merged record with content and no alias |
+| W1BR-041 | `FX-16` / `FX-17` / `FX-20`: the alias head comparison. Q-4 moved version and digest together, so each check masked the other. | `ca28da8` — Q-5: content goes back to its authorized value (ABA), so only the version differs. Q-6: the right version with the wrong digest. |
+| W1BR-042 | `G-19`: the alias-effect oracle granted to PUBLIC went unobserved. | `952e04e` — Q-7: each of the three new helpers runs only for its own role, and every other memory role is refused by privilege. |
+
+Disclosed survivors, unchanged from earlier sweeps, each with proof:
+- the nine `_payload_object` / `_evidence_object` masked backstops;
+- the structurally redundant unique index on authorization receipts `(tenant, workspace, authorization)`.
+
+**Load-induced verdicts.** With eight workers sharing one machine, a kill is not trusted from its verdict alone. One disclosed backstop was "killed" on one worker by unrelated HTTP-reachability failures from CPU starvation, and survived on another. Every kill backed only by a timeout, cancellation, deadline, hook-sentinel failure or mass failure is re-run on a quiet machine against the frozen descendant before it counts. The re-run evidence sits beside the sweep at `aaliyah-w13-evidence/`.
