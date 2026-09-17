@@ -242,3 +242,105 @@ test("047 REFUSES to run over an existing plaintext alias binding, and the plain
   );
   assert.equal(column.rows[0].n, 0);
 });
+
+/**
+ * K-06 — CONCURRENT MIGRATORS ON A FRESH DATABASE.
+ *
+ * 03581a3 reliability review, HIGH, executed: `runMailMigrations` issued
+ * `CREATE TABLE IF NOT EXISTS aaliyah_mail_migrations` as its FIRST statement,
+ * outside any lock, and only then took the table lock that serializes
+ * migrators. `IF NOT EXISTS` is not atomic against a concurrent creator — 2-way
+ * and 3-way runs crashed N-1 instances with `23505` on
+ * `pg_type_typname_nsp_index`, the duplicate being the table's implicit ROW
+ * TYPE — and `src/server.ts` turns a migration failure into `process.exit(1)`.
+ * Every instance of a fresh rolling deploy but one died at boot.
+ *
+ * Each case below gets its OWN database, created and dropped inside the test,
+ * because "fresh" is the whole precondition.
+ */
+async function withFreshDatabase<T>(
+  suffix: string,
+  body: (url: string) => Promise<T>,
+): Promise<T> {
+  const name = `aaliyah_concurrent_${suffix}`;
+  await adminPool.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+  await adminPool.query(`CREATE DATABASE ${name}`);
+  try {
+    return await body(ADMIN_URL.replace(/\/[^/]+$/, `/${name}`));
+  } finally {
+    await adminPool.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+  }
+}
+
+test("POSITIVE CONTROL: bare concurrent CREATE TABLE IF NOT EXISTS really does crash N-1 with 23505", async () => {
+  // Proves the hazard is real on THIS server, so the refusal below is about
+  // the runner's ordering and not about `IF NOT EXISTS` being safe anyway.
+  await withFreshDatabase("control", async (url) => {
+    const pools = Array.from({ length: 3 }, () => new Pool({ connectionString: url, max: 1 }));
+    try {
+      const results = await Promise.allSettled(
+        pools.map((p) =>
+          p.query(`CREATE TABLE IF NOT EXISTS aaliyah_mail_migrations (
+            id text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`),
+        ),
+      );
+      const codes = results
+        .filter((r): r is PromiseRejectedResult => r.status === "rejected")
+        .map((r) => (r.reason as { code?: string }).code);
+      assert.ok(
+        codes.length >= 1,
+        `expected at least one concurrent creator to lose; all ${results.length} succeeded`,
+      );
+      assert.ok(
+        codes.every((code) => code === "23505"),
+        `expected 23505 unique-violation losses; got ${JSON.stringify(codes)}`,
+      );
+    } finally {
+      await Promise.all(pools.map((p) => p.end()));
+    }
+  });
+});
+
+for (const concurrency of [2, 3, 5]) {
+  test(`${concurrency} concurrent migrators on a FRESH database ALL fulfil, and the ledger is applied exactly once`, async () => {
+    await withFreshDatabase(`n${concurrency}`, async (url) => {
+      const pools = Array.from({ length: concurrency }, () => new Pool({ connectionString: url, max: 2 }));
+      try {
+        const results = await Promise.allSettled(pools.map((p) => runMailMigrations(p)));
+        const rejected = results.filter((r) => r.status === "rejected");
+        assert.deepEqual(
+          rejected.map((r) => String((r as PromiseRejectedResult).reason)),
+          [],
+          "no migrator may be crashed by another migrator",
+        );
+        const check = new Pool({ connectionString: url, max: 1 });
+        try {
+          const ledger = await check.query(
+            `SELECT count(*)::int AS n, count(DISTINCT id)::int AS d FROM aaliyah_mail_migrations`,
+          );
+          // Exactly once each: no duplicate rows, and the full set applied.
+          assert.equal(ledger.rows[0].n, ledger.rows[0].d);
+          assert.ok((ledger.rows[0].n as number) >= 54, `only ${ledger.rows[0].n} migrations applied`);
+          // And the ledger agrees with the schema, not just with itself.
+          const helper = await check.query(
+            `SELECT count(*)::int AS n FROM pg_proc
+              WHERE proname = 'aaliyah_memory_unerased_merged_records'`,
+          );
+          assert.equal(helper.rows[0].n, 1);
+          // The session advisory lock the runner takes must not survive it:
+          // it would otherwise ride back into the pool on that connection.
+          const held = await check.query(
+            `SELECT count(*)::int AS n FROM pg_locks
+              WHERE locktype = 'advisory'
+                AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`,
+          );
+          assert.equal(held.rows[0].n, 0, "a migrator left its session advisory lock held");
+        } finally {
+          await check.end();
+        }
+      } finally {
+        await Promise.all(pools.map((p) => p.end()));
+      }
+    });
+  });
+}

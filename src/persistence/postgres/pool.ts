@@ -1,4 +1,5 @@
 import { Pool } from "pg";
+import type { QueryResult } from "pg";
 
 /**
  * THE BOUNDS EVERY DURABLE-STATE CONNECTION CARRIES.
@@ -22,7 +23,121 @@ export const MAIL_DB_POOL_BOUNDS = {
   lockTimeoutMs: 10_000,
   /** A session left idle inside an open transaction is terminated. */
   idleInTransactionSessionTimeoutMs: 60_000,
+  /**
+   * THE CLIENT'S OWN CEILING, BECAUSE EVERY BOUND ABOVE IS THE SERVER'S.
+   *
+   * Found by the 03581a3 reliability review (K-05): `statement_timeout`,
+   * `lock_timeout` and `idle_in_transaction_session_timeout` are all enforced
+   * by the PostgreSQL BACKEND, so they bound a backend that is running. They
+   * bound nothing when the backend is not running its own timers — a
+   * SIGSTOPped backend held boot 30 SECONDS past its 10s bound, because the
+   * process was simply waiting for bytes that were never coming.
+   *
+   * Deliberately ABOVE `statementTimeoutMs`: when the server is alive, its own
+   * error should win, because `57014 statement timeout` says what happened and
+   * `Query read timeout` does not. This fires only when the server never
+   * answers at all.
+   *
+   * A query that trips it leaves the connection AMBIGUOUS. node-postgres
+   * rejects the caller and stops listening, but it does not cancel the
+   * backend and does not close the socket, so a result for the abandoned
+   * query can still arrive on that connection afterwards. Such a connection
+   * must be DESTROYED, never returned to the pool — see `isConnectionAmbiguous`
+   * and `releaseClient`.
+   */
+  queryTimeoutMs: 35_000,
+  /**
+   * A dead peer that never sends a FIN is indistinguishable from a silent one.
+   * Keepalives make the kernel ask, so a severed connection surfaces as an
+   * error instead of as a wait with no end.
+   */
+  keepAliveInitialDelayMillis: 10_000,
 } as const;
+
+/**
+ * BOUNDS FOR WORK THAT IS LEGITIMATELY SLOWER THAN A REQUEST.
+ *
+ * Migrations take DDL over populated tables and legitimately wait behind
+ * another instance's migration during a rolling deploy; `runMailMigrations`
+ * already raises the server's own bounds with `SET LOCAL`. The client ceiling
+ * has to be raised WITH them — a 35s client timeout over a 300s server bound
+ * would abandon a perfectly healthy migration mid-DDL and leave the operator
+ * with an ambiguous outcome, which is worse than waiting.
+ */
+export const MIGRATION_BOUNDS = {
+  lockTimeoutMs: 120_000,
+  statementTimeoutMs: 300_000,
+  /** Above `statementTimeoutMs`, for the same reason as the pool's. */
+  queryTimeoutMs: 330_000,
+} as const;
+
+/**
+ * A QUERY WITH ITS OWN CLIENT-SIDE CEILING.
+ *
+ * node-postgres honours `query_timeout` PER QUERY — `config.query_timeout ||
+ * this.connectionParameters.query_timeout` in `pg/lib/client.js` — but the
+ * property is missing from `@types/pg`'s `QueryConfig`, so reaching a real
+ * feature of the driver needs this one cast, in one place, rather than a cast
+ * at every call site.
+ *
+ * Used where the SERVER's bound is deliberately wider than the pool's default
+ * (migrations) and where a caller needs a TIGHTER ceiling than the pool's
+ * (a provider-adjacent path that must not sit on a pool slot).
+ */
+export type BoundedQuery = (text: string, values?: unknown[]) => Promise<QueryResult>;
+
+export function boundedQuery(
+  client: { query: unknown },
+  queryTimeoutMs: number,
+): BoundedQuery {
+  const run = client.query as (config: {
+    text: string;
+    values: unknown[] | undefined;
+    query_timeout: number;
+  }) => Promise<QueryResult>;
+  return (text, values) => run.call(client, { text, values, query_timeout: queryTimeoutMs });
+}
+
+/**
+ * A CONNECTION WHOSE LAST QUERY'S OUTCOME IS UNKNOWN IS NOT REUSABLE.
+ *
+ * Three shapes, all of which leave bytes that belong to an abandoned query
+ * either in flight or already lost:
+ *   - the client's own read timeout, which stops listening without cancelling;
+ *   - the backend gone (`57P01` admin shutdown, `25P03` idle-in-transaction
+ *     kill, class `08` connection exceptions);
+ *   - the socket broken under us.
+ * Returning any of them to the pool hands the NEXT caller a connection that
+ * may answer with the previous caller's result. Destroy instead: the pool
+ * opens a fresh one on the next checkout.
+ */
+export function isConnectionAmbiguous(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === "string") {
+    if (code === "57P01" || code === "25P03" || code === "ECONNRESET" || code === "EPIPE") {
+      return true;
+    }
+    if (code.startsWith("08")) return true;
+  }
+  const message = String((error as { message?: unknown } | null)?.message ?? "");
+  return (
+    /Query read timeout/i.test(message) ||
+    /Connection terminated/i.test(message) ||
+    /connection is closed/i.test(message) ||
+    /socket hang up/i.test(message)
+  );
+}
+
+/**
+ * Release a pooled client, destroying it when the last query's outcome is
+ * unknown. `release(true)` is node-postgres' destroy path.
+ */
+export function releaseClient(
+  client: { release: (destroy?: boolean) => void },
+  error?: unknown,
+): void {
+  client.release(error !== undefined && isConnectionAmbiguous(error) ? true : undefined);
+}
 
 export type PoolErrorEvent = {
   pool: string;
@@ -110,6 +225,10 @@ export function createMailDbPool(
       lock_timeout: MAIL_DB_POOL_BOUNDS.lockTimeoutMs,
       idle_in_transaction_session_timeout:
         MAIL_DB_POOL_BOUNDS.idleInTransactionSessionTimeoutMs,
+      // The client's own ceiling, and the kernel's. See the bounds above.
+      query_timeout: MAIL_DB_POOL_BOUNDS.queryTimeoutMs,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: MAIL_DB_POOL_BOUNDS.keepAliveInitialDelayMillis,
     }),
     options.name ?? "mail",
     options.onError,

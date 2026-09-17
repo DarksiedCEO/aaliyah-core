@@ -36,6 +36,12 @@ export const idempotencyStoreInternals = {
         lock_timeout: MAIL_DB_POOL_BOUNDS.lockTimeoutMs,
         idle_in_transaction_session_timeout:
           MAIL_DB_POOL_BOUNDS.idleInTransactionSessionTimeoutMs,
+        // Every bound above is the SERVER's. These two are this process's own,
+        // for a backend that has stopped answering rather than one that is
+        // running slowly (03581a3 reliability, K-05).
+        query_timeout: MAIL_DB_POOL_BOUNDS.queryTimeoutMs,
+        keepAlive: true,
+        keepAliveInitialDelayMillis: MAIL_DB_POOL_BOUNDS.keepAliveInitialDelayMillis,
       }),
       "idempotency",
     ),

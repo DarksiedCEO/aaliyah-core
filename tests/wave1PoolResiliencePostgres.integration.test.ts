@@ -1,10 +1,15 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import * as net from "node:net";
 import * as path from "node:path";
 import { Pool } from "pg";
 
-import { createMailDbPool, MAIL_DB_POOL_BOUNDS } from "../src/persistence/postgres/pool";
+import {
+  createMailDbPool,
+  isConnectionAmbiguous,
+  MAIL_DB_POOL_BOUNDS,
+} from "../src/persistence/postgres/pool";
 import { createReadinessProbe } from "../src/http/readiness";
 import { runMailMigrations } from "../src/persistence/postgres/migrations";
 import { createPostgresWave1MemoryService } from "../src/persistence/postgres/wave1IdentityGraphStore";
@@ -270,5 +275,135 @@ test("boot's recovery passes against a reachable but WEDGED database are refused
     await write.end();
     await read.end();
     await sharedTableLock.release();
+  }
+});
+
+/**
+ * K-05 — EVERY BOUND ABOVE IS THE SERVER'S, SO THE CLIENT NEEDS ITS OWN.
+ *
+ * 03581a3 reliability review, HIGH: `statement_timeout`, `lock_timeout` and
+ * `idle_in_transaction_session_timeout` are enforced by the PostgreSQL
+ * BACKEND. They bound a backend that is running its own timers. They bound
+ * NOTHING when the backend has stopped answering — a SIGSTOPped backend held
+ * boot 30 SECONDS past its 10s bound, waiting for bytes that were never
+ * coming, and `grep query_timeout src/` returned nothing.
+ *
+ * Reproduced here without signalling anything, by wedging the TRANSPORT: a
+ * pass-through TCP proxy completes the real handshake against the real
+ * database, then stops relaying in both directions. From the client's side
+ * this is indistinguishable from a stopped backend — and it is strictly
+ * harsher than SIGSTOP, because the server's OWN `statement_timeout` does
+ * fire here and its error still cannot arrive.
+ */
+function wedgeableProxy(target: { host: string; port: number }): {
+  port: Promise<number>;
+  wedge: () => void;
+  close: () => Promise<void>;
+} {
+  const sockets: Array<{ destroy: () => void }> = [];
+  let wedged = false;
+  const server = net.createServer((incoming) => {
+    const outgoing = net.connect(target.port, target.host);
+    sockets.push(incoming, outgoing);
+    const relay = (from: net.Socket, to: net.Socket) => {
+      from.on("data", (chunk) => {
+        // A wedged transport does not error and does not close. It is silent,
+        // which is the whole point: a closed socket would be reported.
+        if (!wedged) to.write(chunk);
+      });
+      from.on("error", () => to.destroy());
+      from.on("close", () => to.destroy());
+    };
+    relay(incoming, outgoing);
+    relay(outgoing, incoming);
+  });
+  const port = new Promise<number>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve((server.address() as net.AddressInfo).port));
+  });
+  return {
+    port,
+    wedge: () => {
+      wedged = true;
+    },
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+test("the mail pool carries a CLIENT-side query ceiling and TCP keepalives, not only the server's bounds", async () => {
+  const pool = createMailDbPool({ AALIYAH_DATABASE_URL: DB_URL } as NodeJS.ProcessEnv);
+  try {
+    const options = pool.options as unknown as {
+      query_timeout?: number;
+      keepAlive?: boolean;
+      keepAliveInitialDelayMillis?: number;
+    };
+    assert.equal(options.query_timeout, MAIL_DB_POOL_BOUNDS.queryTimeoutMs);
+    assert.equal(options.keepAlive, true);
+    assert.equal(
+      options.keepAliveInitialDelayMillis,
+      MAIL_DB_POOL_BOUNDS.keepAliveInitialDelayMillis,
+    );
+    // Above the server's own statement bound ON PURPOSE: when the server is
+    // alive its `57014` should win, because it says what happened.
+    assert.ok(
+      MAIL_DB_POOL_BOUNDS.queryTimeoutMs > MAIL_DB_POOL_BOUNDS.statementTimeoutMs,
+      "a client ceiling at or below statement_timeout would mask the server's own error",
+    );
+  } finally {
+    await pool.end();
+  }
+});
+
+test("a WEDGED transport is abandoned by the client within its own bound, and the connection is not reused", async () => {
+  const url = new URL(DB_URL);
+  const proxy = wedgeableProxy({ host: url.hostname, port: Number(url.port || 5432) });
+  const proxyPort = await proxy.port;
+  const proxied = new URL(DB_URL);
+  proxied.port = String(proxyPort);
+  const pool = createMailDbPool({ AALIYAH_DATABASE_URL: proxied.href } as NodeJS.ProcessEnv);
+  try {
+    // POSITIVE CONTROL: through the proxy, while it relays, everything works —
+    // so the refusal below is the wedge and not the proxy.
+    assert.equal((await pool.query("SELECT 1 AS ok")).rows[0].ok, 1);
+    const wedgedPid = (await pool.query("SELECT pg_backend_pid() AS pid")).rows[0].pid as number;
+
+    proxy.wedge();
+    const started = Date.now();
+    await assert.rejects(
+      pool.query("SELECT pg_sleep(600)"),
+      (error: { message?: string }) => /Query read timeout/i.test(String(error.message)),
+      "a wedged transport must be abandoned by the CLIENT; the server's bounds cannot reach it",
+    );
+    const elapsed = Date.now() - started;
+    assert.ok(
+      elapsed >= MAIL_DB_POOL_BOUNDS.queryTimeoutMs - 1_000,
+      `abandoned too early to be this bound: ${elapsed}ms`,
+    );
+    assert.ok(
+      elapsed < MAIL_DB_POOL_BOUNDS.queryTimeoutMs + 10_000,
+      `the client ceiling did not apply: ${elapsed}ms`,
+    );
+
+    // The abandoned connection is AMBIGUOUS — node-postgres stopped listening
+    // without cancelling the backend, so a result for that query can still
+    // arrive on it. It must not be handed to the next caller.
+    assert.ok(isConnectionAmbiguous(new Error("Query read timeout")));
+    const survivors = await adminPool.query(
+      `SELECT count(*)::int AS n FROM pg_stat_activity WHERE pid = $1`,
+      [wedgedPid],
+    );
+    // Whether the backend is already gone or still winding down, what matters
+    // is that the POOL no longer holds that client.
+    assert.ok(
+      pool.idleCount === 0,
+      `the abandoned client was returned to the pool (idle=${pool.idleCount}, backend rows=${survivors.rows[0].n})`,
+    );
+  } finally {
+    await pool.end().catch(() => undefined);
+    await proxy.close();
   }
 });

@@ -1,4 +1,13 @@
 import type { Pool } from "pg";
+import { boundedQuery, isConnectionAmbiguous, MIGRATION_BOUNDS, releaseClient } from "./pool";
+
+/**
+ * The advisory-lock key concurrent migrators serialize on, BEFORE the ledger
+ * table they would otherwise race to create exists (03581a3 reliability,
+ * K-06). Its text is the ledger's own name so the key is obvious from a
+ * `pg_locks` dump during an incident.
+ */
+const LEDGER_LOCK_KEY = "aaliyah_mail_migrations";
 
 /**
  * Ordered, idempotent migrations for the durable mail state. Each entry runs
@@ -5300,26 +5309,56 @@ export async function runMailMigrations(
   if (options.through !== undefined && !MIGRATIONS.some((m) => m.id === options.through)) {
     throw new Error(`runMailMigrations: no migration named ${options.through}`);
   }
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS aaliyah_mail_migrations (
-      id text PRIMARY KEY,
-      applied_at timestamptz NOT NULL DEFAULT now()
-    )`,
-  );
   const client = await pool.connect();
+  // BOUNDED, AND WIDER THAN THE POOL'S DEFAULTS ON PURPOSE. A second instance
+  // booting during a rolling deploy legitimately waits here for the first
+  // one's migrations; DDL over populated tables legitimately takes longer than
+  // an ordinary statement. Neither is allowed to wait forever — and the
+  // CLIENT's ceiling is raised with the server's, because a 35s client timeout
+  // over a 300s server bound would abandon a healthy migration mid-DDL and
+  // leave the operator with an ambiguous outcome (03581a3 reliability, K-05).
+  const bounded = boundedQuery(client, MIGRATION_BOUNDS.queryTimeoutMs);
+  let ambiguous: unknown;
   try {
-    await client.query("BEGIN");
-    // BOUNDED, AND WIDER THAN THE POOL'S DEFAULTS ON PURPOSE. A second instance
-    // booting during a rolling deploy legitimately waits here for the first
-    // one's migrations; DDL over populated tables legitimately takes longer
-    // than an ordinary statement. Neither is allowed to wait forever.
-    await client.query("SET LOCAL lock_timeout = '120s'");
-    await client.query("SET LOCAL statement_timeout = '300s'");
-    // Serialize concurrent migrators.
-    await client.query("LOCK TABLE aaliyah_mail_migrations IN ACCESS EXCLUSIVE MODE");
+    await bounded(`SET lock_timeout = '${MIGRATION_BOUNDS.lockTimeoutMs}ms'`);
+    // ---- CONCURRENT MIGRATORS SERIALIZE BEFORE THE LEDGER EXISTS --------
+    //
+    // Found by the 03581a3 reliability review (K-06), executed: this runner
+    // used to issue `CREATE TABLE IF NOT EXISTS aaliyah_mail_migrations` as
+    // its FIRST statement, outside any lock, and only then take the table
+    // lock that serializes migrators. `IF NOT EXISTS` is not atomic against a
+    // concurrent creator: 2-way and 3-way concurrent runs on a fresh database
+    // crashed N-1 instances with `23505` on `pg_type_typname_nsp_index` — a
+    // duplicate row for the table's implicit ROW TYPE, raised before the
+    // ledger it was about to lock existed at all — and `src/server.ts` turns
+    // that into `process.exit(1)`. So every instance of a fresh rolling
+    // deploy but one died at boot.
+    //
+    // A session advisory lock needs no table, so it is taken FIRST and covers
+    // the creation itself. `LOCK TABLE` below is kept as well: it binds a
+    // migrator running an OLDER build of this function, which knows nothing
+    // about this key.
+    await bounded("SELECT pg_advisory_lock(hashtextextended($1, 0))", [LEDGER_LOCK_KEY]);
+  } catch (error) {
+    ambiguous = error;
+    releaseClient(client, error);
+    throw error;
+  }
+  try {
+    await bounded("BEGIN");
+    await bounded(`SET LOCAL lock_timeout = '${MIGRATION_BOUNDS.lockTimeoutMs}ms'`);
+    await bounded(`SET LOCAL statement_timeout = '${MIGRATION_BOUNDS.statementTimeoutMs}ms'`);
+    await bounded(
+      `CREATE TABLE IF NOT EXISTS aaliyah_mail_migrations (
+        id text PRIMARY KEY,
+        applied_at timestamptz NOT NULL DEFAULT now()
+      )`,
+    );
+    // Serialize concurrent migrators that predate the advisory lock above.
+    await bounded("LOCK TABLE aaliyah_mail_migrations IN ACCESS EXCLUSIVE MODE");
     const applied = new Set(
-      (await client.query("SELECT id FROM aaliyah_mail_migrations")).rows.map(
-        (r: { id: string }) => r.id,
+      (await bounded("SELECT id FROM aaliyah_mail_migrations")).rows.map(
+        (r: { id: string }) => r.id as string,
       ),
     );
     // ---- MIGRATIONS ARE NOT INDEPENDENTLY REPLAYABLE (W1BR-014) ----------
@@ -5353,15 +5392,37 @@ export async function runMailMigrations(
             `revert any definition a later migration hardened. Refusing.`,
         );
       }
-      await client.query(migration.sql);
-      await client.query("INSERT INTO aaliyah_mail_migrations (id) VALUES ($1)", [migration.id]);
+      await bounded(migration.sql);
+      await bounded("INSERT INTO aaliyah_mail_migrations (id) VALUES ($1)", [migration.id]);
       if (migration.id === options.through) break;
     }
-    await client.query("COMMIT");
+    await bounded("COMMIT");
   } catch (error) {
-    await client.query("ROLLBACK");
+    ambiguous = error;
+    // The rollback itself is bounded and allowed to fail: on a dead backend
+    // there is nothing to roll back, and the connection is destroyed below.
+    await bounded("ROLLBACK").catch(() => undefined);
     throw error;
   } finally {
-    client.release();
+    // The advisory lock is SESSION-scoped, so it outlives the transaction and
+    // rides back into the pool on this connection unless it is released here.
+    // Same for the session `lock_timeout`.
+    //
+    // The distinction is the CONNECTION's health, NOT whether the migration
+    // failed. An ordinary refusal — W1BR-014's "replaying an older migration"
+    // for instance — leaves a perfectly healthy session that must be cleaned
+    // up before it is reused; caught by the K-06 test below asserting no
+    // advisory lock survives, which failed the first time this cleanup was
+    // gated on "did anything throw" instead. A BROKEN connection is destroyed
+    // instead, which drops the session and every lock with it, and must not be
+    // spoken to first.
+    const broken = ambiguous !== undefined && isConnectionAmbiguous(ambiguous);
+    if (!broken) {
+      await bounded("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [
+        LEDGER_LOCK_KEY,
+      ]).catch(() => undefined);
+      await bounded("RESET lock_timeout").catch(() => undefined);
+    }
+    client.release(broken ? true : undefined);
   }
 }
