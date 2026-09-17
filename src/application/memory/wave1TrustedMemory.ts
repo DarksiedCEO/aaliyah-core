@@ -140,6 +140,11 @@ export const TRUSTED_MEMORY_REJECTIONS = [
    * erasure, and one authorization is one mutation.
    */
   "merged_records_not_erased",
+  /**
+   * A merge that would make an identity chain longer than the read-time
+   * resolver walks, which would leave every identity on it unresolvable.
+   */
+  "identity_chain_too_deep",
   /** A mutation on a record whose head is deleted, other than a restore. */
   "record_deleted",
   /**

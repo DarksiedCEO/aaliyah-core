@@ -135,7 +135,10 @@ export function createWave1MemoryService(
   ): Promise<string> {
     const seen = new Set<string>([recordId]);
     let current = recordId;
-    for (let depth = 0; depth < MEMORY_CANONICAL_RESOLUTION_MAX_DEPTH; depth += 1) {
+    // A chain of MAX hops takes MAX + 1 lookups: MAX redirects and the one
+    // that finds the canonical record. `<` here refused a chain of exactly
+    // MAX (red team M3 against 2b2e554).
+    for (let depth = 0; depth <= MEMORY_CANONICAL_RESOLUTION_MAX_DEPTH; depth += 1) {
       const next = await deps.identityGraph.mergedInto(actor, current);
       if (next === null) return current;
       if (seen.has(next)) {

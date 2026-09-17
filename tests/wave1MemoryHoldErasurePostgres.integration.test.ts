@@ -193,7 +193,7 @@ before(async () => {
   shadowTombstonePool = new Pool({
     connectionString: DB_URL,
     max: 4,
-    options: `-c search_path=${EMPTY_TOMBSTONE_SCHEMA},public`,
+    options: `${process.env.PGOPTIONS ?? ""} -c search_path=${EMPTY_TOMBSTONE_SCHEMA},public`,
   });
 });
 
@@ -4470,4 +4470,58 @@ test("K-5 RED TEAM RT2-H1: a spent CORRECT authorization cannot also witness a b
   const unerased = await adminPool.query(`SELECT count(*)::int AS n FROM memory_alias_bindings WHERE pii_erased_at IS NULL`);
   assert.equal(unerased.rows[0].n, 0);
   assert.equal(await aliases().resolveAlias(SCOPE, VICTIM_NORMALIZED), null);
+});
+
+test("K-6 RED TEAM RT2-K1: a key_destroyed row forged for a LIVE key does not stop the completion pass from destroying it", async () => {
+  await bindVictimAddress();
+  const before = await bindingState("alias-pii-001");
+  const copied = before.pii_envelope as PiiEnvelope;
+  TEST_PII_KEYS.setAvailable(false);
+  let result;
+  try {
+    ({ result } = await eraseParticipant("mutation.k6", "tombstone-k6"));
+  } finally {
+    TEST_PII_KEYS.setAvailable(true);
+  }
+  assert.equal(result.rejection, "erasure_incomplete");
+  assert.deepEqual(result.aliasErasure, { bindingsErased: 1, keysDestroyed: 0, keysPending: 1 });
+
+  // The key_destroyed guard binds the tombstone as well as the key: evidence
+  // naming another tombstone is refused (P6 branch survivor BM4).
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        `INSERT INTO memory_pii_key_erasures (tenant_id, workspace_id, tombstone_id, alias_id, binding_mutation_receipt_id, key_ref, provider_id, event)
+         SELECT tenant_id, workspace_id, 'tombstone-k6-other', alias_id, binding_mutation_receipt_id, key_ref, provider_id, 'key_destroyed'
+           FROM memory_pii_key_erasures WHERE tombstone_id = 'tombstone-k6' AND event = 'erasure_committed'`,
+      ),
+    /a key is recorded destroyed only after its erasure committed/,
+  );
+  // The forgery the database cannot see: the right tombstone, a live key.
+  await runAs(
+    "aaliyah_memory_mutator",
+    `INSERT INTO memory_pii_key_erasures (tenant_id, workspace_id, tombstone_id, alias_id, binding_mutation_receipt_id, key_ref, provider_id, event)
+     SELECT tenant_id, workspace_id, tombstone_id, alias_id, binding_mutation_receipt_id, key_ref, provider_id, 'key_destroyed'
+       FROM memory_pii_key_erasures WHERE tombstone_id = 'tombstone-k6' AND event = 'erasure_committed'`,
+  );
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "active");
+
+  assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 1, pending: 0 });
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "destroyed");
+  await assert.rejects(
+    TEST_PII_KEYS.decrypt({
+      scope: DATA_SCOPE,
+      envelope: copied,
+      associatedData: aliasEnvelopeAssociatedData({
+        tenantId: SCOPE.tenantId,
+        workspaceId: SCOPE.workspaceId,
+        aliasId: "alias-pii-001",
+        mutationReceiptId: before.mutation_receipt_id,
+      }),
+    }),
+    MemoryPiiKeyDestroyed,
+  );
+  // Idempotent: a second pass finds the evidence true and does nothing.
+  assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 0, pending: 0 });
 });

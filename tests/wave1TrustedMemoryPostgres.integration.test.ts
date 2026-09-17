@@ -111,7 +111,7 @@ before(async () => {
   shadowReadPool = new Pool({
     connectionString: DB_URL,
     max: 4,
-    options: `-c search_path=${SHADOW_SCHEMA},public`,
+    options: `${process.env.PGOPTIONS ?? ""} -c search_path=${SHADOW_SCHEMA},public`,
   });
 
   // A relation shaped like the real one but WITHOUT its CHECK constraints.
@@ -139,7 +139,7 @@ before(async () => {
   uncheckedReadPool = new Pool({
     connectionString: DB_URL,
     max: 2,
-    options: `-c search_path=${UNCHECKED_SCHEMA},public`,
+    options: `${process.env.PGOPTIONS ?? ""} -c search_path=${UNCHECKED_SCHEMA},public`,
   });
 });
 
@@ -5080,16 +5080,20 @@ async function rawReceipt(input: {
   mutationReceiptId: string;
   authorizationId: string;
   scope?: MemoryScope;
+  action?: string;
+  targetRecordId?: string;
 }): Promise<void> {
   const scope = input.scope ?? SCOPE;
+  const action = input.action ?? "correct";
+  const targetRecordId = input.targetRecordId ?? RECORD_ID;
   const payload = {
     schemaVersion: WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION,
     mutationReceiptId: input.mutationReceiptId,
     authorizationId: input.authorizationId,
     consumedNonceDigest: `sha256:${"5".repeat(64)}`,
-    action: "correct",
+    action,
     scope,
-    targetRecordId: RECORD_ID,
+    targetRecordId,
     outcome: { status: "UNKNOWN_PENDING_RECONCILIATION" },
   };
   await asMutator(
@@ -5097,7 +5101,7 @@ async function rawReceipt(input: {
        (tenant_id, workspace_id, principal_id, user_id, mutation_receipt_id,
         phase, authorization_id, consumed_nonce_digest, action,
         target_record_id, outcome_status, emitted_at, payload)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'correct',$9,
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$11,$9,
              'UNKNOWN_PENDING_RECONCILIATION', now(), $10)`,
     [
       scope.tenantId,
@@ -5108,8 +5112,9 @@ async function rawReceipt(input: {
       input.phase,
       input.authorizationId,
       payload.consumedNonceDigest,
-      RECORD_ID,
+      targetRecordId,
       JSON.stringify(payload),
+      action,
     ],
   );
 }
@@ -5154,6 +5159,26 @@ test("N-5 the DATABASE refuses a terminal receipt that describes a different mut
   // Positive control: the matching terminal is accepted.
   await rawReceipt({ phase: "terminal", mutationReceiptId: "mutation.pair", authorizationId: mine.authorizationId });
   assert.equal((await receiptStatuses("mutation.pair")).length, 2);
+});
+
+test("N-5b a terminal receipt differing from its pending one in ACTION alone, or TARGET alone, is refused", async () => {
+  // P6 branch survivors BM1 and BM8 (red team, 2b2e554): N-5 varies only the
+  // authorization, so removing the action or target comparison changed
+  // nothing any test observed.
+  const genesis = await seedGenesis({ n: 0 });
+  const mine = await issue(
+    authorization({ action: "correct", expectedHead: headOf(1, genesis), proposedContent: { n: 1 } }),
+  );
+  await rawReceipt({ phase: "pending", mutationReceiptId: "mutation.pair.b", authorizationId: mine.authorizationId });
+  for (const differs of [{ action: "promote" }, { targetRecordId: "record-some-other" }]) {
+    await assert.rejects(
+      () => rawReceipt({ phase: "terminal", mutationReceiptId: "mutation.pair.b", authorizationId: mine.authorizationId, ...differs }),
+      /a terminal receipt must describe the same mutation as its pending receipt/,
+      JSON.stringify(differs),
+    );
+  }
+  await rawReceipt({ phase: "terminal", mutationReceiptId: "mutation.pair.b", authorizationId: mine.authorizationId });
+  assert.equal((await receiptStatuses("mutation.pair.b")).length, 2);
 });
 
 test("N-6 the DATABASE refuses a mutation receipt filed outside its authorization's scope", async () => {

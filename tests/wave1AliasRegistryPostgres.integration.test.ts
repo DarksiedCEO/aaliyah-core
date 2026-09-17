@@ -176,12 +176,12 @@ before(async () => {
   shadowRecordPool = new Pool({
     connectionString: DB_URL,
     max: 4,
-    options: `-c search_path=${SHADOW_RECORD_SCHEMA},public`,
+    options: `${process.env.PGOPTIONS ?? ""} -c search_path=${SHADOW_RECORD_SCHEMA},public`,
   });
   shadowBindingPool = new Pool({
     connectionString: DB_URL,
     max: 4,
-    options: `-c search_path=${SHADOW_BINDING_SCHEMA},public`,
+    options: `${process.env.PGOPTIONS ?? ""} -c search_path=${SHADOW_BINDING_SCHEMA},public`,
   });
 
   // A relation shaped like the binding table but WITHOUT its CHECK
@@ -207,7 +207,7 @@ before(async () => {
   uncheckedPool = new Pool({
     connectionString: DB_URL,
     max: 2,
-    options: `-c search_path=${UNCHECKED_SCHEMA},public`,
+    options: `${process.env.PGOPTIONS ?? ""} -c search_path=${UNCHECKED_SCHEMA},public`,
   });
 });
 

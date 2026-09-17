@@ -152,6 +152,14 @@ function childEnv(options) {
   // serialized events to its parent instead of running its reporters — so it
   // would report nothing at all. Removed so a watchdog run is always a root run.
   delete env.NODE_TEST_CONTEXT;
+  // NOTHING INHERITED MAY CHOOSE WHICH TESTS RUN. Red team M1 against
+  // 2b2e554: NODE_OPTIONS="--test-skip-pattern=..." deselected 68 destroyer,
+  // PII, race and receipt tests and the run was still PASS on a clean tree;
+  // on a fixture it turned a failing test into PASS. NODE_OPTIONS can also
+  // preload code (--require/--import) that rewrites node:test. Every flag the
+  // runner needs is on its own argv, so the variable is dropped entirely and
+  // what was dropped is recorded in the evidence.
+  delete env.NODE_OPTIONS;
   return env;
 }
 
@@ -256,6 +264,9 @@ async function main() {
     startedAt: startedAt.toISOString(),
     finishedAt: null,
     durationMs: null,
+    environment: {
+      nodeOptionsIgnored: process.env.NODE_OPTIONS ?? null,
+    },
     bounds: {
       testTimeoutMs: options.testTimeoutMs,
       deadlineMs: options.deadlineMs,

@@ -5111,6 +5111,89 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       END;
       $fn$;`,
   },
+  {
+    // ------------------------------------------------------------------
+    // NO MERGE MAY MAKE AN IDENTITY UNRESOLVABLE.
+    //
+    // Red team M3 against 2b2e554. The read-time resolver walks at most
+    // MEMORY_CANONICAL_RESOLUTION_MAX_DEPTH (16) merge hops, so that a cycle
+    // from a replica or a dropped trigger cannot hang a reader. Nothing bounded
+    // the chains the database ACCEPTED: 17 legitimate merges produced a chain
+    // no identity on which could ever resolve again, with no un-merge to repair
+    // it. (The resolver also refused a chain of exactly 16, an off-by-one fixed
+    // in the service.)
+    //
+    // A merge is now refused when the chain through it — the longest chain
+    // already merged into the absorbed record, this edge, and any chain beyond
+    // the survivor — would exceed 16 hops. Merges within a workspace take one
+    // graph lock first, so two merges at opposite ends of a chain cannot each
+    // pass the bound alone and exceed it together.
+    // ------------------------------------------------------------------
+    id: "053_memory_merge_chain_bounded",
+    sql: `CREATE OR REPLACE FUNCTION public.aaliyah_memory_merge_chain_hops(
+      p_tenant text, p_workspace text, p_from text, p_to text)
+      RETURNS integer
+      LANGUAGE sql
+      STABLE
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public, pg_temp
+      AS $fn$
+        WITH RECURSIVE incoming(record_id, hops) AS (
+          SELECT p_from, 0
+          UNION ALL
+          SELECT e.from_record_id, i.hops + 1
+            FROM public.memory_identity_edges AS e
+            JOIN incoming AS i ON e.to_record_id = i.record_id
+           WHERE e.tenant_id = p_tenant AND e.workspace_id = p_workspace
+             AND e.kind = 'merged_into' AND i.hops < 64
+        ), outgoing(record_id, hops) AS (
+          SELECT p_to, 0
+          UNION ALL
+          SELECT e.to_record_id, o.hops + 1
+            FROM public.memory_identity_edges AS e
+            JOIN outgoing AS o ON e.from_record_id = o.record_id
+           WHERE e.tenant_id = p_tenant AND e.workspace_id = p_workspace
+             AND e.kind = 'merged_into' AND o.hops < 64
+        )
+        SELECT (SELECT max(hops) FROM incoming) + 1 + (SELECT max(hops) FROM outgoing);
+      $fn$;
+    REVOKE ALL ON FUNCTION public.aaliyah_memory_merge_chain_hops(text, text, text, text) FROM PUBLIC;
+    GRANT EXECUTE ON FUNCTION public.aaliyah_memory_merge_chain_hops(text, text, text, text)
+      TO aaliyah_memory_mutator;
+
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_merge_chain_guard()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public, pg_temp
+      AS $fn$
+      DECLARE
+        hops integer;
+      BEGIN
+        IF NEW.kind <> 'merged_into' THEN
+          RETURN NULL;
+        END IF;
+        PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(
+          'aaliyah-identity-graph' || chr(31) || NEW.tenant_id || chr(31) || NEW.workspace_id, 0));
+        -- This edge is already visible to its own AFTER trigger, so the walk
+        -- from the absorbed record forward counts it: measure from its two
+        -- ends with the edge itself excluded by construction (incoming stops
+        -- at the absorbed record, outgoing starts at the survivor).
+        hops := public.aaliyah_memory_merge_chain_hops(
+          NEW.tenant_id, NEW.workspace_id, NEW.from_record_id, NEW.to_record_id);
+        IF hops > 16 THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a merge may not make an identity chain longer than 16 hops (this one: %)', hops
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_identity_edges_zy_merge_chain_bounded ON memory_identity_edges;
+    CREATE TRIGGER memory_identity_edges_zy_merge_chain_bounded
+      AFTER INSERT ON memory_identity_edges
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_merge_chain_guard();`,
+  },
 ];
 
 /**

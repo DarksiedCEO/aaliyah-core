@@ -85,8 +85,15 @@ function assertFail(
   );
 }
 
+// The positive control's bounds are deliberately NOT tight. Under the CPU
+// contention of concurrent reviewers and a mutation sweep, the FAST profile's
+// two-second test timeout and exit grace judged this passing fixture hung
+// (2b2e554 security review, one run in two). Only the refusals need FAST; a
+// PASS must not depend on how busy the machine is.
+const RELAXED = ["--no-db", "--test-timeout-ms", "60000", "--deadline-ms", "110000", "--exit-grace-ms", "15000"];
+
 test("POSITIVE CONTROL: a genuinely passing fixture is PASS, so every refusal below is specific", () => {
-  const run = runWatchdog(["pass.fixture.cjs"], FAST);
+  const run = runWatchdog(["pass.fixture.cjs"], RELAXED);
   assert.equal(run.evidence.verdict, "PASS", JSON.stringify(run.evidence.reasons));
   assert.equal(run.status, 0);
   assert.deepEqual(run.evidence.reasons, []);
@@ -253,4 +260,17 @@ test("no hook in the suite is callback-style, which the hook sentinel deliberate
   };
   walk(path.join(ROOT, "tests"));
   assert.deepEqual(offenders, []);
+});
+
+test("an inherited NODE_OPTIONS cannot deselect a failing test: it is dropped, recorded, and the run is FAIL", () => {
+  const run = runWatchdog(["one-failing-among-two.fixture.cjs"], FAST, {
+    NODE_OPTIONS: "--test-skip-pattern=failing",
+  });
+  assertFail(run, /^FAILED_TESTS: 1$/);
+  assert.equal(run.evidence.counts?.tests, 2);
+  assert.equal(
+    (run.evidence as unknown as { environment: { nodeOptionsIgnored: string | null } }).environment
+      .nodeOptionsIgnored,
+    "--test-skip-pattern=failing",
+  );
 });

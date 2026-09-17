@@ -21,6 +21,11 @@ import { MEMORY_DELETION_ORDER_SCHEMA_VERSION } from "../src/application/memory/
 import { memoryContentDigest } from "../src/application/memory/wave1TrustedMemory";
 import { runMailMigrations } from "../src/persistence/postgres/migrations";
 import { createPostgresTrustedMemoryStore } from "../src/persistence/postgres/wave1TrustedMemoryStore";
+import { createPostgresIdentityGraph } from "../src/persistence/postgres/wave1IdentityGraphStore";
+import {
+  MEMORY_CANONICAL_RESOLUTION_MAX_DEPTH,
+  createWave1MemoryService,
+} from "../src/application/memory/wave1MemoryService";
 import {
   lockSharedMemoryTables,
   type SharedTableLock,
@@ -1959,4 +1964,106 @@ test("C9 the numeric-domain trigger guards identity-edge payloads: fractional re
   await assert.rejects(() => insert({ weight: 0.5 }), /outside the exact numeric domain/);
   await insert({ weight: 2 });
   assert.equal((await edgesFor(ALICE)).length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// D — NO MERGE MAY MAKE AN IDENTITY UNRESOLVABLE (red team M3, 2b2e554)
+// ---------------------------------------------------------------------------
+
+function chainIds(n: number): string[] {
+  return Array.from({ length: n }, (_, i) => `record-chain-${String(i).padStart(2, "0")}`);
+}
+
+async function mergeAtHead(from: string, to: string, receiptId: string, deleting = store()) {
+  const head = await store().readHead(SCOPE, from);
+  assert.ok(head);
+  const order = mergeOrder(to);
+  const receipt = await issue(
+    authorization({
+      action: "merge_identity",
+      targetRecordId: from,
+      expectedHead: { kind: "version", version: head.version, contentDigest: head.contentDigest },
+      proposedContent: order,
+    }),
+  );
+  const result = await deleting.mergeIdentity({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: from,
+    proposedContent: order,
+    mutationReceiptId: receiptId,
+  });
+  return { receipt, result };
+}
+
+function resolver() {
+  return createWave1MemoryService({
+    store: store(),
+    aliases: { resolveAlias: async () => null },
+    identityGraph: createPostgresIdentityGraph(readPool),
+    reconciler: { reconcileAll: async () => [] },
+  });
+}
+
+test("D-1 a chain of exactly the resolver's depth resolves; a merge that would lengthen it is refused before consumption", async () => {
+  assert.equal(MEMORY_CANONICAL_RESOLUTION_MAX_DEPTH, 16);
+  const ids = chainIds(18);
+  for (const id of ids) await createRecord(id, { id });
+  for (let i = 0; i < 16; i += 1) {
+    const { result } = await mergeAtHead(ids[i]!, ids[i + 1]!, `mutation.d1.${i}`);
+    assert.equal(result.verified, true, `merge ${i}: ${result.rejection}`);
+  }
+  // 16 hops: the off-by-one refused this.
+  assert.equal(await resolver().canonicalIdentity(SCOPE, ids[0]!), ids[16]);
+
+  const tail = await mergeAtHead(ids[16]!, ids[17]!, "mutation.d1.tail");
+  assert.equal(tail.result.rejection, "identity_chain_too_deep");
+  assert.equal(await nonceConsumedAt(tail.receipt.nonce.bindingDigest), null);
+
+  // Positive control: a merge INTO the chain's canonical record branches the
+  // graph without lengthening any chain (migration 042 already refuses a merge
+  // into an absorbed record, so a chain can only grow at its canonical end).
+  await createRecord("record-chain-branch", { id: "branch" });
+  const branch = await mergeAtHead("record-chain-branch", ids[16]!, "mutation.d1.branch");
+  assert.equal(branch.result.verified, true, branch.result.rejection ?? "");
+  // Every identity on the graph still resolves.
+  assert.equal(await resolver().canonicalIdentity(SCOPE, ids[0]!), ids[16]);
+  assert.equal(await resolver().canonicalIdentity(SCOPE, "record-chain-branch"), ids[16]);
+});
+
+test("D-2 the DATABASE refuses the 17th hop even when the store's own check is blinded", async () => {
+  const ids = chainIds(18);
+  for (const id of ids) await createRecord(id, { id });
+  for (let i = 0; i < 16; i += 1) {
+    const { result } = await mergeAtHead(ids[i]!, ids[i + 1]!, `mutation.d2.${i}`);
+    assert.equal(result.verified, true, `merge ${i}: ${result.rejection}`);
+  }
+  await adminPool.query(`DROP SCHEMA IF EXISTS d2_shadow CASCADE`);
+  await adminPool.query(`CREATE SCHEMA d2_shadow`);
+  await adminPool.query(
+    `CREATE FUNCTION d2_shadow.aaliyah_memory_merge_chain_hops(text, text, text, text)
+       RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$`,
+  );
+  await adminPool.query(`GRANT USAGE ON SCHEMA d2_shadow TO aaliyah_memory_mutator`);
+  await adminPool.query(`GRANT EXECUTE ON FUNCTION d2_shadow.aaliyah_memory_merge_chain_hops(text, text, text, text) TO aaliyah_memory_mutator`);
+  const blind = new Pool({
+    connectionString: DB_URL,
+    max: 2,
+    options: `${process.env.PGOPTIONS ?? ""} -c search_path=d2_shadow,public`,
+  });
+  try {
+    const { receipt, result } = await mergeAtHead(
+      ids[16]!,
+      ids[17]!,
+      "mutation.d2.tail",
+      createPostgresTrustedMemoryStore(blind, readPool),
+    );
+    assert.equal(result.verified, false);
+    assert.equal(result.rejection, "storage_rejected");
+    assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
+    assert.equal((await edgesFor(ids[16]!)).length, 0);
+  } finally {
+    await blind.end();
+    await adminPool.query(`DROP SCHEMA IF EXISTS d2_shadow CASCADE`);
+  }
 });

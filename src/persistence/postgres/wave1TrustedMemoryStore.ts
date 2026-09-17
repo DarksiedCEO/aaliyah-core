@@ -43,6 +43,7 @@ import {
   type TrustedMemoryStore,
 } from "../../application/memory/wave1TrustedMemory";
 import { appendMutationAttempt } from "./memoryMutationAttempts";
+import { MEMORY_CANONICAL_RESOLUTION_MAX_DEPTH } from "../../application/memory/wave1MemoryService";
 import type { MemoryPiiKeyProvider } from "../../crypto/memoryPiiKeys";
 
 /**
@@ -250,6 +251,7 @@ const ABORT_REASON: Record<string, MemoryAbortReason> = {
   identity_counterparty_merged_away: "policy_rejected",
   record_merged_away: "policy_rejected",
   merged_records_not_erased: "policy_rejected",
+  identity_chain_too_deep: "policy_rejected",
   request_malformed: "policy_rejected",
   authorization_not_found: "policy_rejected",
   authorization_malformed: "policy_rejected",
@@ -1298,6 +1300,22 @@ export function createPostgresTrustedMemoryStore(
             if (counterpartyMerged.rowCount === 1) {
               throw new MutationAborted("identity_counterparty_merged_away");
             }
+            // Red team M3 against 2b2e554: a chain longer than the resolver
+            // walks makes every identity on it unresolvable, for good.
+            // Migration 053 refuses the edge under a workspace graph lock;
+            // this answers first, by name.
+            const hops = await client.query(
+              `SELECT aaliyah_memory_merge_chain_hops($1, $2, $3, $4) AS hops`,
+              [
+                stored.scope.tenantId,
+                stored.scope.workspaceId,
+                stored.targetRecordId,
+                counterparty.recordId,
+              ],
+            );
+            if ((hops.rows[0].hops as number) > MEMORY_CANONICAL_RESOLUTION_MAX_DEPTH) {
+              throw new MutationAborted("identity_chain_too_deep");
+            }
           }
           identityEdge = {
             kind: counterparty.kind,
@@ -2028,24 +2046,31 @@ export function createPostgresTrustedMemoryStore(
       binding_mutation_receipt_id: string;
       key_ref: string;
       provider_id: string;
+      evidenced: boolean;
     }>;
     let erased = 0;
     try {
       await client.query("BEGIN");
       await enterRole(client, mutationRole);
       const found = await client.query(
+        // Keys already EVIDENCED destroyed are included too, after the rest.
+        // Red team M2 against 2b2e554: the mutation role could insert a
+        // `key_destroyed` row for a key that was still alive, and this pass
+        // then never looked at it again. The database cannot see a key
+        // outside it, so the evidence row is not trusted here: the provider
+        // is asked, and a contradicted row's key is destroyed.
         `SELECT c.tenant_id, c.workspace_id, c.tombstone_id, c.alias_id,
-                c.binding_mutation_receipt_id, c.key_ref, c.provider_id
+                c.binding_mutation_receipt_id, c.key_ref, c.provider_id,
+                EXISTS (
+                  SELECT 1 FROM memory_pii_key_erasures AS d
+                   WHERE d.tenant_id = c.tenant_id AND d.workspace_id = c.workspace_id
+                     AND d.key_ref = c.key_ref AND d.event = 'key_destroyed') AS evidenced
            FROM memory_pii_key_erasures AS c
           WHERE c.event = 'erasure_committed'
             AND ($1::text IS NULL OR c.tenant_id = $1)
             AND ($2::text IS NULL OR c.workspace_id = $2)
             AND ($3::text IS NULL OR c.tombstone_id = $3)
-            AND NOT EXISTS (
-              SELECT 1 FROM memory_pii_key_erasures AS d
-               WHERE d.tenant_id = c.tenant_id AND d.workspace_id = c.workspace_id
-                 AND d.key_ref = c.key_ref AND d.event = 'key_destroyed')
-          ORDER BY c.id
+          ORDER BY evidenced, c.id
           LIMIT $4`,
         [filter.tenantId ?? null, filter.workspaceId ?? null, filter.tombstoneId ?? null, filter.limit],
       );
@@ -2069,8 +2094,21 @@ export function createPostgresTrustedMemoryStore(
     }
 
     let destroyed = 0;
+    let settled = 0;
     for (const row of due) {
       if (piiKeys === null || row.provider_id !== piiKeys.providerId) continue;
+      if (row.evidenced) {
+        const claimed = await piiKeys
+          .dataKeyState({
+            scope: { tenantId: row.tenant_id, workspaceId: row.workspace_id },
+            keyRef: row.key_ref,
+          })
+          .catch(() => null);
+        if (claimed === "destroyed") {
+          settled += 1;
+          continue;
+        }
+      }
       try {
         await piiKeys.destroyDataKey({
           scope: { tenantId: row.tenant_id, workspaceId: row.workspace_id },
@@ -2113,7 +2151,7 @@ export function createPostgresTrustedMemoryStore(
         writer.release();
       }
     }
-    return { destroyed, pending: due.length - destroyed, erased };
+    return { destroyed, pending: due.length - settled - destroyed, erased };
   }
 
   /**
