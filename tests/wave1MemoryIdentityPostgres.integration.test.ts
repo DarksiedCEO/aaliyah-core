@@ -1383,3 +1383,262 @@ test("S-5 the DATABASE refuses an edge into a record whose head is deleted", asy
   );
   assert.equal((await edgesFor(ALICE)).length, 0);
 });
+
+// ---------------------------------------------------------------------------
+// C4 — A MUTATED ROW CARRIES ITS AUTHORIZATION'S SCOPE (security, b3efc82).
+//
+// The adversary is a holder of `aaliyah_memory_mutator` writing directly — the
+// party migrations 034/038/039 already defend against. Each case holds every
+// OTHER guard satisfied, so the refusal pinned is the one under test.
+// ---------------------------------------------------------------------------
+
+const VICTIM_SCOPE: MemoryScope = {
+  ...SCOPE,
+  principalId: "principal-victim",
+  userId: "user-victim",
+};
+
+/** Issue an authorization in ANY scope, for ANY target, and spend it. */
+async function spendScoped(input: {
+  scope: MemoryScope;
+  action: MemoryAction;
+  targetRecordId: string;
+  expectedHead: MemoryExpectedHead;
+  proposedContent: unknown;
+  mutationReceiptId: string;
+}): Promise<string> {
+  const receipt = await issue(
+    authorization({
+      action: input.action,
+      targetRecordId: input.targetRecordId,
+      expectedHead: input.expectedHead,
+      proposedContent: input.proposedContent,
+      scope: input.scope,
+    }),
+  );
+  await runAs(
+    "aaliyah_memory_mutator",
+    `UPDATE memory_authorization_nonces
+        SET consumed_at = now(), consumed_by_mutation_receipt_id = $2
+      WHERE binding_digest = $1 AND consumed_at IS NULL`,
+    [receipt.nonce.bindingDigest, input.mutationReceiptId],
+  );
+  return receipt.authorizationId;
+}
+
+function scopedEdgeParams(
+  scope: MemoryScope,
+  from: string,
+  to: string,
+  authorizationId: string,
+  receipt: string,
+) {
+  return [
+    scope.tenantId,
+    scope.workspaceId,
+    scope.principalId,
+    scope.userId,
+    from,
+    to,
+    authorizationId,
+    receipt,
+  ];
+}
+
+test("C4-1 an edge filed under the VICTIM's scope, witnessed by an authorization in the ATTACKER's, is refused", async () => {
+  // Security PoC B. The victim owns both records, so the edge's FROM owner
+  // agrees with the edge; only the authorization's scope does not.
+  const victimRecord = "record-identity-victim";
+  const victimOther = "record-identity-victim-2";
+  const victimDigest = await createRecord(victimRecord, { name: "Victim" }, VICTIM_SCOPE);
+  await createRecord(victimOther, { name: "Victim, elsewhere" }, VICTIM_SCOPE);
+  // A merge authorization issued in the attacker's scope that names the
+  // victim's record. Nothing in the database forbids issuing one.
+  const foreign = await spendScoped({
+    scope: SCOPE,
+    action: "merge_identity",
+    targetRecordId: victimRecord,
+    expectedHead: { kind: "version", version: 1, contentDigest: victimDigest },
+    proposedContent: mergeOrder(victimOther),
+    mutationReceiptId: "mutation.c4.poc-b",
+  });
+
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        RAW_EDGE_SQL,
+        scopedEdgeParams(VICTIM_SCOPE, victimRecord, victimOther, foreign, "mutation.c4.poc-b"),
+      ),
+    /a memory_identity_edges row must carry the scope of the authorization that witnesses it/,
+  );
+  assert.equal((await edgesFor(victimRecord)).length, 0);
+
+  // The impact that no longer lands: the victim's own correction still works.
+  const next = { name: "Victim", note: "still mine" };
+  const own = await issue(
+    authorization({
+      action: "correct",
+      targetRecordId: victimRecord,
+      expectedHead: { kind: "version", version: 1, contentDigest: victimDigest },
+      proposedContent: next,
+      scope: VICTIM_SCOPE,
+    }),
+  );
+  const corrected = await store().correct({
+    actor: VICTIM_SCOPE,
+    authorizationId: own.authorizationId,
+    recordId: victimRecord,
+    proposedContent: next,
+    mutationReceiptId: "mutation.c4.victim-correct",
+  });
+  assert.equal(corrected.verified, true, corrected.rejection ?? "");
+});
+
+test("C4-2 an edge may only leave a record its owner holds, whichever scope it claims", async () => {
+  // Security PoC A: the attacker's OWN authorization, for its OWN record,
+  // spent on an edge filed under the victim's scope.
+  const attackerRecord = "record-identity-attacker";
+  const victimRecord = "record-identity-victim";
+  const attackerDigest = await createRecord(attackerRecord, { name: "Attacker" });
+  const victimDigest = await createRecord(victimRecord, { name: "Victim" }, VICTIM_SCOPE);
+  const own = await spendScoped({
+    scope: SCOPE,
+    action: "merge_identity",
+    targetRecordId: attackerRecord,
+    expectedHead: { kind: "version", version: 1, contentDigest: attackerDigest },
+    proposedContent: mergeOrder(victimRecord),
+    mutationReceiptId: "mutation.c4.poc-a",
+  });
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        RAW_EDGE_SQL,
+        scopedEdgeParams(VICTIM_SCOPE, attackerRecord, victimRecord, own, "mutation.c4.poc-a"),
+      ),
+    /an identity edge may only leave a record its owner holds/,
+  );
+
+  // The mirror: filed under the ATTACKER's scope (so the authorization's
+  // scope agrees), leaving the VICTIM's record through a foreign-target grant.
+  const attackerOther = "record-identity-attacker-2";
+  await createRecord(attackerOther, { name: "Attacker, elsewhere" });
+  const foreign = await spendScoped({
+    scope: SCOPE,
+    action: "merge_identity",
+    targetRecordId: victimRecord,
+    expectedHead: { kind: "version", version: 1, contentDigest: victimDigest },
+    proposedContent: mergeOrder(attackerOther),
+    mutationReceiptId: "mutation.c4.poc-a-mirror",
+  });
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        RAW_EDGE_SQL,
+        scopedEdgeParams(SCOPE, victimRecord, attackerOther, foreign, "mutation.c4.poc-a-mirror"),
+      ),
+    /an identity edge may only leave a record its owner holds/,
+  );
+  assert.equal((await edgesFor(attackerRecord)).length, 0);
+  assert.equal((await edgesFor(victimRecord)).length, 0);
+});
+
+test("C4-3 a later VERSION of somebody else's record cannot be appended under a foreign-target authorization", async () => {
+  // Migration 039 bound GENESIS to its authorization's scope and nothing
+  // later: continuity with the predecessor agreed with the victim's principal,
+  // and the witness only resolved the target.
+  const victimRecord = "record-identity-victim";
+  const victimDigest = await createRecord(victimRecord, { name: "Victim" }, VICTIM_SCOPE);
+  const forged = { name: "Victim", note: "written by somebody else" };
+  const foreign = await spendScoped({
+    scope: SCOPE,
+    action: "correct",
+    targetRecordId: victimRecord,
+    expectedHead: { kind: "version", version: 1, contentDigest: victimDigest },
+    proposedContent: forged,
+    mutationReceiptId: "mutation.c4.version",
+  });
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        `INSERT INTO memory_record_versions
+           (tenant_id, workspace_id, principal_id, user_id, record_id, version,
+            state, content_digest, predecessor_digest, authorization_id,
+            mutation_receipt_id, payload)
+         VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,2,'active',
+                 $6::text,$7::text,$8::text,'mutation.c4.version',
+                 jsonb_build_object(
+                   'recordId',$5::text,'version','2','state','active',
+                   'contentDigest',$6::text,'predecessorDigest',$7::text,
+                   'authorizationId',$8::text,
+                   'mutationReceiptId','mutation.c4.version',
+                   'scope', jsonb_build_object('tenantId',$1::text,
+                                               'workspaceId',$2::text,
+                                               'principalId',$3::text,
+                                               'userId',$4::text)))`,
+        [
+          VICTIM_SCOPE.tenantId,
+          VICTIM_SCOPE.workspaceId,
+          VICTIM_SCOPE.principalId,
+          VICTIM_SCOPE.userId,
+          victimRecord,
+          memoryContentDigest(forged),
+          victimDigest,
+          foreign,
+        ],
+      ),
+    /a memory_record_versions row must carry the scope of the authorization that witnesses it/,
+  );
+  assert.equal(await countVersions(victimRecord), 1);
+});
+
+test("C4-4 the scope binding is attached, enabled, and last-firing on every table a mutation writes", async () => {
+  // Behaviour is proven above (versions, edges) and in the alias registry
+  // suite (bindings). A TOMBSTONE mismatch is not reachable on its own: a
+  // second tombstone for a deleted version collides with the tombstone
+  // uniqueness constraints first, and a deleted version written under a
+  // mismatched scope is refused by the version binding. So for tombstones the
+  // attachment itself is what is pinned — a dropped or disabled trigger fails
+  // here.
+  const expected = [
+    ["memory_record_versions", "memory_record_versions_zz_authorization_scope"],
+    ["memory_identity_edges", "memory_identity_edges_zz_authorization_scope"],
+    ["memory_tombstones", "memory_tombstones_zz_authorization_scope"],
+    ["memory_alias_bindings", "memory_alias_bindings_zz_authorization_scope"],
+  ];
+  for (const [table, trigger] of expected) {
+    const found = await adminPool.query(
+      `SELECT t.tgenabled, p.proname,
+              (t.tgtype & 1) = 1 AS for_each_row,
+              (t.tgtype & 4) = 4 AS on_insert,
+              (t.tgtype & 2) = 0 AS after
+         FROM pg_trigger t
+         JOIN pg_class c ON c.oid = t.tgrelid
+         JOIN pg_proc p ON p.oid = t.tgfoid
+        WHERE c.relname = $1 AND t.tgname = $2`,
+      [table, trigger],
+    );
+    assert.equal(found.rowCount, 1, `${trigger} is missing`);
+    const row = found.rows[0];
+    assert.equal(row.tgenabled, "O", `${trigger} is not enabled`);
+    assert.equal(row.proname, "aaliyah_memory_row_in_authorization_scope");
+    assert.deepEqual([row.for_each_row, row.on_insert, row.after], [true, true, true]);
+    const later = await adminPool.query(
+      `SELECT t.tgname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+        WHERE c.relname = $1 AND NOT t.tgisinternal
+          AND (t.tgtype & 2) = 0 AND (t.tgtype & 4) = 4
+          AND t.tgname > $2`,
+      [table, trigger],
+    );
+    assert.deepEqual(later.rows, [], `${trigger} must fire last`);
+  }
+  const removal = await adminPool.query(
+    `SELECT t.tgenabled FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+      WHERE c.relname = 'memory_alias_bindings'
+        AND t.tgname = 'memory_alias_bindings_removal_authorization_scope'`,
+  );
+  assert.equal(removal.rows[0]?.tgenabled, "O");
+});

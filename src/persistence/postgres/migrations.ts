@@ -3678,6 +3678,165 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       END;
       $fn$`,
   },
+  {
+    // ------------------------------------------------------------------
+    // EVERY MUTATED ROW CARRIES THE SCOPE OF THE AUTHORIZATION THAT
+    // WITNESSES IT.
+    //
+    // Found by the b3efc82 security review. Migration 041's comment, and the
+    // store, claimed the identity-edge trigger "carries the same rule for
+    // writers that never come through here" as migration 039's genesis owner
+    // binding. It did not: the edge guard checked that the TO record existed
+    // under the edge's CLAIMED principal, user and workspace, and never that
+    // the claim was the authorization's. The witness a guard resolves
+    // (`aaliyah_memory_spent_nonce`) carries tenant, authorization, receipt and
+    // target — no principal, user or workspace. Executed as
+    // `aaliyah_memory_mutator`:
+    //
+    //   - holding ONE merge authorization issued for its OWN scope and its OWN
+    //     record, the attacker filed an identity edge under the VICTIM's
+    //     principal, user and workspace — accepted;
+    //   - with a merge authorization naming a foreign record (nothing in the
+    //     database constrains a receipt's target to its scope), it planted an
+    //     edge that redirected the victim's canonical-identity reads and froze
+    //     the victim's own record against the victim's own corrections.
+    //
+    // The same gap is wider than edges. Migration 039 bound GENESIS to the
+    // receipt's scope and left every later version bound only by continuity
+    // with its predecessor — so a foreign-target authorization could append to
+    // somebody else's chain under THEIR principal, and continuity would agree.
+    //
+    // So the rule is stated once, and attached to every table a mutation
+    // writes: the row's (tenant, workspace, principal, user) must be exactly
+    // the scope of the `memory_authorization_receipts` row its authorization
+    // id resolves to. Separate triggers per table, so each is independently
+    // killable by its own test.
+    //
+    // NAMED "_zz_" ON PURPOSE. PostgreSQL fires triggers of the same timing
+    // in NAME order. These fire LAST, after every older guard on the table,
+    // so each older guard still refuses its own case with its own message —
+    // a scope refusal that pre-empted them would leave those guards with no
+    // reachable input and no killing test.
+    //
+    // And an identity edge's FROM record must belong to the edge's owner: an
+    // authorization scoped to one principal, naming another principal's
+    // record, witnesses nothing about that record.
+    // ------------------------------------------------------------------
+    id: "044_memory_authorization_scope_binding",
+    sql: `CREATE OR REPLACE FUNCTION public.aaliyah_memory_row_in_authorization_scope()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      BEGIN
+        PERFORM 1
+          FROM public.memory_authorization_receipts AS a
+         WHERE a.tenant_id = NEW.tenant_id
+           AND a.authorization_id = NEW.authorization_id
+           AND a.workspace_id = NEW.workspace_id
+           AND a.principal_id = NEW.principal_id
+           AND a.user_id = NEW.user_id;
+        IF NOT FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a % row must carry the scope of the authorization that witnesses it',
+            TG_TABLE_NAME
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+
+    DROP TRIGGER IF EXISTS memory_record_versions_zz_authorization_scope
+      ON memory_record_versions;
+    CREATE TRIGGER memory_record_versions_zz_authorization_scope
+      AFTER INSERT ON memory_record_versions
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_row_in_authorization_scope();
+
+    DROP TRIGGER IF EXISTS memory_identity_edges_zz_authorization_scope
+      ON memory_identity_edges;
+    CREATE TRIGGER memory_identity_edges_zz_authorization_scope
+      AFTER INSERT ON memory_identity_edges
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_row_in_authorization_scope();
+
+    DROP TRIGGER IF EXISTS memory_tombstones_zz_authorization_scope
+      ON memory_tombstones;
+    CREATE TRIGGER memory_tombstones_zz_authorization_scope
+      AFTER INSERT ON memory_tombstones
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_row_in_authorization_scope();
+
+    DROP TRIGGER IF EXISTS memory_alias_bindings_zz_authorization_scope
+      ON memory_alias_bindings;
+    CREATE TRIGGER memory_alias_bindings_zz_authorization_scope
+      AFTER INSERT ON memory_alias_bindings
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_row_in_authorization_scope();
+
+    -- Retiring a binding is authorized separately, by removed_authorization_id.
+    CREATE OR REPLACE FUNCTION public.aaliyah_alias_removal_in_authorization_scope()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      BEGIN
+        IF NEW.removed_authorization_id IS NULL
+           OR NEW.removed_authorization_id IS NOT DISTINCT FROM OLD.removed_authorization_id THEN
+          RETURN NULL;
+        END IF;
+        PERFORM 1
+          FROM public.memory_authorization_receipts AS a
+         WHERE a.tenant_id = NEW.tenant_id
+           AND a.authorization_id = NEW.removed_authorization_id
+           AND a.workspace_id = NEW.workspace_id
+           AND a.principal_id = NEW.principal_id
+           AND a.user_id = NEW.user_id;
+        IF NOT FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a binding may only be retired under the scope of the authorization that retires it'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_alias_bindings_removal_authorization_scope
+      ON memory_alias_bindings;
+    CREATE TRIGGER memory_alias_bindings_removal_authorization_scope
+      AFTER UPDATE OF removed_authorization_id ON memory_alias_bindings
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_alias_removal_in_authorization_scope();
+
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_identity_edge_from_owner()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public
+      AS $fn$
+      DECLARE
+        owner_principal text;
+        owner_user text;
+      BEGIN
+        SELECT v.principal_id, v.user_id INTO owner_principal, owner_user
+          FROM public.memory_record_versions AS v
+         WHERE v.tenant_id = NEW.tenant_id
+           AND v.workspace_id = NEW.workspace_id
+           AND v.record_id = NEW.from_record_id
+         ORDER BY v.version DESC
+         LIMIT 1;
+        IF owner_principal IS NULL
+           OR owner_principal <> NEW.principal_id
+           OR owner_user <> NEW.user_id THEN
+          RAISE EXCEPTION
+            'aaliyah memory: an identity edge may only leave a record its owner holds'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    DROP TRIGGER IF EXISTS memory_identity_edges_from_owner
+      ON memory_identity_edges;
+    CREATE TRIGGER memory_identity_edges_from_owner
+      AFTER INSERT ON memory_identity_edges
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_identity_edge_from_owner()`,
+  },
 ];
 
 /**

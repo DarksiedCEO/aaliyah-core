@@ -596,14 +596,22 @@ for (const destroyer of [
 async function withoutTombstoneStructuralGuard<T>(
   run: () => Promise<T>,
 ): Promise<T> {
+  // Migration 044's scope binding is the same kind of layer: it resolves the
+  // base row's authorization, which this CHECK-layer fixture deliberately does
+  // not issue. Stood down with the structural guard, and its own behaviour is
+  // proven in tests/wave1MemoryIdentityPostgres.integration.test.ts (C4).
   await adminPool.query(
-    `ALTER TABLE memory_tombstones DISABLE TRIGGER memory_tombstones_structural`,
+    `ALTER TABLE memory_tombstones
+       DISABLE TRIGGER memory_tombstones_structural,
+       DISABLE TRIGGER memory_tombstones_zz_authorization_scope`,
   );
   try {
     return await run();
   } finally {
     await adminPool.query(
-      `ALTER TABLE memory_tombstones ENABLE TRIGGER memory_tombstones_structural`,
+      `ALTER TABLE memory_tombstones
+         ENABLE TRIGGER memory_tombstones_structural,
+         ENABLE TRIGGER memory_tombstones_zz_authorization_scope`,
     );
   }
 }

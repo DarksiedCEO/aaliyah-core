@@ -3711,3 +3711,51 @@ test("B3 a binding witnessed by a nonce consumed after it lapsed is refused", as
   );
   assert.equal(await activeBindings(), 0);
 });
+
+test("C4-A a binding witnessed by an authorization issued to ANOTHER principal is refused", async () => {
+  // Found by the b3efc82 security review for identity edges; the same shape
+  // held here. The witness resolves tenant, authorization and receipt — never
+  // the principal, user or workspace the binding is filed under.
+  await witnessAppend({
+    authorizationId: "auth-alias-foreign-scope-0000000",
+    mutationReceiptId: "mutation.raw",
+    targetRecordId: VICTIM,
+    scope: { ...SCOPE, principalId: "principal-alias-other" },
+  });
+  await assert.rejects(
+    () => insertRawBinding({ authorization_id: "auth-alias-foreign-scope-0000000" }, {
+      authorizationId: "auth-alias-foreign-scope-0000000",
+    }),
+    /a memory_alias_bindings row must carry the scope of the authorization that witnesses it/,
+  );
+  assert.equal(await activeBindings(), 0);
+});
+
+test("C4-A a binding cannot be RETIRED under an authorization issued to another principal", async () => {
+  await bindThen(
+    "alias-retire-scope",
+    "ceo@example.com",
+    VICTIM,
+    "mutation.alias.retirescope.bind",
+  );
+  await witnessAppend({
+    authorizationId: "auth-alias-retire-other-0000000",
+    mutationReceiptId: "mutation.alias.retirescope.remove",
+    targetRecordId: VICTIM,
+    scope: { ...SCOPE, principalId: "principal-alias-other" },
+    action: "remove_alias",
+  });
+  await assert.rejects(
+    () =>
+      adminPool.query(
+        `UPDATE memory_alias_bindings
+            SET removed_at = now(),
+                removed_by_mutation_receipt_id = 'mutation.alias.retirescope.remove',
+                removed_authorization_id = 'auth-alias-retire-other-0000000'
+          WHERE alias_id = $1`,
+        ["alias-retire-scope"],
+      ),
+    /may only be retired under the scope of the authorization that retires it/,
+  );
+  assert.equal(await activeBindings(), 1);
+});
