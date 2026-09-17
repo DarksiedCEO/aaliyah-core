@@ -3854,3 +3854,91 @@ test("U-4 every alias-binding and protected-domain unique index refuses the one 
     positive: () => ({ registrable_domain: "acme-unique-other.example" }),
   });
 });
+
+// ---------------------------------------------------------------------------
+// C7 — survivors of the P2 mutation sweep at a9b6ec7, closed.
+// ---------------------------------------------------------------------------
+
+test("C7 an ABORTED alias mutation is filed as an ATTEMPT, never as a mutation receipt", async () => {
+  // Survivor C5-12: routing the alias store's aborts back into
+  // memory_mutation_receipts changed nothing any alias test observed.
+  const prepared = await prepareAssign({
+    aliasId: "alias-c7-abort",
+    observedAlias: "ceo@example.com",
+    participantId: VICTIM,
+  });
+  const result = await store().assignAlias({
+    actor: SCOPE,
+    authorizationId: prepared.receipt.authorizationId,
+    participantRecordId: VICTIM,
+    alias: prepared.alias,
+    evidence: prepared.evidence,
+    proposedContent: { participant: VICTIM, generation: 999 },
+    mutationReceiptId: "mutation.alias.c7.abort",
+  });
+  assert.equal(result.rejection, "proposed_content_digest_mismatch");
+  assert.deepEqual(await receiptStatuses("mutation.alias.c7.abort"), []);
+  const attempts = await adminPool.query(
+    `SELECT rejection, action FROM memory_mutation_attempts WHERE mutation_receipt_id = $1`,
+    ["mutation.alias.c7.abort"],
+  );
+  assert.deepEqual(attempts.rows, [{ rejection: "proposed_content_digest_mismatch", action: "assign_alias" }]);
+});
+
+test("C7 an alias mutation cannot reuse a receipt id already on record, and the refusal spends nothing", async () => {
+  // Survivor C5-13.
+  await bindThen("alias-c7-first", "ceo@example.com", VICTIM, "mutation.alias.c7.reused");
+  const second = await prepareAssign({
+    aliasId: "alias-c7-second",
+    observedAlias: "cfo@example.com",
+    participantId: ATTACKER,
+  });
+  const result = await store().assignAlias({
+    actor: SCOPE,
+    authorizationId: second.receipt.authorizationId,
+    participantRecordId: ATTACKER,
+    alias: second.alias,
+    evidence: second.evidence,
+    proposedContent: second.content,
+    mutationReceiptId: "mutation.alias.c7.reused",
+  });
+  assert.equal(result.rejection, "mutation_receipt_id_reused");
+  assert.equal(await nonceConsumedAt(second.receipt.nonce.bindingDigest), null);
+  assert.equal(await activeBindings(), 1);
+});
+
+test("C7 a participant lock held elsewhere refuses an alias mutation with record_busy within the bound", async () => {
+  // Survivor C2-13: the alias store's transaction-local lock bound was masked
+  // by the pool's 10s lock_timeout, so removing it went unobserved.
+  const prepared = await prepareAssign({
+    aliasId: "alias-c7-busy",
+    observedAlias: "ceo@example.com",
+    participantId: VICTIM,
+  });
+  const holder = await adminPool.connect();
+  try {
+    await holder.query("BEGIN");
+    await holder.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      [SCOPE.tenantId, SCOPE.workspaceId, VICTIM].join(String.fromCharCode(0x1f)),
+    ]);
+    const started = Date.now();
+    const result = await createPostgresAliasRegistryStore(writePool, readPool, {
+      lockWaitMs: 400,
+    }).assignAlias({
+      actor: SCOPE,
+      authorizationId: prepared.receipt.authorizationId,
+      participantRecordId: VICTIM,
+      alias: prepared.alias,
+      evidence: prepared.evidence,
+      proposedContent: prepared.content,
+      mutationReceiptId: "mutation.alias.c7.busy",
+    });
+    const elapsed = Date.now() - started;
+    assert.equal(result.rejection, "record_busy");
+    assert.ok(elapsed >= 350 && elapsed < 4_000, `elapsed ${elapsed}ms`);
+    assert.equal(await nonceConsumedAt(prepared.receipt.nonce.bindingDigest), null);
+  } finally {
+    await holder.query("ROLLBACK").catch(() => undefined);
+    holder.release();
+  }
+});

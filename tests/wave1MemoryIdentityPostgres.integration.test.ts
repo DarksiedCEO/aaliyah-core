@@ -1834,3 +1834,63 @@ test("C4-6 an edge's FROM owner is checked on principal AND user independently",
     );
   }
 });
+
+test("S-7 the store takes an identity pair's locks in ONE order, so opposite merges cannot deadlock", async () => {
+  // Survivor C3-07: reversing the lock order changed nothing S-1 observed,
+  // because there the first merge already held both locks. Here the arrival
+  // order is forced. PostgreSQL grants a contended advisory lock in queue
+  // order, so with a gate held on ALICE:
+  //   - merge BOB->ALICE queues on ALICE first;
+  //   - merge ALICE->BOB queues second.
+  // In sorted order both queue on ALICE and neither holds BOB, so the first
+  // proceeds to BOB and the second refuses as merged-away. In any other order
+  // ALICE->BOB takes BOB before queuing on ALICE, the first then waits on BOB
+  // while the second waits on ALICE, and PostgreSQL aborts one as a deadlock —
+  // `storage_rejected`, which this test refuses to accept.
+  const bob = "record-identity-bob";
+  assert.ok(ALICE < bob, "the test's premise: ALICE sorts first");
+  const alice = await createRecord(ALICE, { name: "Alice" });
+  const bobDigest = await createRecord(bob, { name: "Bob" });
+  const aToB = await mergeAuthorization(ALICE, alice, bob);
+  const bToA = await mergeAuthorization(bob, bobDigest, ALICE);
+
+  const gate = await adminPool.connect();
+  await gate.query("BEGIN");
+  await gate.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+    [SCOPE.tenantId, SCOPE.workspaceId, ALICE].join(String.fromCharCode(0x1f)),
+  ]);
+  let first: ReturnType<typeof tracked>;
+  let second: ReturnType<typeof tracked>;
+  try {
+    first = tracked(
+      store().mergeIdentity({
+        actor: SCOPE,
+        authorizationId: bToA.receipt.authorizationId,
+        recordId: bob,
+        proposedContent: bToA.order,
+        mutationReceiptId: "mutation.order.b-to-a",
+      }),
+    );
+    await untilBlocked(1);
+    second = tracked(
+      store().mergeIdentity({
+        actor: SCOPE,
+        authorizationId: aToB.receipt.authorizationId,
+        recordId: ALICE,
+        proposedContent: aToB.order,
+        mutationReceiptId: "mutation.order.a-to-b",
+      }),
+    );
+    await untilBlocked(2);
+  } finally {
+    await gate.query("COMMIT");
+    gate.release();
+  }
+  type MergeResult = Awaited<ReturnType<ReturnType<typeof store>["mergeIdentity"]>>;
+  const results = (await Promise.all([first!.promise, second!.promise])) as MergeResult[];
+  assert.deepEqual(
+    results.map((r) => r.rejection).sort(),
+    ["identity_counterparty_merged_away", null].sort(),
+    JSON.stringify(results.map((r) => r.rejection)),
+  );
+});

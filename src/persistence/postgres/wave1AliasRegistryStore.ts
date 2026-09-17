@@ -1062,6 +1062,12 @@ export function createPostgresAliasRegistryStore(
       }
       if (error instanceof AliasMutationAborted) {
         failure = { kind: "abort", rejection: error.rejection };
+      } else if (
+        !commitIssued &&
+        (error as { code?: unknown } | null)?.code === "55P03"
+      ) {
+        // A participant lock held past the bound. Rolled back; nothing spent.
+        failure = { kind: "abort", rejection: "record_busy" };
       } else if (!commitIssued) {
         failure = { kind: "abort", rejection: "storage_rejected" };
       } else {
@@ -1287,6 +1293,12 @@ export function createPostgresAliasRegistryStore(
       }
       if (error instanceof AliasMutationAborted) {
         failure = { kind: "abort", rejection: error.rejection };
+      } else if (
+        !commitIssued &&
+        (error as { code?: unknown } | null)?.code === "55P03"
+      ) {
+        // A participant lock held past the bound. Rolled back; nothing spent.
+        failure = { kind: "abort", rejection: "record_busy" };
       } else if (!commitIssued) {
         failure = { kind: "abort", rejection: "storage_rejected" };
       } else {
