@@ -860,3 +860,67 @@ reconciliation evidence bindings (migration 049, C8) and the implementer-found
 `pg_temp` search order (migration 048, W1BR-028).
 
 Critical surviving behavioural mutants: **0.**
+
+---
+
+## W1.3 REMEDIATION OF 2b2e554 — SESSION 3, SECOND HOSTILE CHAIN
+
+`2b2e554` was independently BLOCKED. Integration and Security were GREEN.
+Test Falsifiability, Reliability and Red Team returned BLOCK. It is preserved
+unmodified. The five reports and the red team's reproducers are kept verbatim
+outside the repository, at `aaliyah-w13-evidence/2b2e554/reviews/` and
+`redteam-repro/`.
+
+Two dispositions recorded above were falsified by that chain, and are
+corrected here rather than left to read as they did:
+
+- **W1BR-019 was HALF-fixed.** It covered idle clients only. A backend lost
+  while a client was checked out still killed the process.
+- **W1BR-008 F ("alias erasure, proposed closed")** did not hold across a
+  merge.
+
+As before, every entry is **REMEDIATED — PENDING INDEPENDENT VERIFICATION**.
+
+| Entry | Finding (reviewer, severity) | Remediation | Proven by |
+| --- | --- | --- | --- |
+| W1BR-031 | A backend terminated while a client is CHECKED OUT crashes the process through the store's own `ROLLBACK ... .catch()`; pg-pool detaches its listener at checkout (Reliability, CRITICAL) | `356eb2b` — every guarded pool attaches a permanent client listener on `'connect'` | Probe: an unguarded pool dies (positive control); guarded mail and idempotency pools survive 57P01 mid-transaction, clean up and serve. RED before the fix. |
+| W1BR-032 | After P merged into S, erasing S reported verified with nothing erased, and P (frozen) could never be erased (Red Team BREAK A, HIGH) | `df046c3` — migration 051: the freeze admits exactly one further version on an absorbed record, a `subject_erasure_request` deletion; a subject-erasure tombstone is refused while any record merged into its target, transitively, is unerased; the store refuses first as `merged_records_not_erased`. No cascade: ONE AUTHORIZATION → ONE MUTATION holds. | X-1..X-5 (X-5 blinds the store's check with a shadow schema) |
+| W1BR-033 | The binding guard never checked what the witnessing authorization was for: a spent `correct` authorization witnessed a binding for an erased participant (Red Team BREAK C, HIGH) | `df046c3` — migration 050: a binding needs a spent `assign_alias` for its own participant plus that mutation's participant version; a retirement needs the same of `remove_alias` | K-1..K-5 (K-5 is RT2-H1 in shape) |
+| W1BR-034 | A correct alias mutation whose read-back failed could only be reconciled `COMMITTED_DIVERGED`, permanently (Red Team BREAK B, HIGH) | `83f7d2b` — migration 052: for alias actions the verdict is derived from the authorized head being extended by the authorization's own version and the alias effect being on record; the reconciler mirrors it through a SECURITY DEFINER function and is not granted the binding table | Q-1 (RT2-R1), Q-2, Q-3, Q-4. **Disclosed limit:** the keyed assignment digest cannot be recomputed inside PostgreSQL (keys live outside it). That the content matched it was verified inside the committing transaction. |
+| W1BR-035 | `reconcile()`'s principal/user comparison had no discriminating test (Test Falsifiability, MEDIUM) | `83f7d2b` — V-5 | one dimension at a time, with a positive control |
+| W1BR-036 | The mutation role can record `key_destroyed` for a live key, and completion never re-examined it (Red Team M2) | `68328f9` — the completion pass asks the provider about evidenced keys too, and destroys contradicted ones | K-6 (RT2-K1), and the tombstone match of the evidence guard (BM4). **Residual, bounded:** the forged evidence row itself remains representable; the database cannot see a key outside it. |
+| W1BR-037 | 17 legitimate merges make every identity on the chain unresolvable; the resolver also refused exactly 16 (Red Team M3) | `68328f9` — migration 053 bounds a chain at 16 hops, under a per-workspace graph lock; store refuses first as `identity_chain_too_deep`; the resolver walks MAX + 1 | D-1, D-2 |
+| W1BR-038 | `NODE_OPTIONS` could deselect tests while the watchdog still said PASS (Red Team M1) | `68328f9` — dropped for the child, recorded in the evidence | watchdog self-test on a two-test fixture with one failing |
+| W1BR-039 | Branch-level mutants of the receipt-id discipline survived (Red Team L2: BM1 action, BM8 target) | `68328f9` — N-5b | one dimension at a time |
+
+### Dispositioned, not remediated
+
+These are stated as dispositions, not as fixes.
+
+- **Red Team BM2 (user comparison in the receipt-id discipline) and BM3 (key-erasure guard): MASKED.**
+  - BM2: a terminal receipt that differs only in user is refused by the later `zz_` scope binding.
+  - BM3: the `pii_present_or_erased` CHECK refuses the row first.
+- **Red Team L1: BOUNDED_AND_PROVEN_NONBLOCKING.**
+  - What happens: `carriesPlaintext` matches substrings, so an address split across two content strings is stored in the record's clear content.
+  - Why it is bounded: record content is operator-authorized, and deletion erases it. Since W1BR-032, that includes an absorbed record.
+  - Remaining risk: record content is not application-encrypted (W1BR-008 B).
+- **Red Team L3: BOUNDED_AND_PROVEN_NONBLOCKING.**
+  - What happens: the mutation role can write an attempt row under any tenant.
+  - Why it is bounded: attempts are rejections and carry no authority. No verdict, reconciliation or mutation reads them as proof.
+- **Integration MEDIUM, migration 047 across a rolling deploy or rollback: DISCLOSED.**
+  - What happens: `b3efc82`-era code reads columns that 047 drops, so the two cannot share a database.
+  - Rule: a release containing 047 must be a full-stop deploy, and so must any later column-dropping migration.
+  - This candidate's first deploy starts from an empty database under one code version.
+- **Reliability LOW:**
+  - Six test-only read-back pools replaced the watchdog's PostgreSQL bounds. They now keep them.
+  - The boot-time reconcile pass handles up to 100 mutations sequentially, each individually bounded. This is bounded but slow, and NOT tested at that scale.
+- **Reliability NOT_VERIFIED:**
+  - fd/memory exhaustion;
+  - restart recovery against an out-of-process KMS. None is provisioned.
+- **Test Falsifiability / Security, flakiness under load:**
+  - One full-suite run failed in `wave1MigrationReplayPostgres` and passed 4/4 in isolation.
+  - The watchdog's positive control misjudged a pass under load. It now runs with relaxed bounds.
+  - Both errors run toward FAIL, never toward PASS.
+- **Red Team, watchdog limit: DISCLOSED.**
+  - What happens: a test file that registers tests after a promise that never settles, with no live handle, reports only the tests it registered.
+  - Why this is a limit, not a fix: the watchdog cannot know tests it was never told about. A hostile test author has simpler ways to write a vacuous test.
