@@ -1045,6 +1045,47 @@ export function createPostgresTrustedMemoryStore(
         if (unerased.rowCount !== 0) {
           throw new MutationAborted("merged_records_not_erased");
         }
+        // The database's answer rests on key_destroyed evidence, which the
+        // mutation role can write. Every data key of a binding erased under
+        // a record merged into this one is asked about, and a key the
+        // provider does not confirm destroyed refuses the erasure (security
+        // review of 03581a3, ATK-C1).
+        const mergedKeys = await client.query(
+          `WITH RECURSIVE absorbed(record_id) AS (
+             SELECT from_record_id FROM memory_identity_edges
+              WHERE tenant_id = $1 AND workspace_id = $2 AND to_record_id = $3 AND kind = 'merged_into'
+             UNION
+             SELECT e.from_record_id FROM memory_identity_edges AS e
+               JOIN absorbed AS a ON e.to_record_id = a.record_id
+              WHERE e.tenant_id = $1 AND e.workspace_id = $2 AND e.kind = 'merged_into'
+           )
+           SELECT DISTINCT b.pii_key_ref AS key_ref
+             FROM memory_alias_bindings AS b
+             JOIN absorbed AS a ON b.canonical_participant_id = a.record_id
+            WHERE b.tenant_id = $1 AND b.workspace_id = $2`,
+          [
+            stored.scope.tenantId,
+            stored.scope.workspaceId,
+            stored.targetRecordId,
+          ],
+        );
+        for (const row of mergedKeys.rows as Array<{ key_ref: string }>) {
+          const state =
+            piiKeys === null
+              ? null
+              : await piiKeys
+                  .dataKeyState({
+                    scope: {
+                      tenantId: stored.scope.tenantId,
+                      workspaceId: stored.scope.workspaceId,
+                    },
+                    keyRef: row.key_ref,
+                  })
+                  .catch(() => null);
+          if (state !== "destroyed") {
+            throw new MutationAborted("merged_records_not_erased");
+          }
+        }
       }
 
       if (action === "delete") {
@@ -2087,13 +2128,15 @@ export function createPostgresTrustedMemoryStore(
             AND ($1::text IS NULL OR c.tenant_id = $1)
             AND ($2::text IS NULL OR c.workspace_id = $2)
             AND ($3::text IS NULL OR c.tombstone_id = $3)
-            AND c.provider_id = $4
             AND EXISTS (
               SELECT 1 FROM memory_pii_key_erasures AS d
                WHERE d.tenant_id = c.tenant_id AND d.workspace_id = c.workspace_id
                  AND d.key_ref = c.key_ref AND d.event = 'key_destroyed')
           ORDER BY c.id`,
-        [filter.tenantId ?? null, filter.workspaceId ?? null, filter.tombstoneId ?? null, piiKeys?.providerId ?? null],
+        // Every provider's evidence, not only this one's: a key this store
+        // cannot ask about stays counted as pending rather than disappearing
+        // (security review of 03581a3, F2).
+        [filter.tenantId ?? null, filter.workspaceId ?? null, filter.tombstoneId ?? null],
       );
       due = [...found.rows, ...evidenced.rows];
       if (filter.tombstoneId !== undefined) {

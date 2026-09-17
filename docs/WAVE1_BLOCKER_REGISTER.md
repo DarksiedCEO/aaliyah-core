@@ -1015,3 +1015,38 @@ The confirming sweep's duplicate verdicts also surfaced two real survivors, G-13
 - A chain created by *older* code before 053 is therefore not exercised.
 - 053's guard measures chains only when a new merge edge is inserted, so a pre-existing chain longer than 16 hops is not rewritten. Every further merge onto it is refused, and its identities stay unresolvable by the resolver. This can only arise if older code ran merges past 16 hops.
 - This candidate's first deploy starts from an empty database, so no such chain exists.
+
+---
+
+## W1.3 FOURTH HOSTILE CHAIN — `03581a3`
+
+Reports are at `aaliyah-w13-evidence/03581a3/reviews/`.
+
+| Reviewer | Verdict |
+| --- | --- |
+| Security | **BLOCK**: F1 HIGH, executed |
+| Red Team | **BLOCK**: same break, rated MEDIUM, executed |
+| Integration | GREEN, bounded |
+| Test Falsifiability | recorded when it completes |
+| Reliability | recorded when it completes |
+
+**Security F1 / Red Team C5.** The pending-key window across a merge, listed above as theoretical and still open, is REAL.
+- **What happened:** after a provider outage during the absorbed record's erasure, the survivor's subject erasure reported verified. The absorbed subject's data key was still live, so a ciphertext copy taken before erasure decrypted to the full address.
+- **Transitive case:** the same held through an intermediate record (ATK-C2).
+- **Recovery:** the window lasted until a completion pass ran, which happens at boot.
+
+| Entry | Finding | Remediation | Proven by |
+| --- | --- | --- | --- |
+| W1BR-048 | Security F1 (HIGH) / Red Team C5: a survivor's erasure verified over a merged-in live key | Migration 054: `aaliyah_memory_unerased_merged_records` counts a merged-in binding with `erasure_committed` and no `key_destroyed` as unerased, so the store's pre-check and the tombstone trigger both refuse. The store also asks the provider about every merged-in data key, since the evidence row is writable by the mutation role. | X-6 (ATK-C1: refused, nonce unconsumed, key live; completion then lets the survivor erase and the copy is dead). X-7 (forged `key_destroyed` still refused, because the provider is asked). X-8 (store pre-check blinded and provider lying: the database refuses). All three RED before the fix. |
+| W1BR-049 | Security F2 (MEDIUM): the evidenced audit filtered on this provider's id, so another provider's forged evidence vanished from the pending count | Every provider's evidence is selected; a key this store cannot ask about stays pending | K-9 (pending stays 1 after forgery; the owning provider destroys it) |
+
+**Dispositioned, not remediated, at this descendant:**
+- **Security F3 (MEDIUM): the privilege map does not close the whole class.** Grants to PUBLIC, grant options, schema CREATE, role attributes, and SECURITY DEFINER functions not named `aaliyah_*` are outside the map. None exists at this SHA (reviewer's live catalog survey). **OPEN**: extend the map.
+- **Security F4 (LOW):**
+  - PUBLIC can execute the SECURITY DEFINER `aaliyah_memory_restricting_hold`, which answers whether a named participant is held, and the hold id.
+  - `aaliyah_memory_spent_nonce` is also PUBLIC.
+  - **OPEN**: revoke PUBLIC, and confirm trigger-internal calls still resolve.
+- **Security F5 (LOW):** the reconciler has SELECT on blind indexes and key-erasure rows it does not read, and the issuer and revoker read bindings. **OPEN**: least-privilege trim.
+- **Security F6 (LOW): audit cost grows with erasure history.** DISCLOSED.
+- **Red Team C1: TCB boundary.** An attacker who owns the watchdog process can forge PASS, via its own NODE_OPTIONS preload, GIT_DIR, or a gitignored node_modules shim. That is outside what an in-process verdict can defend. DISCLOSED; not a claim this repository makes.
+- **Integration LOW:** both `ABORT_REASON` maps are typed `Record<string, …>`, so exhaustiveness is not compile-checked. **OPEN.**

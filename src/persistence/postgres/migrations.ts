@@ -5197,6 +5197,76 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       AFTER INSERT ON memory_identity_edges
       FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_merge_chain_guard();`,
   },
+  {
+    // ------------------------------------------------------------------
+    // A MERGED-IN RECORD IS NOT ERASED WHILE ITS DATA KEY LIVES.
+    //
+    // Security review of 03581a3, HIGH, executed (ATK-C1, ATK-C2). After a key
+    // provider outage during the absorbed record's own erasure, the database
+    // half committed (envelope nulled, erasure_committed recorded) while the
+    // data key stayed live, and 051 counted that record as erased: the
+    // survivor's subject erasure reported verified, and a pre-erasure
+    // ciphertext copy still decrypted to the full address until a completion
+    // pass ran — at boot. A merged-in erasure without key_destroyed evidence
+    // now keeps the survivor's subject erasure refused, in the helper the
+    // store's pre-check and the tombstone trigger both use. The store also asks
+    // the provider about those keys, because the evidence row is writable by
+    // the mutation role (W1BR-036).
+    // ------------------------------------------------------------------
+    id: "054_memory_merged_erasure_requires_destroyed_keys",
+    sql: `CREATE OR REPLACE FUNCTION public.aaliyah_memory_unerased_merged_records(
+      p_tenant text, p_workspace text, p_record text)
+      RETURNS SETOF text
+      LANGUAGE sql
+      STABLE
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public, pg_temp
+      AS $fn$
+        WITH RECURSIVE absorbed(record_id) AS (
+          SELECT e.from_record_id
+            FROM public.memory_identity_edges AS e
+           WHERE e.tenant_id = p_tenant AND e.workspace_id = p_workspace
+             AND e.to_record_id = p_record AND e.kind = 'merged_into'
+          UNION
+          SELECT e.from_record_id
+            FROM public.memory_identity_edges AS e
+            JOIN absorbed AS a ON e.to_record_id = a.record_id
+           WHERE e.tenant_id = p_tenant AND e.workspace_id = p_workspace
+             AND e.kind = 'merged_into'
+        )
+        SELECT a.record_id
+          FROM absorbed AS a
+         WHERE COALESCE((SELECT v.state
+                           FROM public.memory_record_versions AS v
+                          WHERE v.tenant_id = p_tenant AND v.workspace_id = p_workspace
+                            AND v.record_id = a.record_id
+                          ORDER BY v.version DESC LIMIT 1), 'active') <> 'deleted'
+            OR EXISTS (SELECT 1 FROM public.memory_alias_bindings AS b
+                        WHERE b.tenant_id = p_tenant AND b.workspace_id = p_workspace
+                          AND b.canonical_participant_id = a.record_id
+                          AND b.pii_erased_at IS NULL)
+            -- An erased binding whose data key has no destruction evidence is
+            -- not erased: its ciphertext, wherever a copy survives, still
+            -- decrypts (security review of 03581a3, ATK-C1).
+            OR EXISTS (SELECT 1
+                         FROM public.memory_alias_bindings AS b
+                         JOIN public.memory_pii_key_erasures AS c
+                           ON c.tenant_id = b.tenant_id AND c.workspace_id = b.workspace_id
+                          AND c.binding_mutation_receipt_id = b.mutation_receipt_id
+                          AND c.key_ref = b.pii_key_ref
+                          AND c.event = 'erasure_committed'
+                        WHERE b.tenant_id = p_tenant AND b.workspace_id = p_workspace
+                          AND b.canonical_participant_id = a.record_id
+                          AND NOT EXISTS (
+                            SELECT 1 FROM public.memory_pii_key_erasures AS d
+                             WHERE d.tenant_id = c.tenant_id AND d.workspace_id = c.workspace_id
+                               AND d.key_ref = c.key_ref AND d.event = 'key_destroyed'))
+         ORDER BY a.record_id COLLATE "C";
+      $fn$;
+    REVOKE ALL ON FUNCTION public.aaliyah_memory_unerased_merged_records(text, text, text) FROM PUBLIC;
+    GRANT EXECUTE ON FUNCTION public.aaliyah_memory_unerased_merged_records(text, text, text)
+      TO aaliyah_memory_mutator;`,
+  },
 ];
 
 /**

@@ -4624,3 +4624,108 @@ test("K-8 a forged key_destroyed row is audited on every pass, however many PEND
   assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: victim.keyRef }), "destroyed");
   assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: pending.keyRef }), "destroyed");
 });
+
+test("X-6 SECURITY 03581a3 ATK-C1: a survivor's erasure is refused while a merged-in key is still live after an outage, and succeeds once it is destroyed", async () => {
+  await absorbVictim("mutation.x6.merge");
+  const before = await bindingState("alias-pii-001");
+  const copied = before.pii_envelope as PiiEnvelope;
+  TEST_PII_KEYS.setAvailable(false);
+  try {
+    const { result } = await eraseRecordAtHead(PARTICIPANT, "mutation.x6.erase.absorbed", "tombstone-x6-absorbed");
+    assert.equal(result.rejection, "erasure_incomplete");
+  } finally {
+    TEST_PII_KEYS.setAvailable(true);
+  }
+  const refused = await eraseRecordAtHead(SURVIVOR, "mutation.x6.erase.survivor", "tombstone-x6-survivor");
+  assert.equal(refused.result.verified, false);
+  assert.equal(refused.result.rejection, "merged_records_not_erased");
+  assert.equal(await nonceConsumed(refused.receipt.authorizationId), false);
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "active");
+  // Positive control: the completion pass destroys the key; the survivor then erases.
+  assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 1, pending: 0 });
+  const { result } = await eraseRecordAtHead(SURVIVOR, "mutation.x6.erase.survivor.2", "tombstone-x6-survivor-2");
+  assert.equal(result.verified, true, result.rejection ?? "");
+  await assert.rejects(
+    TEST_PII_KEYS.decrypt({
+      scope: DATA_SCOPE,
+      envelope: copied,
+      associatedData: aliasEnvelopeAssociatedData({
+        tenantId: SCOPE.tenantId,
+        workspaceId: SCOPE.workspaceId,
+        aliasId: "alias-pii-001",
+        mutationReceiptId: before.mutation_receipt_id,
+      }),
+    }),
+    MemoryPiiKeyDestroyed,
+  );
+});
+
+test("X-7 a FORGED key_destroyed row for the merged-in key does not let the survivor's erasure through: the store asks the provider", async () => {
+  await absorbVictim("mutation.x7.merge");
+  const before = await bindingState("alias-pii-001");
+  TEST_PII_KEYS.setAvailable(false);
+  try {
+    const { result } = await eraseRecordAtHead(PARTICIPANT, "mutation.x7.erase.absorbed", "tombstone-x7-absorbed");
+    assert.equal(result.rejection, "erasure_incomplete");
+  } finally {
+    TEST_PII_KEYS.setAvailable(true);
+  }
+  await forgeKeyDestroyed("tombstone-x7-absorbed");
+  const refused = await eraseRecordAtHead(SURVIVOR, "mutation.x7.erase.survivor", "tombstone-x7-survivor");
+  assert.equal(refused.result.rejection, "merged_records_not_erased");
+  assert.equal(await nonceConsumed(refused.receipt.authorizationId), false);
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "active");
+});
+
+test("X-8 the DATABASE refuses a survivor's subject-erasure tombstone while a merged-in erasure has no key_destroyed evidence, even past the store's check", async () => {
+  await absorbVictim("mutation.x8.merge");
+  TEST_PII_KEYS.setAvailable(false);
+  try {
+    const { result } = await eraseRecordAtHead(PARTICIPANT, "mutation.x8.erase.absorbed", "tombstone-x8-absorbed");
+    assert.equal(result.rejection, "erasure_incomplete");
+  } finally {
+    TEST_PII_KEYS.setAvailable(true);
+  }
+  // A store whose provider says every key is destroyed, and whose pre-check
+  // helper answers nothing: only the database stands between it and success.
+  await adminPool.query(`DROP SCHEMA IF EXISTS x8_shadow CASCADE`);
+  await adminPool.query(`CREATE SCHEMA x8_shadow`);
+  await adminPool.query(
+    `CREATE FUNCTION x8_shadow.aaliyah_memory_unerased_merged_records(text, text, text)
+       RETURNS SETOF text LANGUAGE sql AS $$ SELECT NULL::text WHERE false $$`,
+  );
+  await adminPool.query(`GRANT USAGE ON SCHEMA x8_shadow TO aaliyah_memory_mutator`);
+  await adminPool.query(`GRANT EXECUTE ON FUNCTION x8_shadow.aaliyah_memory_unerased_merged_records(text, text, text) TO aaliyah_memory_mutator`);
+  const blind = new Pool({ connectionString: DB_URL, max: 2, options: `${process.env.PGOPTIONS ?? ""} -c search_path=x8_shadow,public` });
+  const lying = { ...TEST_PII_KEYS, dataKeyState: async () => "destroyed" as const };
+  try {
+    const { receipt, result } = await eraseRecordAtHead(
+      SURVIVOR,
+      "mutation.x8.erase.survivor",
+      "tombstone-x8-survivor",
+      "subject_erasure_request",
+      createPostgresTrustedMemoryStore(blind, readPool, { piiKeys: lying }),
+    );
+    assert.equal(result.verified, false);
+    assert.equal(result.rejection, "storage_rejected");
+    assert.equal(await nonceConsumed(receipt.authorizationId), false);
+  } finally {
+    await blind.end();
+    await adminPool.query(`DROP SCHEMA IF EXISTS x8_shadow CASCADE`);
+  }
+});
+
+test("K-9 SECURITY 03581a3 F2: forged key_destroyed evidence for another provider's key does not remove it from the pending count", async () => {
+  await bindVictimAddress();
+  const before = await bindingState("alias-pii-001");
+  const other = { ...TEST_PII_KEYS, providerId: "other-kms/v1" } as typeof TEST_PII_KEYS;
+  const otherStore = createPostgresTrustedMemoryStore(writePool, readPool, { piiKeys: other });
+  const { result } = await eraseRecordAtHead(PARTICIPANT, "mutation.k9.erase", "tombstone-k9", "subject_erasure_request", otherStore);
+  assert.equal(result.rejection, "erasure_incomplete");
+  assert.deepEqual(await otherStore.completePendingAliasErasures(), { destroyed: 0, pending: 1 });
+  await forgeKeyDestroyed("tombstone-k9");
+  assert.deepEqual(await otherStore.completePendingAliasErasures(), { destroyed: 0, pending: 1 });
+  assert.equal(await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: before.pii_key_ref }), "active");
+  // Positive control: the provider that owns the key destroys it.
+  assert.deepEqual(await store().completePendingAliasErasures(), { destroyed: 1, pending: 0 });
+});
