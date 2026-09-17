@@ -27,7 +27,7 @@ import {
   lockSharedMemoryTables,
   type SharedTableLock,
 } from "./support/sharedMemoryTables";
-import { assertUniqueIndexKills } from "./support/uniquenessDestroyer";
+import { assertCheckConstraintsKill, assertUniqueIndexKills } from "./support/uniquenessDestroyer";
 
 /**
  * Wave 1.3 trusted memory, against a REAL PostgreSQL 16.
@@ -5458,4 +5458,48 @@ test("T-2 a TEMP TABLE forging an authorization receipt does not satisfy the gen
     client.release();
   }
   assert.equal(await countVersions(recordId), 0);
+});
+
+test("C8 every CHECK on memory_mutation_receipts refuses the one row it exists for (from a real terminal receipt)", async () => {
+  // Priority 6: all 15 CHECKs on the evidence table were outside the original
+  // destroyer population (red team M3).
+  const genesis = await seedGenesis({ n: 0 });
+  const receipt = await issue(
+    authorization({ action: "correct", expectedHead: headOf(1, genesis), proposedContent: { n: 1 } }),
+  );
+  const done = await store().correct({
+    actor: SCOPE,
+    authorizationId: receipt.authorizationId,
+    recordId: RECORD_ID,
+    proposedContent: { n: 1 },
+    mutationReceiptId: "mutation.checks.receipt",
+  });
+  assert.equal(done.verified, true);
+  await assertCheckConstraintsKill(adminPool, {
+    table: "memory_mutation_receipts",
+    where: "mutation_receipt_id = $1 AND phase = 'terminal'",
+    params: ["mutation.checks.receipt"],
+    fresh: () => ({ mutation_receipt_id: "mutation.checks.fresh", payload: { mutationReceiptId: "mutation.checks.fresh" } }),
+    cases: [
+      { constraint: "memory_mutation_receipts_action_binding", violate: () => ({ payload: { action: "delete" } }) },
+      { constraint: "memory_mutation_receipts_authorization_binding", violate: () => ({ payload: { authorizationId: "someone-else-0000000000001" } }) },
+      { constraint: "memory_mutation_receipts_id_binding", violate: () => ({ payload: { mutationReceiptId: "mutation.elsewhere" } }) },
+      { constraint: "memory_mutation_receipts_nonce_binding", violate: () => ({ payload: { consumedNonceDigest: `sha256:${"7".repeat(64)}` } }) },
+      {
+        constraint: "memory_mutation_receipts_nonce_digest_form",
+        violate: () => ({ consumed_nonce_digest: "not-a-digest", payload: { consumedNonceDigest: "not-a-digest" } }),
+      },
+      { constraint: "memory_mutation_receipts_outcome_binding", violate: () => ({ payload: { outcome: { status: "UNKNOWN_PENDING_RECONCILIATION" } } }) },
+      { constraint: "memory_mutation_receipts_outcome_domain", violate: () => ({ outcome_status: "PROBABLY_FINE", payload: { outcome: { status: "PROBABLY_FINE" } } }) },
+      // A pending row that already claims success is the whole defect the
+      // pending/terminal split exists to prevent.
+      { constraint: "memory_mutation_receipts_pending_is_unknown", violate: () => ({ phase: "pending" }) },
+      { constraint: "memory_mutation_receipts_phase_domain", violate: () => ({ phase: "final" }) },
+      { constraint: "memory_mutation_receipts_principal_binding", violate: () => ({ payload: { scope: { principalId: "principal-elsewhere" } } }) },
+      { constraint: "memory_mutation_receipts_target_binding", violate: () => ({ payload: { targetRecordId: "record-elsewhere" } }) },
+      { constraint: "memory_mutation_receipts_tenant_binding", violate: () => ({ payload: { scope: { tenantId: "tenant-elsewhere" } } }) },
+      { constraint: "memory_mutation_receipts_user_binding", violate: () => ({ payload: { scope: { userId: "user-elsewhere" } } }) },
+      { constraint: "memory_mutation_receipts_workspace_binding", violate: () => ({ payload: { scope: { workspaceId: "workspace-elsewhere" } } }) },
+    ],
+  });
 });

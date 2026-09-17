@@ -66,7 +66,7 @@ import {
   type SharedTableLock,
 } from "./support/sharedMemoryTables";
 import { TEST_PII_KEYS, testAliasAssignmentDigest } from "./support/piiKeys";
-import { assertUniqueIndexKills } from "./support/uniquenessDestroyer";
+import { assertCheckConstraintsKill, assertUniqueIndexKills } from "./support/uniquenessDestroyer";
 
 /**
  * Wave 1.3 PART F — LEGAL HOLDS AND REAL ERASURE, against a REAL PostgreSQL 16.
@@ -4011,4 +4011,87 @@ test("P-19 no CACHE outlives an erasure: the executive memory service answers fr
     await service.resolveExecutiveContext({ actor: SCOPE, normalizedAlias: VICTIM_NORMALIZED }),
     null,
   );
+});
+
+test("C8 every CHECK on the legal-hold and retention tables refuses the one row it exists for (from real holds)", async () => {
+  // Priority 6: none of these CHECKs was in the original destroyer
+  // population, and dropping them left the suite green.
+  await placeHold(legalHold({ coverage: { kind: "records", recordIds: [FREE_RECORD_ID] }, holdId: "hold-checks-records", carveOutActions: ["promote"] }));
+  await placeHold(legalHold({ coverage: { kind: "subjects", canonicalParticipantIds: ["participant-checks-001"] }, holdId: "hold-checks-subjects" }));
+  const imposed = await holds().imposeRetention(SCOPE, {
+    obligationId: "retention-checks-001",
+    recordId: FREE_RECORD_ID,
+    policyRef: "policy:retention/seven-years",
+    imposingAuthorityId: "authority.records-manager",
+    imposedAt: isoOffset(-60_000),
+    retainUntil: isoOffset(3_600_000),
+  });
+  assert.equal(imposed.rejection, null);
+
+  const freshHold = { hold_id: "hold-checks-fresh", payload: { holdId: "hold-checks-fresh" } };
+  await assertCheckConstraintsKill(adminPool, {
+    table: "memory_legal_holds",
+    where: "hold_id = $1",
+    params: ["hold-checks-records"],
+    fresh: () => freshHold,
+    cases: [
+      { constraint: "memory_legal_holds_coverage_domain", violate: () => ({ coverage_kind: "everything", payload: { coverage: { kind: "everything" } } }) },
+      { constraint: "memory_legal_holds_status_domain", violate: () => ({ status_state: "suspended", payload: { status: { state: "suspended" } } }) },
+      {
+        constraint: "memory_legal_holds_release_witness",
+        violate: () => ({ status_state: "released", payload: { status: { state: "released" } } }),
+      },
+      {
+        constraint: "memory_legal_holds_release_after_issue",
+        violate: (r) => ({
+          status_state: "released",
+          released_at: new Date(Date.parse(String(r.issued_at)) - 60_000).toISOString(),
+          releasing_authority_id: "authority.general-counsel",
+          release_order_ref: "order:court/2026-0200",
+          payload: { status: { state: "released" } },
+        }),
+      },
+      { constraint: "memory_legal_holds_authority_binding", violate: () => ({ payload: { issuingAuthorityId: "authority.someone-else" } }) },
+      { constraint: "memory_legal_holds_coverage_binding", violate: () => ({ payload: { coverage: { kind: "subjects" } } }) },
+      { constraint: "memory_legal_holds_hold_binding", violate: () => ({ payload: { holdId: "hold-elsewhere" } }) },
+      { constraint: "memory_legal_holds_matter_binding", violate: () => ({ payload: { matterRef: "matter:elsewhere/2026" } }) },
+      { constraint: "memory_legal_holds_principal_binding", violate: () => ({ payload: { scope: { principalId: "principal-elsewhere" } } }) },
+      { constraint: "memory_legal_holds_status_binding", violate: () => ({ payload: { status: { state: "released" } } }) },
+      { constraint: "memory_legal_holds_tenant_binding", violate: () => ({ payload: { scope: { tenantId: "tenant-elsewhere" } } }) },
+      { constraint: "memory_legal_holds_user_binding", violate: () => ({ payload: { scope: { userId: "user-elsewhere" } } }) },
+      { constraint: "memory_legal_holds_workspace_binding", violate: () => ({ payload: { scope: { workspaceId: "workspace-elsewhere" } } }) },
+    ],
+  });
+  await assertCheckConstraintsKill(adminPool, {
+    table: "memory_legal_hold_records",
+    where: "hold_id = $1",
+    params: ["hold-checks-records"],
+    fresh: () => ({ record_id: "record-checks-fresh" }),
+    cases: [{ constraint: "memory_legal_hold_records_kind", violate: () => ({ coverage_kind: "subjects" }) }],
+  });
+  await assertCheckConstraintsKill(adminPool, {
+    table: "memory_legal_hold_subjects",
+    where: "hold_id = $1",
+    params: ["hold-checks-subjects"],
+    fresh: () => ({ canonical_participant_id: "participant-checks-fresh" }),
+    cases: [{ constraint: "memory_legal_hold_subjects_kind", violate: () => ({ coverage_kind: "records" }) }],
+  });
+  await assertCheckConstraintsKill(adminPool, {
+    table: "memory_legal_hold_carve_outs",
+    where: "hold_id = $1",
+    params: ["hold-checks-records"],
+    fresh: () => ({ action: "assign_alias" }),
+    cases: [
+      { constraint: "memory_legal_hold_carve_outs_action_domain", violate: () => ({ action: "rewrite" }) },
+      // THE CARVE-OUT A COURT MAY NEVER GRANT: destroying held evidence.
+      { constraint: "memory_legal_hold_carve_outs_never", violate: () => ({ action: "delete" }) },
+    ],
+  });
+  await assertCheckConstraintsKill(adminPool, {
+    table: "memory_retention_obligations",
+    where: "obligation_id = $1",
+    params: ["retention-checks-001"],
+    fresh: () => ({ obligation_id: "retention-checks-fresh" }),
+    cases: [{ constraint: "memory_retention_obligations_window", violate: (r) => ({ retain_until: r.imposed_at }) }],
+  });
 });

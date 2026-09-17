@@ -10,7 +10,7 @@ import {
   lockSharedMemoryTables,
   type SharedTableLock,
 } from "./support/sharedMemoryTables";
-import { assertUniqueIndexKills } from "./support/uniquenessDestroyer";
+import { assertCheckConstraintsKill, assertUniqueIndexKills } from "./support/uniquenessDestroyer";
 
 /**
  * RECONCILING UNKNOWN OUTCOMES, AGAINST A REAL DATABASE.
@@ -1010,4 +1010,30 @@ test("U-5 memory_reconciliations_once refuses a second verdict for one mutation,
       evidence: { mutationReceiptId: "mutation.unique.recon.dup" },
     }),
   });
+});
+
+test("C8 every CHECK on memory_reconciliations refuses the one row it exists for — including an ABSENT evidence member (049)", async () => {
+  const { authorizationId } = await committedUnknown("mutation.checks.recon", { note: "checks" });
+  const [unresolved] = await reconciler().findUnresolved();
+  assert.ok(unresolved);
+  await reconciler().reconcile(unresolved);
+  const fresh = { mutation_receipt_id: "mutation.checks.recon.fresh", evidence: { mutationReceiptId: "mutation.checks.recon.fresh" } };
+  await assertCheckConstraintsKill(adminPool, {
+    table: "memory_reconciliations",
+    where: "mutation_receipt_id = $1",
+    params: ["mutation.checks.recon"],
+    fresh: () => fresh,
+    cases: [
+      // Observing nothing, so `committed_observes` (which sorts first) holds.
+      { constraint: "memory_reconciliations_verdict_domain", violate: () => ({ verdict: "PROBABLY_COMMITTED", observed_version: null, observed_content_digest: null }) },
+      { constraint: "memory_reconciliations_committed_observes", violate: () => ({ observed_version: null }) },
+      { constraint: "memory_reconciliations_not_committed_observes_nothing", violate: () => ({ verdict: "NOT_COMMITTED", observed_version: null }) },
+      { constraint: "memory_reconciliations_receipt_binding", violate: () => ({ evidence: { mutationReceiptId: "mutation.elsewhere" } }) },
+      { constraint: "memory_reconciliations_authorization_binding", violate: () => ({ evidence: { authorizationId: "someone-else-0000000000001" } }) },
+      // THE VACUITY 049 CLOSED: a JSON-null member used to satisfy the binding.
+      { constraint: "memory_reconciliations_receipt_binding", violate: () => ({ evidence: { mutationReceiptId: null } }) },
+      { constraint: "memory_reconciliations_authorization_binding", violate: () => ({ evidence: { authorizationId: null } }) },
+    ],
+  });
+  assert.ok(authorizationId.length > 0);
 });

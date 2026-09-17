@@ -4733,6 +4733,29 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       END
       $do$`,
   },
+  {
+    // ------------------------------------------------------------------
+    // THE RECONCILIATION EVIDENCE BINDINGS WERE VACUOUS AGAINST A NULL MEMBER.
+    //
+    // The same defect class red team M4 found on identity edges (migration
+    // 046), found here by the implementer while writing Priority 6 destroyers
+    // for the CHECK constraints outside the original 81: migration 040 wrote
+    // `CHECK (evidence ->> 'x' = col)`, which passes when the member is absent
+    // or JSON null. A reconciliation whose evidence names no receipt or no
+    // authorization satisfied the binding it claimed to carry.
+    // ------------------------------------------------------------------
+    id: "049_memory_reconciliation_bindings_not_vacuous",
+    sql: `ALTER TABLE memory_reconciliations
+      DROP CONSTRAINT IF EXISTS memory_reconciliations_receipt_binding,
+      DROP CONSTRAINT IF EXISTS memory_reconciliations_authorization_binding;
+    ALTER TABLE memory_reconciliations
+      ADD CONSTRAINT memory_reconciliations_receipt_binding
+        CHECK (evidence ->> 'mutationReceiptId' IS NOT NULL
+               AND evidence ->> 'mutationReceiptId' = mutation_receipt_id),
+      ADD CONSTRAINT memory_reconciliations_authorization_binding
+        CHECK (evidence ->> 'authorizationId' IS NOT NULL
+               AND evidence ->> 'authorizationId' = authorization_id)`,
+  },
 ];
 
 /**

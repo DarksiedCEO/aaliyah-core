@@ -45,7 +45,7 @@ import {
   type SharedTableLock,
 } from "./support/sharedMemoryTables";
 import { TEST_PII_KEYS, testAliasAssignmentDigest } from "./support/piiKeys";
-import { assertUniqueIndexKills } from "./support/uniquenessDestroyer";
+import { assertCheckConstraintsKill, assertUniqueIndexKills } from "./support/uniquenessDestroyer";
 
 /**
  * Wave 1.3 Part D — THE AUTHORITATIVE ALIAS REGISTRY, against a REAL
@@ -3983,4 +3983,22 @@ test("C7 a participant lock held elsewhere refuses an alias mutation with record
     await holder.query("ROLLBACK").catch(() => undefined);
     holder.release();
   }
+});
+
+test("C8 the alias policy and protected-domain CHECKs each refuse the one row they exist for (from real rows)", async () => {
+  await protectDomain(SCOPE, "acme-checks.example");
+  await assertCheckConstraintsKill(adminPool, {
+    table: "memory_alias_tenant_policy",
+    where: "tenant_id = $1",
+    params: [TENANT],
+    fresh: () => ({ tenant_id: "tenant-alias-checks-fresh" }),
+    cases: [{ constraint: "memory_alias_tenant_policy_domain", violate: () => ({ cross_workspace_policy: "anything_goes" }) }],
+  });
+  await assertCheckConstraintsKill(adminPool, {
+    table: "memory_alias_protected_domains",
+    where: "registrable_domain = $1",
+    params: ["acme-checks.example"],
+    fresh: () => ({ registrable_domain: "acme-checks-fresh.example" }),
+    cases: [{ constraint: "memory_alias_protected_domains_host_form", violate: () => ({ registrable_domain: "NOT A DOMAIN" }) }],
+  });
 });

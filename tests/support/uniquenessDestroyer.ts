@@ -124,3 +124,86 @@ export async function assertUniqueIndexKills(pool: Pool, spec: UniquenessCase): 
     client.release();
   }
 }
+
+export type CheckDestroyerCase = {
+  /** The CHECK constraint the violating row must be refused by, by name. */
+  constraint: string;
+  /** Overrides (applied on top of `fresh`) that violate exactly this constraint. */
+  violate: (row: Json) => Json;
+};
+
+/**
+ * EVERY CHECK ON A TABLE, DESTROYED FROM A REAL ROW.
+ *
+ * The CHECK-destroyer suite built base rows by hand for five tables; the
+ * Priority 6 sweep then dropped every other CHECK on the memory tables and
+ * many survived, because no test ever wrote a row that could reach them.
+ * This does for those tables what `assertUniqueIndexKills` does for unique
+ * indexes: start from a row the workflow actually wrote, stand triggers down
+ * in a transaction that is always rolled back (CHECKs are evaluated before
+ * AFTER triggers and after BEFORE triggers, so triggers can only pre-empt
+ * them), and prove —
+ *
+ *   POSITIVE CONTROL: the row with its unique keys freshened is ACCEPTED;
+ *   each case: that row plus one violation is refused with 23514 NAMING the
+ *   constraint.
+ */
+export async function assertCheckConstraintsKill(
+  pool: Pool,
+  spec: {
+    table: string;
+    where: string;
+    params: unknown[];
+    fresh: (row: Json) => Json;
+    cases: readonly CheckDestroyerCase[];
+  },
+): Promise<void> {
+  if (!/^memory_[a-z_]+$/.test(spec.table)) {
+    throw new Error(`check destroyer: unsafe table name ${spec.table}`);
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const source = await client.query(
+      `SELECT to_jsonb(t) AS row FROM ${spec.table} AS t WHERE ${spec.where} LIMIT 2`,
+      spec.params,
+    );
+    assert.equal(source.rowCount, 1, `${spec.table}: the source row must exist exactly once`);
+    const row = source.rows[0].row as Json;
+    delete row.id;
+    const columns = (
+      await client.query(
+        `SELECT column_name FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = $1 AND column_name <> 'id'
+          ORDER BY ordinal_position`,
+        [spec.table],
+      )
+    ).rows.map((r: { column_name: string }) => r.column_name);
+    const list = columns.join(", ");
+    const insert = `INSERT INTO ${spec.table} (${list})
+      SELECT ${list} FROM jsonb_populate_record(NULL::public.${spec.table}, $1::jsonb)`;
+    await client.query(`ALTER TABLE ${spec.table} DISABLE TRIGGER USER`);
+
+    const freshRow = applyOverrides(row, spec.fresh(row));
+    await client.query("SAVEPOINT positive");
+    await client.query(insert, [JSON.stringify(freshRow)]);
+    await client.query("ROLLBACK TO SAVEPOINT positive");
+
+    for (const testCase of spec.cases) {
+      await client.query("SAVEPOINT violation");
+      let refused: { code?: string; constraint?: string } | null = null;
+      try {
+        await client.query(insert, [JSON.stringify(applyOverrides(freshRow, testCase.violate(freshRow)))]);
+      } catch (error) {
+        refused = error as { code?: string; constraint?: string };
+      }
+      await client.query("ROLLBACK TO SAVEPOINT violation");
+      assert.ok(refused !== null, `${testCase.constraint}: the violating row was ACCEPTED`);
+      assert.equal(refused.code, "23514", `${testCase.constraint}: refused, but not by a CHECK: ${String(refused)}`);
+      assert.equal(refused.constraint, testCase.constraint, `${testCase.constraint}: refused by a different CHECK`);
+    }
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
+}

@@ -25,7 +25,7 @@ import {
   lockSharedMemoryTables,
   type SharedTableLock,
 } from "./support/sharedMemoryTables";
-import { assertUniqueIndexKills } from "./support/uniquenessDestroyer";
+import { assertCheckConstraintsKill, assertUniqueIndexKills } from "./support/uniquenessDestroyer";
 
 /**
  * IDENTITY MERGE AND SPLIT, AGAINST A REAL DATABASE.
@@ -1893,4 +1893,39 @@ test("S-7 the store takes an identity pair's locks in ONE order, so opposite mer
     ["identity_counterparty_merged_away", null].sort(),
     JSON.stringify(results.map((r) => r.rejection)),
   );
+});
+
+test("C8 every CHECK on memory_identity_edges refuses the one row it exists for (from a real merge edge)", async () => {
+  // Priority 6: all 8 CHECKs on the table W1.3 introduced were outside the
+  // original destroyer population and survived a DROP.
+  await createRecord(ALICE, { name: "Alice" });
+  const absorbed = await createRecord(ALIAS_OF_ALICE, { name: "A. Smith" });
+  const { result } = await runIdentity({
+    action: "merge_identity",
+    targetRecordId: ALIAS_OF_ALICE,
+    headVersion: 1,
+    headDigest: absorbed,
+    order: mergeOrder(ALICE),
+    mutationReceiptId: "mutation.checks.edge",
+  });
+  assert.equal(result.verified, true);
+  await assertCheckConstraintsKill(adminPool, {
+    table: "memory_identity_edges",
+    where: "mutation_receipt_id = $1",
+    params: ["mutation.checks.edge"],
+    fresh: () => ({
+      mutation_receipt_id: "mutation.checks.edge.fresh",
+      from_record_id: "record-identity-fresh",
+      payload: { fromRecordId: "record-identity-fresh" },
+    }),
+    cases: [
+      { constraint: "memory_identity_edges_kind_domain", violate: () => ({ kind: "absorbed", payload: { kind: "absorbed" } }) },
+      { constraint: "memory_identity_edges_not_self", violate: (r) => ({ to_record_id: r.from_record_id, payload: { toRecordId: r.from_record_id } }) },
+      { constraint: "memory_identity_edges_version_positive", violate: () => ({ from_version: 0 }) },
+      { constraint: "memory_identity_edges_kind_binding", violate: () => ({ payload: { kind: "split_to" } }) },
+      { constraint: "memory_identity_edges_from_binding", violate: () => ({ payload: { fromRecordId: "record-elsewhere" } }) },
+      { constraint: "memory_identity_edges_to_binding", violate: () => ({ payload: { toRecordId: "record-elsewhere" } }) },
+      { constraint: "memory_identity_edges_authorization_binding", violate: () => ({ payload: { authorizationId: "someone-else-0000000000001" } }) },
+    ],
+  });
 });
