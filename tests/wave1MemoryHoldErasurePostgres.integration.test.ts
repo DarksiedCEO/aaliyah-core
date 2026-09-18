@@ -6631,6 +6631,43 @@ test("S-4: NO SELF-VERIFICATION — a settlement whose authority is also its ver
   );
 });
 
+test("S-4b: a settlement naming the wrong key VERSION, or a future decision date, is refused", async () => {
+  // Red team B8 against 86d33c9: `keyVersion: 999999` for a version-1 key was
+  // accepted and the survivor erasure verified — while the trigger's own
+  // header claimed the key "really does belong to that provider AND VERSION".
+  // `decidedAt: 2099-01-01` was accepted too. Destruction is a claim about a
+  // VERSION, not about a name.
+  const { binding, tombstoneId, authorizationId } = await survivorWithAnUnprovableMergedKey();
+  const store0 = NO_VAULT();
+  const wrongVersion = await store0.settleKeyDestruction(
+    settlementFor(binding, tombstoneId, authorizationId, {
+      keyVersion: 999_999,
+      settlementReceiptId: "settlement-wrong-version",
+      nonce: "nonce-wrong-version",
+    }),
+  );
+  assert.deepEqual(wrongVersion, { recorded: false, rejection: "settlement_not_evidence_bound" });
+  const future = await store0.settleKeyDestruction(
+    settlementFor(binding, tombstoneId, authorizationId, {
+      decidedAt: new Date("2099-01-01T00:00:00.000Z"),
+      settlementReceiptId: "settlement-future",
+      nonce: "nonce-future",
+    }),
+  );
+  assert.deepEqual(future, { recorded: false, rejection: "settlement_malformed" });
+  // Neither wrote anything.
+  const rows = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_key_destruction_settlements`,
+  );
+  assert.equal(rows.rows[0].n, 0);
+
+  // POSITIVE CONTROL: the real version and a real date are accepted.
+  const ok = await store0.settleKeyDestruction(
+    settlementFor(binding, tombstoneId, authorizationId),
+  );
+  assert.equal(ok.recorded, true, JSON.stringify(ok));
+});
+
 test("S-5: a settlement nonce is spent once per tenant", async () => {
   const { binding, tombstoneId, authorizationId } = await survivorWithAnUnprovableMergedKey();
   const store0 = NO_VAULT();
