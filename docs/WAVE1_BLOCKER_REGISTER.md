@@ -1261,3 +1261,69 @@ is a W1.4-or-later change, not a quiet edit here.
 - **Production: NOT CERTIFIED. Fortress: NOT CERTIFIED.** Nothing is pushed,
   merged or deployed.
 - **Remote CI: not proven.** Only local runs.
+
+### THE MUTATION SWEEP, AND THE THREE CONTROLS IT FOUND UNTESTED
+
+39 targeted mutants, each removing or inverting ONE control this round added or
+repaired, run in a DISPOSABLE worktree against its OWN PostgreSQL database.
+The implementation worktree was never mutated. Every mutant is judged by the
+WATCHDOG rather than by `node --test`, because a mutant that HANGS has to be a
+verdict and not a wait — M-18, which reintroduces the K-02 defect, leaks a
+pooled connection per erasure and runs for ever; the watchdog turns that into
+FAIL, which is the doctrine working.
+
+Two methodology errors in the sweep itself, recorded because a sweep whose own
+harness is wrong is worse than no sweep:
+
+- the first run passed `--test-name-pattern` to the watchdog, which refuses
+  unknown flags with exit 2 — and six mutants were recorded KILLED on the
+  strength of a refusal to run anything at all. The empty verdict line gave it
+  away. Every mutant is now run against the WHOLE target file, which is also
+  the stronger question: the mutant has to be caught by the suite, not by the
+  one test expected to catch it;
+- two mutants did not compile and one was a no-op that left the timer in the
+  race it claimed to remove. All three were re-specified and re-run.
+
+Final classification at the swept SHA: **36 KILLED, 1 INVALID_MUTANT, 2
+REAL_SURVIVOR, 0 environment-blocked, 0 structurally-unreachable.** Both
+survivors were real, and both were the same shape — a control whose only tests
+reached it through a DIFFERENT code path:
+
+| Mutant | The control nothing was driving | Falsifier now in the suite |
+| --- | --- | --- |
+| M-08 | `askProvider`'s PROVIDER_DOES_NOT_OWN_KEY branch — the PRE-CHECK's answer for a key this store cannot speak for. S-10 and K-9 reach provider-mismatch through the COMPLETION PASS, which has its own branch and never calls `askProvider`. | **S-11**: a merged-in key destroyed honestly by its owning provider, and a survivor's erasure attempted by a store speaking for a different provider — refused `key_destruction_not_proven`, obligation named PROVIDER_DOES_NOT_OWN_KEY, with the owning store as positive control |
+| M-23 | Migration 055's evidence trigger clause `s.decision = 'PROVEN_DESTROYED'`. S-3 proves a STILL_UNKNOWN settlement writes no destruction evidence — but that is the STORE declining to insert. The DATABASE's clause, which is what makes "only PROVEN_DESTROYED may satisfy erasure" a property rather than a convention, had nothing driving it. | **S-12**: the insert attempted DIRECTLY as the settler role, past the store, and refused by the trigger; no evidence row appears; the completion pass still counts the key unproven; a PROVEN_DESTROYED settlement on a second key is the positive control |
+| M-29 | `releaseClient`'s destroy decision. The wedged-transport test goes through `pool.query()`, and pg-pool already passes the error to `release()` there, so it destroys the client whatever `releaseClient` decides. Every store transaction checks a client out EXPLICITLY and depends on `releaseClient` instead. | **K-05 (second test)**: the decision asserted directly for six ambiguous and five ordinary error classes, plus a real checked-out client whose backend is killed mid-transaction — destroyed, pool left with no idle client, and the pool still serving |
+
+Each survivor's repair produced a new descendant SHA and the sweep was re-run
+against it. The sweep's own defects above are why its first two runs are not
+cited as evidence anywhere.
+
+### K-21 UPDATED — fd exhaustion EXECUTED, memory exhaustion still NOT_VERIFIED
+
+Disclosed NOT_VERIFIED by the reliability reviews of both 03581a3 and 8a0bf05,
+each time because OS-level exhaustion on a shared host was outside a safe
+budget. Attempted here inside a CONTAINED CHILD PROCESS whose resource ceiling
+is its own. Evidence: `aaliyah-w13-evidence/k21-probes/`.
+
+- **fd exhaustion: EXECUTED.** A child with a lowered HARD limit burns
+  descriptors until the kernel returns EMFILE, gives none back, and only then
+  asks a pool for a connection. The pool fails with a catchable `EMFILE`: it
+  does not hang, it does not take the process down, and the process exits
+  cleanly. Two earlier versions of the probe were wrong and are kept for the
+  reason — hogging with sockets exhausts nothing, because a failed connect
+  releases its descriptor immediately, and `ulimit -n` alone is ignored,
+  because Node raises RLIMIT_NOFILE to the hard limit at startup.
+  **NOT a regression test**, and that is named rather than glossed: a test that
+  lowers a hard fd limit is host-dependent, and a test that can come back
+  "inconclusive" is a skip in disguise, which this suite's watchdog counts as
+  a failure.
+- **memory exhaustion: STILL NOT_VERIFIED.** With a 24 MB heap the child
+  THRASHED rather than aborting and was still thrashing after five minutes; it
+  was killed, and the database was confirmed clean afterwards (no
+  idle-in-transaction session, no advisory lock on the probe's key, no witness
+  table) — a real observation about crash cleanup, but not the one the probe
+  was for. Not rounded up. A V8 heap abort is uncatchable in-process, so the
+  properties worth proving are that an aborted process leaves no torn state and
+  cannot be read as a pass; both are proven elsewhere (P-6, and the watchdog's
+  process-exit and SIGKILL attacks) but not under memory pressure specifically.

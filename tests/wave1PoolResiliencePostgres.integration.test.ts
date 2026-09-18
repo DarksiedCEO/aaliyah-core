@@ -9,6 +9,7 @@ import {
   createMailDbPool,
   isConnectionAmbiguous,
   MAIL_DB_POOL_BOUNDS,
+  releaseClient,
 } from "../src/persistence/postgres/pool";
 import { createReadinessProbe } from "../src/http/readiness";
 import { runMailMigrations } from "../src/persistence/postgres/migrations";
@@ -430,6 +431,93 @@ test("the mail pool carries a CLIENT-side query ceiling and TCP keepalives, not 
     );
   } finally {
     await pool.end();
+  }
+});
+
+test("K-05: an AMBIGUOUS connection is DESTROYED, and an ordinary error's connection is not", async () => {
+  // ---- A REAL MUTATION SURVIVOR, AND THE TEST THAT KILLS IT ---------
+  // Found by this round's own sweep (M-29). `releaseClient` could be changed
+  // to never destroy — `client.release(undefined)` for every error — and all
+  // 14 tests in this file still passed.
+  //
+  // The reason: the wedged-transport test above goes through `pool.query()`,
+  // and pg-pool ALREADY passes the error to `release()` on that path, so it
+  // destroys the client whatever `releaseClient` decides. Every caller that
+  // checks a client OUT explicitly — which is every transaction the memory
+  // stores open — depends on `releaseClient` instead, and nothing drove it.
+  //
+  // The decision is about which argument is passed, so it is asserted
+  // directly, on a client that records what it was told.
+  const seen: Array<boolean | undefined> = [];
+  const spy = { release: (destroy?: boolean) => seen.push(destroy) };
+
+  // AMBIGUOUS: the outcome of the last query is unknown, so a later caller
+  // could be handed a connection that answers with the previous caller's
+  // result. Destroyed.
+  const ambiguous: unknown[] = [
+    new Error("Query read timeout"),
+    new Error("Connection terminated unexpectedly"),
+    Object.assign(new Error("terminating connection due to administrator command"), { code: "57P01" }),
+    Object.assign(new Error("terminating connection due to idle-in-transaction timeout"), { code: "25P03" }),
+    Object.assign(new Error("connection exception"), { code: "08006" }),
+    Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
+  ];
+  for (const error of ambiguous) {
+    assert.equal(isConnectionAmbiguous(error), true, String((error as Error).message));
+    seen.length = 0;
+    releaseClient(spy, error);
+    assert.deepEqual(seen, [true], `not destroyed: ${String((error as Error).message)}`);
+  }
+
+  // NOT AMBIGUOUS: the server answered, and its answer was a refusal. The
+  // connection is perfectly good, and destroying it on every constraint
+  // violation would turn ordinary refusals into connection churn.
+  const ordinary: unknown[] = [
+    Object.assign(new Error("duplicate key value violates unique constraint"), { code: "23505" }),
+    Object.assign(new Error("new row violates check constraint"), { code: "23514" }),
+    Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }),
+    Object.assign(new Error("lock timeout"), { code: "55P03" }),
+    new Error("aaliyah memory: a subject erasure may not complete"),
+  ];
+  for (const error of ordinary) {
+    assert.equal(isConnectionAmbiguous(error), false, String((error as Error).message));
+    seen.length = 0;
+    releaseClient(spy, error);
+    assert.deepEqual(seen, [undefined], `wrongly destroyed: ${String((error as Error).message)}`);
+  }
+
+  // No error at all: an ordinary release.
+  seen.length = 0;
+  releaseClient(spy);
+  assert.deepEqual(seen, [undefined]);
+
+  // AND THE SAME DECISION THROUGH A REAL CHECKED-OUT CLIENT. A backend killed
+  // mid-transaction is the shape the memory stores actually meet.
+  const pool = createMailDbPool({ AALIYAH_DATABASE_URL: DB_URL } as NodeJS.ProcessEnv, {
+    name: "release-decision",
+    onError: () => undefined,
+  });
+  try {
+    const client = await pool.connect();
+    let failure: unknown;
+    try {
+      await client.query("BEGIN");
+      const pid = (await client.query("SELECT pg_backend_pid() AS pid")).rows[0].pid as number;
+      await adminPool.query("SELECT pg_terminate_backend($1)", [pid]);
+      await client.query("SELECT 1");
+      assert.fail("the terminated backend must reject the next query");
+    } catch (error) {
+      failure = error;
+    }
+    assert.equal(isConnectionAmbiguous(failure), true, String(failure));
+    releaseClient(client, failure);
+    // Destroyed, so the pool holds no idle client that might answer with a
+    // dead session's result.
+    assert.equal(pool.idleCount, 0, `a destroyed client was kept: idle=${pool.idleCount}`);
+    // Positive control: the pool still serves.
+    assert.equal((await pool.query("SELECT 1 AS ok")).rows[0].ok, 1);
+  } finally {
+    await pool.end().catch(() => undefined);
   }
 });
 

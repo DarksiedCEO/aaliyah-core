@@ -6043,6 +6043,105 @@ test("S-3b: ONE settlement per key per erasure request — a second is refused, 
   assert.equal(refused.result.rejection, "key_destruction_not_proven");
 });
 
+test("S-12: the DATABASE refuses settled destruction evidence unless the settlement says PROVEN_DESTROYED", async () => {
+  // ---- A REAL MUTATION SURVIVOR, AND THE TEST THAT KILLS IT ---------
+  // Found by this round's own sweep (M-23). Migration 055's evidence trigger
+  // requires `s.decision = 'PROVEN_DESTROYED'`; weakening it to
+  // `s.decision IS NOT NULL` left all 117 tests in this file passing.
+  //
+  // The reason is the interesting part: S-3 proves that a STILL_UNKNOWN
+  // settlement writes no destruction evidence — but that is enforced by the
+  // STORE, which only attempts the insert when the decision satisfies. The
+  // DATABASE's own clause, the one that makes "only PROVEN_DESTROYED may
+  // satisfy the key-destruction portion of verified erasure" a property rather
+  // than a convention, had nothing driving it. Exactly the "the store's answer
+  // is not the enforcement" standard this register holds everything else to.
+  //
+  // So the insert is attempted DIRECTLY, as the settler role, past the store.
+  const a = await bindNumberedParticipantAs(
+    "participant-s12-a", "alias-s12-a", "person-s12-a@example.com", "mutation.s12.bind.a",
+  );
+  const b = await bindNumberedParticipantAs(
+    "participant-s12-b", "alias-s12-b", "person-s12-b@example.com", "mutation.s12.bind.b",
+  );
+  const bindingA = await bindingState("alias-s12-a");
+  const bindingB = await bindingState("alias-s12-b");
+  TEST_PII_KEYS.setAvailable(false);
+  let erasedA;
+  let erasedB;
+  try {
+    erasedA = await eraseRecordAtHead("participant-s12-a", "mutation.s12.erase.a", "tombstone-s12-a");
+    erasedB = await eraseRecordAtHead("participant-s12-b", "mutation.s12.erase.b", "tombstone-s12-b");
+    assert.equal(erasedA.result.rejection, "key_destruction_not_proven");
+    assert.equal(erasedB.result.rejection, "key_destruction_not_proven");
+  } finally {
+    TEST_PII_KEYS.setAvailable(true);
+  }
+  const store0 = NO_VAULT();
+  // A: the evidence did not settle it.
+  const unresolved = await store0.settleKeyDestruction(
+    settlementFor(bindingA as never, "tombstone-s12-a", erasedA.receipt.authorizationId, {
+      subjectRecordId: "participant-s12-a",
+      decision: "STILL_UNKNOWN",
+      settlementReceiptId: "settlement-s12-a",
+      nonce: "nonce-s12-a",
+    }),
+  );
+  assert.equal(unresolved.recorded, true, JSON.stringify(unresolved));
+  // B: PROVEN_DESTROYED — the positive control, and it writes its own evidence.
+  const resolved = await store0.settleKeyDestruction(
+    settlementFor(bindingB as never, "tombstone-s12-b", erasedB.receipt.authorizationId, {
+      subjectRecordId: "participant-s12-b",
+      decision: "PROVEN_DESTROYED",
+      settlementReceiptId: "settlement-s12-b",
+      nonce: "nonce-s12-b",
+    }),
+  );
+  assert.equal(resolved.recorded, true, JSON.stringify(resolved));
+
+  const settledEvidence = (keyRef: string, receiptId: string) =>
+    runAs(
+      "aaliyah_memory_settler",
+      `INSERT INTO memory_pii_key_erasures
+         (tenant_id, workspace_id, tombstone_id, alias_id,
+          binding_mutation_receipt_id, key_ref, provider_id, event,
+          settlement_receipt_id)
+       SELECT tenant_id, workspace_id, tombstone_id, alias_id,
+              binding_mutation_receipt_id, key_ref, provider_id, 'key_destroyed', $2
+         FROM memory_pii_key_erasures
+        WHERE key_ref = $1 AND event = 'erasure_committed'`,
+      [keyRef, receiptId],
+    );
+
+  // THE ASSERTION. The store would never attempt this; the database must
+  // refuse it anyway.
+  await assert.rejects(
+    () => settledEvidence(a.keyRef, "settlement-s12-a"),
+    /settled destruction evidence needs a PROVEN_DESTROYED settlement for that exact key/,
+  );
+  const forA = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_pii_key_erasures
+      WHERE key_ref = $1 AND event = 'key_destroyed'`,
+    [a.keyRef],
+  );
+  assert.equal(forA.rows[0].n, 0, "a STILL_UNKNOWN settlement produced destruction evidence");
+  // And the completion pass still counts A as unproven, which is what the
+  // clause protects. (A's own erasure is not retried here — its head is
+  // already `deleted`, and the restore-then-re-erase path is RT5-R1b's.)
+  const pass = await store0.completePendingAliasErasures();
+  assert.equal(pass.notProven, 1, JSON.stringify(pass));
+
+  // POSITIVE CONTROL: B's settlement DID produce labelled evidence, so the
+  // refusal above is the decision and not the insert's shape.
+  const forB = await adminPool.query(
+    `SELECT settlement_receipt_id FROM memory_pii_key_erasures
+      WHERE key_ref = $1 AND event = 'key_destroyed'`,
+    [b.keyRef],
+  );
+  assert.equal(forB.rowCount, 1);
+  assert.equal(forB.rows[0].settlement_receipt_id, "settlement-s12-b");
+});
+
 test("S-4: NO SELF-VERIFICATION — a settlement whose authority is also its verifier is refused, in the store and in the database", async () => {
   const { binding, tombstoneId, authorizationId } = await survivorWithAnUnprovableMergedKey();
   const same = await NO_VAULT().settleKeyDestruction(
