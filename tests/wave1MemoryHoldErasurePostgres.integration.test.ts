@@ -6157,6 +6157,176 @@ test("S-2 K-01/K-09: a PROVEN_DESTROYED settlement satisfies the key-destruction
   assert.equal(second.result.verified, true, second.result.rejection ?? "");
 });
 
+test("S-2c: a SETTLED obligation's resolution is immutable, enforced by the database (M-47/M-55)", async () => {
+  // ---- TWO MUTATION SURVIVORS THAT MASKED EACH OTHER -----------------
+  // The seventh pass's sweep found BOTH of the application guards on this
+  // invariant surviving, and the reason is structural rather than a missing
+  // test. `provenDestroyed` has exactly ONE consumer, `clearHealedObligations`.
+  // So:
+  //
+  //   M-47 re-adds the `provenDestroyed.push(row)` that red-team B7 removed —
+  //        invisible, because `clearHealedObligations` filters on
+  //        `state = 'KEY_DESTRUCTION_NOT_PROVEN'` and a settled row is not in
+  //        that state.
+  //   M-55 removes that filter — invisible, because the settlement branch does
+  //        not put the row in the list in the first place.
+  //
+  // Remove EITHER alone and nothing changes. Remove BOTH and a key proven by a
+  // SETTLEMENT is recorded as resolved by a PROVIDER that was never asked. No
+  // single-point mutation can be observed, so by this register's standard
+  // neither guard is a control, however correct the behaviour is.
+  //
+  // The founder's settlement requirements already say a receipt is "immutable
+  // after completion". That held for the settlement ROW and not for the
+  // OBLIGATION it resolves, so migration 058 puts the invariant in the
+  // database, where ONE statement can falsify it and where it binds every
+  // caller rather than one call site. This test is that statement.
+  const { binding, tombstoneId, authorizationId } = await survivorWithAnUnprovableMergedKey();
+  const store0 = NO_VAULT();
+  const refused = await eraseRecordAtHead(
+    SURVIVOR, "mutation.s2c.refused", "tombstone-s2c-refused", "subject_erasure_request", store0,
+  );
+  assert.equal(refused.result.rejection, "key_destruction_not_proven");
+  const settled = await store0.settleKeyDestruction(
+    settlementFor(binding, tombstoneId, authorizationId),
+  );
+  assert.equal(settled.recorded, true, JSON.stringify(settled));
+
+  const row = async () => {
+    const r = await adminPool.query(
+      `SELECT state, resolved_by, settled_by, observations
+         FROM memory_key_destruction_obligations WHERE key_ref = $1`,
+      [binding.pii_key_ref],
+    );
+    assert.equal(r.rowCount, 1);
+    return r.rows[0];
+  };
+  const settledRow = await row();
+  assert.equal(settledRow.resolved_by, "SETTLEMENT");
+  assert.equal(settledRow.settled_by, "settlement-001");
+
+  // ---- THE MUTATOR IS THE ROLE THAT RUNS `clearHealedObligations` ----
+  // It holds UPDATE on this table, which is how provider-healed obligations
+  // are closed. So this is the exact statement that function would issue with
+  // both guards gone — not a hypothetical.
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        `UPDATE memory_key_destruction_obligations
+            SET state = 'PROVEN_DESTROYED', not_proven_reason = 'SETTLED',
+                resolved_by = 'PROVIDER', last_observed_at = now()
+          WHERE key_ref = $1`,
+        [binding.pii_key_ref],
+      ),
+    /a settled obligation resolution is immutable/,
+    "a settlement-resolved obligation was re-attributed to the provider",
+  );
+  // Every field of the resolution is frozen, not just `resolved_by` — and each
+  // is attempted AS THE ROLE THAT ACTUALLY HOLDS THE GRANT, so the refusal is
+  // the trigger's and not a privilege error wearing its clothes. The grants are
+  // column-level: the mutator may write state / resolved_by /
+  // not_proven_reason (that is provider healing), and only the SETTLER may
+  // write `settled_by`.
+  for (const [role, column, value] of [
+    ["aaliyah_memory_mutator", "state", "'KEY_DESTRUCTION_NOT_PROVEN'"],
+    ["aaliyah_memory_mutator", "not_proven_reason", "'PROVIDER_UNAVAILABLE'"],
+    ["aaliyah_memory_settler", "settled_by", "'settlement-forged'"],
+    ["aaliyah_memory_settler", "resolved_by", "'PROVIDER'"],
+  ] as const) {
+    await assert.rejects(
+      () =>
+        runAs(
+          role,
+          `UPDATE memory_key_destruction_obligations SET ${column} = ${value} WHERE key_ref = $1`,
+          [binding.pii_key_ref],
+        ),
+      /a settled obligation resolution is immutable/,
+      `${column} was mutable on a settled obligation by ${role}`,
+    );
+  }
+  // AND THE COLUMN GRANT IS THE FIRST LINE, INDEPENDENTLY OF THE TRIGGER:
+  // the mutator cannot name `settled_by` at all, so even a future edit to the
+  // trigger leaves the settlement pointer out of its reach.
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        `UPDATE memory_key_destruction_obligations SET settled_by = 'settlement-forged' WHERE key_ref = $1`,
+        [binding.pii_key_ref],
+      ),
+    /permission denied for table memory_key_destruction_obligations/,
+    "the mutator could name settled_by",
+  );
+  const unchanged = await row();
+  assert.equal(unchanged.state, "PROVEN_DESTROYED");
+  assert.equal(unchanged.resolved_by, "SETTLEMENT");
+  assert.equal(unchanged.settled_by, "settlement-001");
+
+  // ---- POSITIVE CONTROL, BOTH DIRECTIONS -----------------------------
+  // (1) An OBSERVATIONAL write is still allowed on a settled row: recording
+  // that a pass looked again is not a change to the resolution, and the
+  // completion pass does exactly this.
+  await runAs(
+    "aaliyah_memory_mutator",
+    `UPDATE memory_key_destruction_obligations
+        SET observations = observations + 1, last_observed_at = now()
+      WHERE key_ref = $1`,
+    [binding.pii_key_ref],
+  );
+  const observed = await row();
+  assert.equal(
+    observed.observations,
+    (settledRow.observations as number) + 1,
+    "an observational write was refused on a settled obligation",
+  );
+  assert.equal(observed.resolved_by, "SETTLEMENT");
+
+  // (2) An UNSETTLED obligation is freely resolvable by the provider — the
+  // trigger refuses only what is already SETTLED, so ordinary healing (the
+  // transient-outage case, which is the common one) still works. Without this
+  // control the trigger could be a blanket freeze and this test would still
+  // pass.
+  // A SECOND, genuinely unsettled obligation, because the settled one cannot be
+  // un-settled: the trigger binds the admin connection too, which is the point
+  // of putting the invariant in the database rather than in a role's grants.
+  const spare = await bindNumberedParticipantAs(
+    "participant-s2c", "alias-s2c", "person-s2c@example.com", "mutation.s2c.bind",
+  );
+  TEST_PII_KEYS.setAvailable(false);
+  try {
+    const spareRefused = await eraseRecordAtHead(
+      "participant-s2c", "mutation.s2c.spare", "tombstone-s2c-spare",
+    );
+    assert.equal(spareRefused.result.rejection, "key_destruction_not_proven");
+  } finally {
+    TEST_PII_KEYS.setAvailable(true);
+  }
+  const unsettled = await adminPool.query(
+    `SELECT settled_by FROM memory_key_destruction_obligations WHERE key_ref = $1`,
+    [spare.keyRef],
+  );
+  assert.equal(unsettled.rowCount, 1, "fixture precondition: the spare key needs an obligation");
+  assert.equal(unsettled.rows[0].settled_by, null, "fixture precondition: it must be UNSETTLED");
+  await runAs(
+    "aaliyah_memory_mutator",
+    `UPDATE memory_key_destruction_obligations
+        SET state = 'PROVEN_DESTROYED', not_proven_reason = 'SETTLED',
+            resolved_by = 'PROVIDER'
+      WHERE key_ref = $1 AND settled_by IS NULL`,
+    [spare.keyRef],
+  );
+  const healed = await adminPool.query(
+    `SELECT resolved_by FROM memory_key_destruction_obligations WHERE key_ref = $1`,
+    [spare.keyRef],
+  );
+  assert.equal(
+    healed.rows[0]?.resolved_by,
+    "PROVIDER",
+    "the trigger blocked ordinary provider healing of an UNSETTLED obligation",
+  );
+});
+
 test("S-2b K-01: the PERMANENT case — no provider AND no destruction evidence — is settleable, and the settlement writes the evidence", async () => {
   // ---- RV5-U-7, THE INTEGRATION REVIEW'S OTHER HALF ------------------
   // The absorbed record's erasure half-committed during a provider outage, so
@@ -6402,6 +6572,25 @@ test("S-12: only a PROVEN_DESTROYED settlement can record destruction, and the s
     [a.keyRef],
   );
   assert.equal(forA.rows[0].n, 0, "a STILL_UNKNOWN settlement produced destruction evidence");
+  // The trigger raises ONE message for every reason its PERFORM finds nothing,
+  // so a provider or scope mismatch would refuse the insert below too — and
+  // the mutant would survive while this test still passed. Pin the
+  // precondition explicitly: every column the clause matches on ALREADY
+  // agrees, and the DECISION is the only thing left to refuse it.
+  const bound = await adminPool.query(
+    `SELECT s.decision, s.provider_id = e.provider_id AS provider_agrees,
+            (s.tenant_id = e.tenant_id AND s.workspace_id = e.workspace_id
+              AND s.key_ref = e.key_ref) AS scope_agrees
+       FROM memory_key_destruction_settlements AS s
+       JOIN memory_pii_key_erasures AS e
+         ON e.key_ref = s.key_ref AND e.event = 'erasure_committed'
+      WHERE s.settlement_receipt_id = 'settlement-s12-a'`,
+  );
+  assert.equal(bound.rowCount, 1, "fixture precondition: the settlement and the evidence row must pair up");
+  assert.equal(bound.rows[0].provider_agrees, true, "fixture precondition: provider must already agree");
+  assert.equal(bound.rows[0].scope_agrees, true, "fixture precondition: scope must already agree");
+  assert.equal(bound.rows[0].decision, "STILL_UNKNOWN", "fixture precondition: the decision is the defect");
+
   // (3) M-23 AT THE CLAUSE, not at the function. Two things enforce this:
   // `aaliyah_memory_record_settled_destruction` (asserted above) and the
   // INSERT trigger on the table. The sweep weakened the TRIGGER's

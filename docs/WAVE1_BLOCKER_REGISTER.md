@@ -1547,3 +1547,128 @@ that. A test written for a refusal caught a false claim sitting next to it.
 Suite 1069/1069, guards 8/8, denominator now 56. Production NOT CERTIFIED.
 Fortress NOT CERTIFIED. Nothing pushed, merged or deployed. Every gauntlet
 verdict from the sixth chain is bound to a SUPERSEDED tree and must be re-run.
+
+---
+
+## W1.3 EIGHTH PASS — THE 56-MUTANT SWEEP AT `97bb476`
+
+    TALLY {"KILLED": 54, "REAL_SURVIVOR": 2}
+
+All six of the seventh pass's survivors and all three of its invalid mutants
+are closed: M-02, M-11 and M-54 now resolve and die; M-23, M-40, M-50 and M-51
+are killed by the falsifiers written for them; M-30b kills where retired M-30
+could not. Two survivors remain, and they are the same finding twice.
+
+### M-47 AND M-55: A MUTUALLY-MASKING PAIR
+
+Both survived with `1069/1069 PASS` and `fail=0`, including the `S-2`
+completion-pass assertion written the round before *specifically* to kill M-47.
+The reason is structural, not a missing test:
+
+    `provenDestroyed` has EXACTLY ONE consumer — `clearHealedObligations`.
+
+    M-47 re-adds the `provenDestroyed.push(row)` red-team B7 removed.
+         Invisible: `clearHealedObligations`' UPDATE is restricted to
+         `state = 'KEY_DESTRUCTION_NOT_PROVEN'`, and a settled obligation is
+         `PROVEN_DESTROYED`, so the pushed row reaches a statement that matches
+         nothing.
+
+    M-55 removes that `state` filter.
+         Invisible: the settlement branch does not put the row in the list in
+         the first place.
+
+Remove **either** and nothing changes. Remove **both** and a key proven by a
+SETTLEMENT is recorded as `resolved_by = 'PROVIDER'` — a provider that, in the
+`NO_VAULT` case, was never asked at all. There is a third guard of the same
+invariant too: `recordObligations`' `ON CONFLICT ... WHERE settled_by IS NULL`.
+
+**Three overlapping application-layer guards, and not one of them falsifiable.**
+By this register's standard that means the invariant had no control — only
+correct behaviour, which is not the same thing and does not survive a
+refactor.
+
+### MIGRATION 058, WHICH IS WHERE THE INVARIANT BELONGED
+
+The founder's settlement requirements already say a receipt is **immutable
+after completion**. That was enforced for the settlement ROW (the append-only
+trigger on `memory_key_destruction_settlements`) and merely *observed* for the
+OBLIGATION it resolves. So the invariant moves into the database:
+
+`058_settled_obligation_resolution_immutable` adds
+`aaliyah_memory_settled_obligation_frozen()`, a BEFORE UPDATE row trigger that
+refuses any change to `state`, `resolved_by`, `settled_by` or
+`not_proven_reason` once `settled_by IS NOT NULL`. `observations` and
+`last_observed_at` stay writable on purpose: recording that a pass looked again
+is not a change to the resolution, and the completion pass does exactly that.
+
+This binds **every** caller, including the admin connection — which is what
+made the first version of the test fail, because it tried to un-settle a row to
+build its own control.
+
+| id | disposition |
+|---|---|
+| M-60 | **CLOSED** — `S-2c` drives the refusal as `aaliyah_memory_mutator`, with the exact UPDATE `clearHealedObligations` would issue with both guards gone. |
+| M-61 | **CLOSED** — `S-2c`'s second positive control: an UNSETTLED obligation is still freely provider-healed, so a blanket freeze fails too. Without it the trigger could refuse everything and the test would still pass. |
+| M-47 | **STRUCTURALLY_UNREACHABLE_WITH_PROOF** — proof above, recorded in the driver's `UNREACHABLE_WITH_PROOF` map, not in prose only. |
+| M-55 | **STRUCTURALLY_UNREACHABLE_WITH_PROOF** — same pair. |
+
+The driver now carries that classification as data. If a mutant declared
+unreachable is ever KILLED it is reported as
+`DECLARED_UNREACHABLE_BUT_KILLED` — a finding about the RECORD — rather than
+quietly counted as a pass. Priority EIGHT permits this classification; it does
+not permit it silently.
+
+`S-2c` also pins something the privilege map already enforced but no test had
+stated: the grants on `memory_key_destruction_obligations` are COLUMN-level.
+The mutator may write `state` / `resolved_by` / `not_proven_reason` — that is
+ordinary provider healing — and **only the settler may write `settled_by`**. So
+the settlement pointer is out of the mutator's reach by privilege, before the
+trigger is consulted at all. Each case in `S-2c` runs as the role that actually
+holds the grant, so no refusal is a permission error wearing a trigger's
+clothes.
+
+### TWO DEFECTS FOUND BY WRITING TESTS, NOT BY THE SWEEP
+
+1. `boundToCommit` was `verified && ignored.length === 0`, so a run **refused**
+   for `DISCOVERY_MISSED_TRACKED_TESTS` recorded `boundToCommit: true` — the
+   executed set declared bound to the commit in the very evidence file saying a
+   committed test never ran. Now requires `missing.length === 0`. Held by M-56.
+2. The watchdog exits 2 when it cannot WRITE its evidence — correct, and
+   untested. A passing suite whose evidence cannot be recorded must not exit 0;
+   that is priority TWO's "monitor failure reporting GREEN". Now tested, held
+   by M-59.
+
+And one correction to this round's own work: the first version of the migrator
+session-state test compared `SHOW lock_timeout` on a **different** pool. A GUC
+is per-session, so it proved nothing. It now asks the migrator's own
+`max: 1` pool, which hands back the same backend, and asserts restoration to
+the BASELINE rather than to a literal `0` — the watchdog sets `1min` through
+PGOPTIONS, so `0` was never the right expectation. Held by M-57 and M-58.
+
+### AN OBSERVED INCOMPLETE RUN, RECORDED RATHER THAN DISCARDED
+
+One full-suite run during this pass was refused with:
+
+    TESTS_NEVER_FINISHED: tests/wave1PoolResiliencePostgres.integration.test.ts queued=15 finished=14
+    FILES_WITHOUT_TESTS: tests/wave1TrustedMemoryPostgres.integration.test.ts
+
+It did not reproduce: the two runs before and after it were 1069/1069 and
+1072/1072. The probable cause is host contention — the mutation sweep's own
+PostgreSQL container was still up on port 54521 alongside the suite's on 54520,
+and the pool-resilience file deliberately wedges sockets and lowers the file
+descriptor ceiling.
+
+It is recorded because it is a **positive** result for priority TWO: a run in
+which one file never finished and another registered zero tests was **refused**,
+not reported green. Both refusals are watchdog controls with tests
+(`FILES_WITHOUT_TESTS` and the never-finished accounting), and this is the first
+time either has fired on the real suite rather than on a fixture.
+
+### STATE AFTER THIS PASS
+
+Suite 1072/1072, guards 8/8, mutation denominator 61. Migrations 001..058.
+Contracts still pinned at `7d576681` (a `cp -R` of this session's earlier
+provisioning followed a gauntlet symlink back into the contracts worktree and
+left an untracked nested copy; it was removed, no tracked file changed, and the
+release guard caught it). Production NOT CERTIFIED. Fortress NOT CERTIFIED.
+Nothing pushed, merged or deployed.

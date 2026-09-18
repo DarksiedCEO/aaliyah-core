@@ -5864,6 +5864,67 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       ADD CONSTRAINT aaliyah_mail_migrations_digest_shape
         CHECK (sql_digest IS NULL OR sql_digest ~ '^sha256:[0-9a-f]{64}$')`,
   },
+  {
+    /*
+     * A SETTLED OBLIGATION'S RESOLUTION IS IMMUTABLE, ENFORCED BY THE DATABASE.
+     *
+     * The founder's settlement requirements say a receipt must be "immutable
+     * after completion". That held for the settlement ROW (the append-only
+     * trigger on memory_key_destruction_settlements), but the OBLIGATION it
+     * resolves was protected only by application code: two redundant guards,
+     * a `continue` that keeps a settled key out of the provider-healing list
+     * and a `state = 'KEY_DESTRUCTION_NOT_PROVEN'` filter on the UPDATE.
+     *
+     * The seventh pass's sweep found BOTH of them surviving, and found out why:
+     * `provenDestroyed` has exactly one consumer, so each guard masks the
+     * other. Remove either alone and nothing changes; remove both and a key
+     * proven by a SETTLEMENT is recorded as resolved by a PROVIDER that was
+     * never asked. Neither is individually falsifiable, which by this
+     * register's standard means neither is a control.
+     *
+     * So the invariant moves to where it can be enforced against any caller
+     * and any future code path, and where one statement can falsify it. The
+     * two application guards stay as defense in depth; what they are no longer
+     * asked to do is BE the enforcement.
+     *
+     * Observational columns stay writable on purpose: `observations` and
+     * `last_observed_at` record that a pass looked again, which is not a
+     * change to the resolution.
+     */
+    id: "058_settled_obligation_resolution_immutable",
+    sql: `CREATE OR REPLACE FUNCTION public.aaliyah_memory_settled_obligation_frozen()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public, pg_temp
+      AS $fn$
+      BEGIN
+        IF OLD.settled_by IS NULL THEN
+          RETURN NEW;
+        END IF;
+        IF NEW.settled_by IS DISTINCT FROM OLD.settled_by
+           OR NEW.resolved_by IS DISTINCT FROM OLD.resolved_by
+           OR NEW.state IS DISTINCT FROM OLD.state
+           OR NEW.not_proven_reason IS DISTINCT FROM OLD.not_proven_reason THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a settled obligation resolution is immutable'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$;
+
+    ALTER FUNCTION public.aaliyah_memory_settled_obligation_frozen()
+      OWNER TO CURRENT_USER;
+    REVOKE ALL ON FUNCTION public.aaliyah_memory_settled_obligation_frozen()
+      FROM PUBLIC;
+
+    DROP TRIGGER IF EXISTS memory_key_destruction_obligations_settled_frozen
+      ON memory_key_destruction_obligations;
+    CREATE TRIGGER memory_key_destruction_obligations_settled_frozen
+      BEFORE UPDATE ON memory_key_destruction_obligations
+      FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_settled_obligation_frozen()`,
+  },
 ];
 
 /**

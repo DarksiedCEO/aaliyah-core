@@ -357,6 +357,61 @@ test("POSITIVE CONTROL: on a clean tree the full suite is bound to the commit, s
   assert.deepEqual(run.evidence.discovery.ignored, []);
 });
 
+test("the watchdog cannot report a PASS it failed to RECORD", () => {
+  // ---- PRIORITY TWO: "MONITOR FAILURE REPORTING GREEN" ----------------
+  // Every other case here asks whether the watchdog judges the SUITE
+  // correctly. This one asks what happens when the watchdog's own recording
+  // fails — an unwritable evidence path, which in practice means a full disk,
+  // a read-only mount, or an evidence directory somebody chmod'd. A runner
+  // that has just watched a passing suite and then cannot write its evidence
+  // must NOT exit 0: the caller would read a green exit code with no artifact
+  // behind it, which is the same defect as a timeout reported as PASS.
+  //
+  // The fixture passes, so a green exit is exactly what a naive implementation
+  // would produce.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "watchdog-unwritable-"));
+  const readOnly = path.join(dir, "ro");
+  fs.mkdirSync(readOnly);
+  fs.chmodSync(readOnly, 0o500);
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [
+        WATCHDOG,
+        "--evidence",
+        path.join(readOnly, "evidence.json"),
+        ...RELAXED,
+        "--",
+        path.join(FIXTURES, "pass.fixture.cjs"),
+      ],
+      {
+        cwd: ROOT,
+        encoding: "utf8",
+        timeout: 120_000,
+        killSignal: "SIGKILL",
+        env: { ...process.env, AALIYAH_TEST_DATABASE_URL: DB_URL },
+      },
+    );
+    assert.equal(result.error, undefined, `watchdog did not complete: ${result.error}`);
+    // The suite itself really did pass — that is what makes this specific.
+    assert.match(`${result.stdout}`, /pass 1/);
+    assert.notEqual(result.status, 0, "a PASS that could not be recorded exited 0");
+    assert.equal(result.status, 2, `expected the watchdog's own-failure code 2; got ${result.status}`);
+    assert.match(
+      `${result.stdout}${result.stderr}`,
+      /test-watchdog internal error/,
+      "the failure to record was not named",
+    );
+    assert.ok(
+      !fs.existsSync(path.join(readOnly, "evidence.json")),
+      "fixture precondition: the evidence file must not be writable",
+    );
+  } finally {
+    fs.chmodSync(readOnly, 0o700);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("a FOCUSED run records NO binding claim, because it checked none (mutation M-50)", () => {
   // ---- RED TEAM B5, AND THEN THE SWEEP -------------------------------
   // A FOCUSED run on a git-ignored file recorded `{boundToCommit: true,

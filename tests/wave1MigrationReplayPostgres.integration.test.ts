@@ -3,6 +3,7 @@ import test, { after, before } from "node:test";
 import { Pool } from "pg";
 
 import { runMailMigrations } from "../src/persistence/postgres/migrations";
+import { MIGRATION_BOUNDS } from "../src/persistence/postgres/pool";
 
 /**
  * W1BR-014 — MIGRATIONS ARE NOT INDEPENDENTLY REPLAYABLE.
@@ -109,6 +110,82 @@ test("W1BR-014: replaying an OLDER migration is REFUSED, so later hardening cann
     `INSERT INTO aaliyah_mail_migrations (id)
      VALUES ('027_memory_exact_numeric_domain')`,
   );
+});
+
+test("the migrator leaves NO session state on the connection it returns — success AND refusal", async () => {
+  // ---- WHAT THE ADVISORY LOCK'S REMOVAL LEFT BEHIND ------------------
+  // The runner used to take a session advisory lock and raise `lock_timeout`
+  // to MIGRATION bounds. The lock is gone (removed as unfalsifiable once the
+  // ledger creation tolerated a lost race), but the raised `lock_timeout` is
+  // real session state that outlives the transaction, and the `finally` block
+  // that resets it is gated on the CONNECTION's health rather than on "did
+  // anything throw" — because the first version of that gate returned a
+  // perfectly healthy connection to the pool with migrator state still on it,
+  // and W1BR-014's ordinary refusal was the path that did it.
+  //
+  // `pg_locks` is server-wide, so the existing lock assertions can be made
+  // from any connection. A GUC is NOT: `SHOW lock_timeout` on a fresh pool
+  // says nothing about the migrator's session. So this asks the MIGRATOR'S OWN
+  // pool, with `max: 1`, which hands back the same backend.
+  await withFreshDatabase("session_state", async (url) => {
+    const pool = new Pool({ connectionString: url, max: 1 });
+    pool.on("error", () => undefined);
+    try {
+      const pid = async () => {
+        const r = await pool.query(`SELECT pg_backend_pid()::int AS pid, current_setting('lock_timeout') AS lt`);
+        return { pid: r.rows[0].pid as number, lockTimeout: String(r.rows[0].lt) };
+      };
+      // The BASELINE, not a literal: the watchdog sets its own `lock_timeout`
+      // through PGOPTIONS, so a fresh connection here reads `1min`, not `0`.
+      // What the runner owes the pool is the value it was GIVEN, whatever that
+      // is — and `RESET` restores exactly that startup value.
+      const before = await pid();
+      assert.notEqual(
+        before.lockTimeout,
+        `${MIGRATION_BOUNDS.lockTimeoutMs}ms`,
+        "fixture precondition: the baseline must differ from the migrator's raised value, or a missing reset is invisible",
+      );
+
+      // ---- THE SUCCESS PATH ----
+      await runMailMigrations(pool);
+      const afterSuccess = await pid();
+      assert.equal(
+        afterSuccess.pid,
+        before.pid,
+        "fixture precondition: max:1 must hand back the same backend, or this proves nothing",
+      );
+      assert.equal(
+        afterSuccess.lockTimeout,
+        before.lockTimeout,
+        "the migrator left its raised lock_timeout on the connection it returned",
+      );
+
+      // ---- AND THE REFUSAL PATH, WHICH IS THE ONE THAT BROKE ----
+      await pool.query(
+        `DELETE FROM aaliyah_mail_migrations WHERE id = '027_memory_exact_numeric_domain'`,
+      );
+      await assert.rejects(
+        () => runMailMigrations(pool),
+        /is older than migration ordinal/,
+      );
+      const afterRefusal = await pid();
+      assert.equal(afterRefusal.pid, before.pid, "the refusal destroyed a healthy connection");
+      assert.equal(
+        afterRefusal.lockTimeout,
+        before.lockTimeout,
+        "an ordinary refusal returned a healthy connection carrying migrator session state",
+      );
+      // No advisory lock either, from either path.
+      const held = await pool.query(
+        `SELECT count(*)::int AS n FROM pg_locks
+          WHERE locktype = 'advisory'
+            AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`,
+      );
+      assert.equal(held.rows[0].n, 0);
+    } finally {
+      await pool.end().catch(() => undefined);
+    }
+  });
 });
 
 test("W1BR-014: the refusal is about ORDER, not about that one migration", async () => {
@@ -510,14 +587,19 @@ for (const concurrency of [2, 3, 5]) {
               WHERE proname = 'aaliyah_memory_unerased_merged_records'`,
           );
           assert.equal(helper.rows[0].n, 1);
-          // The session advisory lock the runner takes must not survive it:
-          // it would otherwise ride back into the pool on that connection.
+          // ---- NO SESSION STATE RODE BACK INTO THE POOL ----------------
+          //
+          // The runner no longer TAKES an advisory lock (it was removed as
+          // unfalsifiable once the ledger creation tolerated a lost race), so
+          // this assertion is now a forward leak check rather than a proof
+          // about today's code: it holds any future session lock to the same
+          // standard, and it must keep passing.
           const held = await check.query(
             `SELECT count(*)::int AS n FROM pg_locks
               WHERE locktype = 'advisory'
                 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`,
           );
-          assert.equal(held.rows[0].n, 0, "a migrator left its session advisory lock held");
+          assert.equal(held.rows[0].n, 0, "a migrator left a session advisory lock held");
         } finally {
           await check.end();
         }
