@@ -6114,6 +6114,29 @@ test("S-2 K-01/K-09: a PROVEN_DESTROYED settlement satisfies the key-destruction
   assert.equal(obligations[0]!.resolvedBy, "SETTLEMENT");
   assert.equal(obligations[0]!.settledBy, "settlement-001");
 
+  // ---- AND A LATER COMPLETION PASS MUST NOT RE-BLAME THE PROVIDER ----
+  // Red team B7 against 86d33c9: the settlement branch of
+  // `destroyCommittedAliasKeys` pushed the row onto `provenDestroyed`, which
+  // feeds `clearHealedObligations` and writes `resolved_by = 'PROVIDER'` — so
+  // a key proven by a SETTLEMENT was attributed to a provider that was never
+  // asked (this store has none at all). The mutation sweep then re-added that
+  // one line with nothing failing, because no test had ever run a pass OVER an
+  // already-settled key: every settlement test stopped at the receipt.
+  //
+  // `resolvedBy` is the field an auditor reads to learn whether destruction
+  // was witnessed or adjudicated. Those are not interchangeable.
+  const pass = await store0.completePendingAliasErasures();
+  const after = await store0.listKeyDestructionObligations({ actor: SCOPE });
+  const settledOne = after.find((o) => o.keyRef === binding.pii_key_ref);
+  assert.ok(settledOne !== undefined, `the obligation vanished: ${JSON.stringify(after)}`);
+  assert.equal(
+    settledOne.resolvedBy,
+    "SETTLEMENT",
+    `a settled key was re-attributed after a pass: ${JSON.stringify({ pass, settledOne })}`,
+  );
+  assert.equal(settledOne.settledBy, "settlement-001");
+  assert.equal(settledOne.state, "PROVEN_DESTROYED");
+
   // No NEW destruction evidence here, and that is correct: this key was
   // destroyed honestly, so a provider-confirmed `key_destroyed` row already
   // holds the one slot `memory_pii_key_erasures_once` allows. What the
@@ -6379,6 +6402,39 @@ test("S-12: only a PROVEN_DESTROYED settlement can record destruction, and the s
     [a.keyRef],
   );
   assert.equal(forA.rows[0].n, 0, "a STILL_UNKNOWN settlement produced destruction evidence");
+  // (3) M-23 AT THE CLAUSE, not at the function. Two things enforce this:
+  // `aaliyah_memory_record_settled_destruction` (asserted above) and the
+  // INSERT trigger on the table. The sweep weakened the TRIGGER's
+  // `s.decision = 'PROVEN_DESTROYED'` to `IS NOT NULL` and every test still
+  // passed, because both assertions above go through the function. The
+  // MUTATOR holds INSERT on this table — it is how ordinary provider-confirmed
+  // destruction evidence is written — and the label is whatever the caller
+  // supplies, so this path is reachable and the clause is the only thing on it.
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        `INSERT INTO memory_pii_key_erasures
+           (tenant_id, workspace_id, tombstone_id, alias_id,
+            binding_mutation_receipt_id, key_ref, provider_id, event,
+            settlement_receipt_id)
+         SELECT tenant_id, workspace_id, tombstone_id, alias_id,
+                binding_mutation_receipt_id, key_ref, provider_id,
+                'key_destroyed', 'settlement-s12-a'
+           FROM memory_pii_key_erasures
+          WHERE key_ref = $1 AND event = 'erasure_committed'`,
+        [a.keyRef],
+      ),
+    /settled destruction evidence needs a PROVEN_DESTROYED settlement for that exact key/,
+    "a STILL_UNKNOWN settlement labelled a destruction row",
+  );
+  const stillNone = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_pii_key_erasures
+      WHERE key_ref = $1 AND event = 'key_destroyed'`,
+    [a.keyRef],
+  );
+  assert.equal(stillNone.rows[0].n, 0);
+
   const pass = await store0.completePendingAliasErasures();
   assert.ok(pass.notProven >= 1, JSON.stringify(pass));
 
@@ -6666,6 +6722,62 @@ test("S-4b: a settlement naming the wrong key VERSION, or a future decision date
     settlementFor(binding, tombstoneId, authorizationId),
   );
   assert.equal(ok.recorded, true, JSON.stringify(ok));
+});
+
+test("S-4c: a settlement naming an erasure AUTHORIZATION nobody issued is refused (mutation M-40)", async () => {
+  // ---- RED TEAM B1, AND WHY ITS FIRST TEST DID NOT HOLD --------------
+  // `erasure_authorization_id` was unverified free text, and
+  // memory_key_destruction_settlements_scope_unique — UNIQUE (tenant,
+  // workspace, key_ref, erasure_authorization_id) — was the whole of
+  // "action-specific". So a settlement already refused as
+  // settlement_already_resolved was ACCEPTED by editing that one string to an
+  // id nobody ever issued, and a STILL_UNKNOWN key became ERASED.
+  //
+  // The fix binds the settlement to the authorization the TOMBSTONE recorded.
+  // The mutation sweep then deleted that check and nothing failed: S-3b was
+  // rebuilt with real authorizations, and S-5's forged id is refused by the
+  // spent NONCE before the authorization is ever consulted. Neither test can
+  // see this control. This one drives it directly — first settlement, fresh
+  // nonce, fresh receipt, the ONLY defect being an authorization that does not
+  // exist.
+  const { binding, tombstoneId, authorizationId } = await survivorWithAnUnprovableMergedKey();
+  const store0 = NO_VAULT();
+  const forged = await store0.settleKeyDestruction(
+    settlementFor(binding, tombstoneId, authorizationId, {
+      erasureAuthorizationId: "authorization-nobody-ever-issued",
+    }),
+  );
+  assert.deepEqual(
+    forged,
+    { recorded: false, rejection: "settlement_not_evidence_bound" },
+    "a settlement named an authorization that was never issued",
+  );
+  // NOTHING was written. The nonce lives on the settlement row, so no row means
+  // the nonce is unspent too — the forged attempt costs the subject nothing.
+  const wrote = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_key_destruction_settlements`,
+  );
+  assert.equal(wrote.rows[0].n, 0, "a refused settlement was written anyway");
+  const obligation = await store0.listKeyDestructionObligations({ actor: SCOPE });
+  assert.ok(
+    obligation.every((o) => o.state === "KEY_DESTRUCTION_NOT_PROVEN"),
+    `a forged settlement resolved an obligation: ${JSON.stringify(obligation)}`,
+  );
+  // AND THE SUBJECT IS STILL NOT ERASED, which is the consequence B1 reached.
+  const stillRefused = await eraseRecordAtHead(
+    SURVIVOR, "mutation.s4c.refused", "tombstone-s4c", "subject_erasure_request", store0,
+  );
+  assert.equal(stillRefused.result.rejection, "key_destruction_not_proven");
+
+  // POSITIVE CONTROL: the authorization the tombstone actually recorded is
+  // accepted, on the same key, through the same call.
+  const real = await store0.settleKeyDestruction(
+    settlementFor(binding, tombstoneId, authorizationId, {
+      settlementReceiptId: "settlement-s4c-real",
+      nonce: "nonce-s4c-real",
+    }),
+  );
+  assert.equal(real.recorded, true, JSON.stringify(real));
 });
 
 test("S-5: a settlement nonce is spent once per tenant", async () => {

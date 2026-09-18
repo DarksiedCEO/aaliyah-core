@@ -418,10 +418,19 @@ async function main() {
     discovery: {
       scope,
       // `null` for FOCUSED: not checked, and not claimed either way.
+      //
+      // BOTH directions, or this field contradicts the verdict beside it. It
+      // read `verified && ignored.length === 0`, so a run refused for
+      // DISCOVERY_MISSED_TRACKED_TESTS recorded `boundToCommit: true` — the
+      // executed set declared bound to the commit in the very evidence file
+      // saying a committed test never ran. Found by the M-51 test below, which
+      // was written for the refusal and caught the claim.
       boundToCommit:
         discovery.verified === null
           ? null
-          : discovery.verified && discovery.ignored.length === 0,
+          : discovery.verified &&
+            discovery.ignored.length === 0 &&
+            (discovery.missing ?? []).length === 0,
       ignored: discovery.ignored,
       untracked: discovery.untracked,
       missing: discovery.missing ?? [],

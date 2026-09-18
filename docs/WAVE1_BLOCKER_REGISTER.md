@@ -1473,3 +1473,77 @@ role issued from ANY database on the same cluster breaks the privileges suite
 wherever it runs. A reviewer fired exactly that by accident. The existing
 mitigation is unchanged — every reviewer gets its own container — and the
 boundary is now written down concretely instead of as a warning.
+
+---
+
+## W1.3 SEVENTH PASS — THE 54-MUTANT SWEEP AT `a3d1d0e`
+
+The sweep that followed the sixth chain's remediation. Denominator 54, judged
+by the watchdog in a disposable worktree on an isolated database (port 54521).
+
+    TALLY {"KILLED": 45, "INVALID_MUTANT": 3, "REAL_SURVIVOR": 6}
+
+### THE PATTERN, FOR THE FOURTH TIME
+
+Every one of M-40, M-47, M-50 and M-51 is a control **added during gauntlet
+remediation with no test that reaches it**. M-08, M-23, M-29, M3, M10 and M1
+were the same defect in the three previous sweeps. The tests that were supposed
+to cover them exist and pass; they simply arrive at the outcome by another
+route:
+
+| survivor | the control | why the "covering" test cannot see it |
+|---|---|---|
+| M-40 | the settlement is bound to the tombstone's authorization (B1) | S-3b was rebuilt with REAL authorizations, so deleting the check changes nothing it asserts; S-5 forges the id but is refused by the spent NONCE first, before the authorization is consulted |
+| M-47 | a settlement-resolved key is not attributed to the provider (B7) | every settlement test stops at the receipt; none ran a completion pass OVER an already-settled key |
+| M-50 | a FOCUSED run records `boundToCommit: null` (B5) | the only discovery assertions run the FULL suite |
+| M-51 | `DISCOVERY_MISSED_TRACKED_TESTS` (B5) | no fixture had ever put a tracked test file out of the two-level walk's reach |
+| M-23 | migration 055's trigger clause, as distinct from its function | both existing assertions go through `aaliyah_memory_record_settled_destruction`; the trigger on the table was never driven with a labelled row |
+
+The lesson is not "add tests". It is that a test which asserts the right
+OUTCOME proves nothing about a control it does not traverse, and a control
+added at the end of a review round is exactly the kind that gets one.
+
+### DISPOSITIONS
+
+| id | disposition |
+|---|---|
+| M-40 | **CLOSED** — `S-4c` drives a first settlement, fresh nonce, fresh receipt, whose ONLY defect is an authorization nobody issued. Refused `settlement_not_evidence_bound`; nothing written; the subject stays NOT ERASED; the real authorization is accepted as the positive control. |
+| M-47 | **CLOSED** — `S-2` now runs a completion pass over the settled key and asserts `resolvedBy === "SETTLEMENT"`. The second defense (`clearHealedObligations`' `state = 'KEY_DESTRUCTION_NOT_PROVEN'` filter) is held by the NEW mutant **M-55**, so neither half is unfalsifiable. |
+| M-50 | **CLOSED** — `testWatchdog.test.ts` asserts a FOCUSED run's `boundToCommit` is `null` and explicitly `notEqual` to `true`. `null` is the finding; it is not a weaker `true`. |
+| M-51 | **CLOSED** — a probe at `tests/deep/nested/`, staged INTENT-TO-ADD so `git ls-files` reports it while no blob is written, three levels down where `tests/*/*.test.ts` cannot reach. Refused `DISCOVERY_MISSED_TRACKED_TESTS` before any spawn; the tree is restored and re-asserted clean in `finally`. |
+| M-23 | **CLOSED** — reached at the clause rather than at the function. The MUTATOR holds INSERT on `memory_pii_key_erasures` (it is how ordinary provider-confirmed evidence is written) and chooses the label, so a `key_destroyed` row labelled with a STILL_UNKNOWN settlement's receipt is a reachable path, and the trigger clause is the only thing on it. |
+| M-30 | **RETIRED — the code it mutated was DELETED.** See below. |
+| M-02, M-11, M-54 | **INVALID_MUTANT, re-specified.** M-02 and M-11 anchored on text this round rewrote (`lower()` added for case-insensitive `$user` stripping; the decision filter moved into the three-column `JOIN unnest(...)` form). M-54's anchor was mangled by the DRIVER: a unicode NUL escape inside a non-raw Python string collapsed to one NUL byte, so it could never match the six characters the file contains. All three now resolve exactly once. **Fourth driver defect this sweep** — the reason INVALID_MUTANT is never a silent category. |
+
+### M-30: A MECHANISM REMOVED BECAUSE NOTHING COULD FALSIFY IT
+
+M-30 deleted the migrator's session advisory lock and no test failed. The lock
+was added in the fifth chain to cover the ledger's `CREATE TABLE` against a
+racing migrator. G-01 then made that creation **tolerate** a lost race
+(`LEDGER_RACE_LOST = {42P07, 23505}`) — and with tolerance in place the
+advisory lock covers nothing `LOCK TABLE ... ACCESS EXCLUSIVE` does not: by the
+time the transaction opens the table exists, which is the only state a table
+lock can be taken on.
+
+So there was no property left for a test to hold it to. The choice was between
+keeping an unfalsifiable mechanism and removing it; this register's standard is
+enforceability rather than intent, so it is **removed**, along with
+`LEDGER_LOCK_KEY` and the session-unlock in the `finally` block. The
+`RESET lock_timeout` on a healthy connection stays — that is real session state
+this runner sets.
+
+**M-30b** replaces it against the mechanism that now actually serializes
+migrators: deleting the `LOCK TABLE` must break the concurrent-migrator tests.
+
+A second finding fell out of writing M-51's test. `boundToCommit` was
+`verified && ignored.length === 0` — so a run **refused** for
+`DISCOVERY_MISSED_TRACKED_TESTS` recorded `boundToCommit: true`: the executed
+set declared bound to the commit, in the very evidence file saying a committed
+test never ran. It now requires `missing.length === 0` too, and **M-56** holds
+that. A test written for a refusal caught a false claim sitting next to it.
+
+### STATE AFTER THIS PASS
+
+Suite 1069/1069, guards 8/8, denominator now 56. Production NOT CERTIFIED.
+Fortress NOT CERTIFIED. Nothing pushed, merged or deployed. Every gauntlet
+verdict from the sixth chain is bound to a SUPERSEDED tree and must be re-run.

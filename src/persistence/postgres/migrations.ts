@@ -21,14 +21,6 @@ function migrationDigest(sql: string): string {
 }
 
 /**
- * The advisory-lock key concurrent migrators serialize on, BEFORE the ledger
- * table they would otherwise race to create exists (03581a3 reliability,
- * K-06). Its text is the ledger's own name so the key is obvious from a
- * `pg_locks` dump during an incident.
- */
-const LEDGER_LOCK_KEY = "aaliyah_mail_migrations";
-
-/**
  * Ordered, idempotent migrations for the durable mail state. Each entry runs
  * once, recorded in aaliyah_mail_migrations; re-running is a no-op. Every
  * tenant-owned table carries tenant_id + workspace_id and every read is
@@ -5985,8 +5977,6 @@ export async function runMailMigrations(
     // that into `process.exit(1)`. So every instance of a fresh rolling
     // deploy but one died at boot.
     //
-    // A session advisory lock needs no table, so it is taken FIRST and covers
-    // the creation against every migrator that TAKES IT.
     //
     // ---- AND AN OLDER BUILD CANNOT BE BOUND AT ALL ---------------------
     //
@@ -6006,9 +5996,19 @@ export async function runMailMigrations(
     // nothing; inside one, the same error would abort the transaction that
     // was about to apply the migrations.
     //
-    // `LOCK TABLE` is still taken below, where it does serialize an older
-    // build — once the table exists, which is the only state it can lock.
-    await bounded("SELECT pg_advisory_lock(hashtextextended($1, 0))", [LEDGER_LOCK_KEY]);
+    // ---- AND THE ADVISORY LOCK IS GONE, BECAUSE IT IS REDUNDANT ------
+    //
+    // It was added to cover the ledger's creation. Now that the creation
+    // TOLERATES a lost race, the lock covers nothing that `LOCK TABLE` does
+    // not: once the table exists — which it does by the time the transaction
+    // below opens — `LOCK TABLE ... ACCESS EXCLUSIVE` serializes every
+    // migrator that reaches it, old build or new.
+    //
+    // Removed rather than kept, because this round's own mutation sweep found
+    // it UNFALSIFIABLE after the tolerance fix: deleting the lock broke no
+    // test, and there is no property left for a test to hold it to. A
+    // mechanism nothing can falsify is a claim, not a control, and this
+    // register's standard is the other way round.
     await createLedgerToleratingARace(bounded);
   } catch (error) {
     ambiguous = error;
@@ -6138,23 +6138,18 @@ export async function runMailMigrations(
     await bounded("ROLLBACK").catch(() => undefined);
     throw error;
   } finally {
-    // The advisory lock is SESSION-scoped, so it outlives the transaction and
-    // rides back into the pool on this connection unless it is released here.
-    // Same for the session `lock_timeout`.
+    // The session `lock_timeout` this runner raised outlives the transaction
+    // and would ride back into the pool on this connection unless it is reset.
     //
     // The distinction is the CONNECTION's health, NOT whether the migration
     // failed. An ordinary refusal — W1BR-014's "replaying an older migration"
     // for instance — leaves a perfectly healthy session that must be cleaned
-    // up before it is reused; caught by the K-06 test below asserting no
-    // advisory lock survives, which failed the first time this cleanup was
-    // gated on "did anything throw" instead. A BROKEN connection is destroyed
-    // instead, which drops the session and every lock with it, and must not be
-    // spoken to first.
+    // up before it is reused; the first version of this cleanup was gated on
+    // "did anything throw" and returned a healthy connection to the pool with
+    // state still set on it. A BROKEN connection is destroyed instead, which
+    // drops the session and everything on it, and must not be spoken to first.
     const broken = ambiguous !== undefined && isConnectionAmbiguous(ambiguous);
     if (!broken) {
-      await bounded("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [
-        LEDGER_LOCK_KEY,
-      ]).catch(() => undefined);
       await bounded("RESET lock_timeout").catch(() => undefined);
     }
     client.release(broken ? true : undefined);

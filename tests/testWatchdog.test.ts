@@ -34,7 +34,12 @@ type Evidence = {
   timedOut: Array<{ name: string; message: string | null }>;
   processGroup: { killedSurvivors: boolean; survivedSigkill: boolean } | null;
   database: { before: { reachable: boolean } | null };
-  discovery?: { boundToCommit: boolean; ignored: string[]; untracked: string[] };
+  discovery?: {
+    boundToCommit: boolean | null;
+    ignored: string[];
+    untracked: string[];
+    missing: string[];
+  };
 };
 
 function runWatchdog(
@@ -350,6 +355,88 @@ test("POSITIVE CONTROL: on a clean tree the full suite is bound to the commit, s
   assert.equal(run.status, 0);
   assert.equal(run.evidence.discovery.boundToCommit, true);
   assert.deepEqual(run.evidence.discovery.ignored, []);
+});
+
+test("a FOCUSED run records NO binding claim, because it checked none (mutation M-50)", () => {
+  // ---- RED TEAM B5, AND THEN THE SWEEP -------------------------------
+  // A FOCUSED run on a git-ignored file recorded `{boundToCommit: true,
+  // ignored: []}` — a positive assertion about a property nobody had checked,
+  // in the one field a reviewer reads to decide whether the executed set was
+  // the commit's. The fix records `null` instead. The 54-mutant sweep then put
+  // `true` back and NOTHING failed, because no test read this field on a
+  // FOCUSED run: the only discovery assertions ran the full suite.
+  //
+  // `null` is the whole finding. It is not a weaker `true`.
+  // An ordinary FOCUSED run — discovery evidence is recorded on every run, so
+  // this is the shape a reviewer actually reads. (`--verify-discovery` is not
+  // used: it answers the full-suite question and runs nothing.)
+  const run = runWatchdog(["pass.fixture.cjs"], RELAXED);
+  assert.equal(run.evidence.verdict, "PASS", JSON.stringify(run.evidence.reasons));
+  const discovery = run.evidence.discovery;
+  assert.ok(discovery !== undefined, "a --verify-discovery run recorded no discovery evidence");
+  assert.equal(discovery.boundToCommit, null);
+  assert.notEqual(
+    discovery.boundToCommit,
+    true,
+    "a FOCUSED run claimed a commit binding it never verified",
+  );
+});
+
+test("a test file in the commit that discovery MISSES is FAIL, not a silently smaller suite (mutation M-51)", () => {
+  // ---- THE OTHER DIRECTION OF B5, WHICH HAD NO TEST AT ALL ------------
+  // `discoveryBinding` originally asked only whether everything DISCOVERED is
+  // in the commit. The reverse — a tracked test file the two-level walk never
+  // finds — is the same defect with worse consequences: a test that is in the
+  // commit, that a reviewer counts, and that did not run. The
+  // DISCOVERY_MISSED_TRACKED_TESTS refusal was added for it and the sweep
+  // deleted it with every test still green, because no fixture had ever put a
+  // tracked file out of the walk's reach.
+  //
+  // The probe is INTENT-TO-ADD (`git add -N`): that is enough to make
+  // `git ls-files` report it — which is what the watchdog asks — while writing
+  // no blob, and `git rm --cached` plus the unlink below restore the tree
+  // exactly. It sits three levels deep, where `tests/*/*.test.ts` cannot see
+  // it.
+  const dir = path.join(ROOT, "tests/deep/nested");
+  const rel = "tests/deep/nested/discoveryMissed.probe.test.ts";
+  const probe = path.join(ROOT, rel);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(probe, 'import { test } from "node:test";\ntest("never runs", () => {});\n');
+  const git = (args: string[]) => spawnSync("git", args, { cwd: ROOT, encoding: "utf8" });
+  try {
+    assert.equal(git(["add", "-N", rel]).status, 0, "fixture precondition: could not stage the probe");
+    // It really is in the commit's file list...
+    assert.ok(
+      git(["ls-files", "--", "tests"]).stdout.split("\n").includes(rel),
+      "fixture precondition: the probe must be tracked",
+    );
+    // ...and it really is NOT ignored, so DISCOVERY_NOT_BOUND_TO_COMMIT is not
+    // what refuses this. Only the missing-tracked check can.
+    assert.equal(
+      git(["check-ignore", rel]).status,
+      1,
+      "fixture precondition: the probe must not be git-ignored",
+    );
+
+    const run = runFullSuiteDiscovery(["--no-db", "--deadline-ms", "20000"]);
+    assert.equal(run.evidence.verdict, "FAIL", JSON.stringify(run.evidence.reasons));
+    assert.equal(run.status, 1);
+    assert.ok(
+      run.evidence.reasons.some((r) => /^DISCOVERY_MISSED_TRACKED_TESTS:/.test(r)),
+      `expected a missed-tracked refusal; got ${JSON.stringify(run.evidence.reasons)}`,
+    );
+    assert.deepEqual(run.evidence.discovery.missing, [rel]);
+    assert.deepEqual(run.evidence.discovery.ignored, []);
+    assert.equal(run.evidence.discovery.boundToCommit, false);
+    // Refused before anything was spawned.
+    assert.equal(run.evidence.counts, null);
+    assert.ok(run.elapsedMs < 10_000, `refusal took ${run.elapsedMs}ms — it did not short-circuit`);
+  } finally {
+    git(["rm", "--cached", "--force", "--quiet", rel]);
+    fs.rmSync(path.join(ROOT, "tests/deep"), { recursive: true, force: true });
+    const left = git(["status", "--porcelain", "--", "tests/deep"]).stdout.trim();
+    assert.equal(left, "", `the probe was not fully removed: ${left}`);
+  }
 });
 
 test("a git-ignored test file in tests/ is FAIL: it would execute while git status stays clean", () => {
