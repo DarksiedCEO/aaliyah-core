@@ -6202,6 +6202,52 @@ test("S-9: a settlement whose digest is not the digest of its own evidence prove
   assert.equal(obligations[0]!.notProvenReason, "CONTRADICTORY_EVIDENCE", JSON.stringify(obligations));
 });
 
+test("S-11 K-09: a MERGED-IN key held by another provider is not proven by the PRE-CHECK either", async () => {
+  // ---- A REAL MUTATION SURVIVOR, AND THE TEST THAT KILLS IT ---------
+  // Found by this round's own sweep (M-08). `askProvider`'s
+  // PROVIDER_DOES_NOT_OWN_KEY branch could be changed to report
+  // PROVEN_DESTROYED and every test still passed — because S-10 and K-9 reach
+  // the provider-mismatch case through the COMPLETION PASS, which has its own
+  // mismatch branch and never calls `askProvider` at all. The PRE-CHECK's
+  // mismatch path, the one that decides whether a survivor's erasure proceeds,
+  // was claimed and not discriminated.
+  //
+  // The shape: the merged-in key was destroyed HONESTLY by its owning
+  // provider, so the database's evidence is real and its helper is satisfied.
+  // The survivor's erasure is then attempted by a store that speaks for a
+  // DIFFERENT provider — a provider migration — and cannot establish anything
+  // about that key.
+  await absorbVictim("mutation.s11.merge");
+  const binding = await bindingState("alias-pii-001");
+  const erased = await eraseRecordAtHead(PARTICIPANT, "mutation.s11.absorbed", "tombstone-s11-absorbed");
+  assert.equal(erased.result.verified, true, erased.result.rejection ?? "");
+  assert.equal(
+    await TEST_PII_KEYS.dataKeyState({ scope: DATA_SCOPE, keyRef: binding.pii_key_ref }),
+    "destroyed",
+    "fixture precondition: the merged-in key really is destroyed, with real evidence",
+  );
+
+  const other = { ...TEST_PII_KEYS, providerId: "other-kms/v1" } as typeof TEST_PII_KEYS;
+  const refused = await eraseRecordAtHead(
+    SURVIVOR, "mutation.s11.survivor", "tombstone-s11-survivor", "subject_erasure_request",
+    createPostgresTrustedMemoryStore(writePool, readPool, { piiKeys: other }),
+  );
+  assert.equal(
+    refused.result.verified,
+    false,
+    "a store that cannot speak for the key reported the survivor erased",
+  );
+  assert.equal(refused.result.rejection, "key_destruction_not_proven");
+  assert.equal(await nonceConsumed(refused.receipt.authorizationId), false);
+  const obligations = await store().listKeyDestructionObligations({ actor: SCOPE });
+  assert.deepEqual(obligations.map((o) => o.notProvenReason), ["PROVIDER_DOES_NOT_OWN_KEY"]);
+
+  // POSITIVE CONTROL: the store that DOES own the key erases the same
+  // survivor. So the refusal is which provider is asking, and nothing else.
+  const allowed = await eraseRecordAtHead(SURVIVOR, "mutation.s11.ok", "tombstone-s11-ok");
+  assert.equal(allowed.result.verified, true, allowed.result.rejection ?? "");
+});
+
 test("S-10 K-09: a key held by ANOTHER provider is not proven, is named, and heals by PROVIDER when the owner answers", async () => {
   // Security NEW-2's shape: the store's provider never held the key. It is
   // counted and named rather than skipped, and when the owning provider
