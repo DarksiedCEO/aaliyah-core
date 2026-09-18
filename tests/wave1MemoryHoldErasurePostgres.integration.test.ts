@@ -5213,6 +5213,212 @@ test("K-07: the pinned path drops \"$user\" and pg_temp's precedence, and KEEPS 
   }
 });
 
+test("X-9 K-23: the merged-key check walks the WHOLE chain — a key three hops away is asked about, not just the nearest", async () => {
+  // Founder FOURTH priority: the erasure contract must hold "across every
+  // in-scope identity/key/alias in the canonical merge set", and the earlier
+  // claim that alias erasure was closed did not survive identity merge. Every
+  // other X-test uses a ONE-HOP merge, so a scope that walked a single edge
+  // instead of the transitive closure would pass all of them.
+  //
+  //   leaf -> mid -> near -> SURVIVOR
+  //
+  // All three levels are erased HONESTLY, so the database's evidence says
+  // every key is destroyed and its own helper is satisfied. The survivor's
+  // erasure then runs against a provider that can speak for `near` and `mid`
+  // but answers `unknown` for the LEAF's key — the shape of a partially
+  // migrated key provider. A one-edge scope asks only about `near`, is told
+  // "destroyed", and lets the survivor through. The recursive scope asks about
+  // the leaf as well.
+  //
+  // The cap that bounds this recursion at 16 hops is proven by D-1/D-2 in the
+  // identity suite; this proves the recursion itself reaches past hop one.
+  const levels = ["x9-leaf", "x9-mid", "x9-near"];
+  const keyOf = new Map<string, string>();
+  for (const [i, level] of levels.entries()) {
+    const bound = await bindNumberedParticipantAs(
+      `participant-${level}`, `alias-${level}`, `person-${level}@example.com`, `mutation.x9.bind.${i}`,
+    );
+    keyOf.set(level, bound.keyRef);
+  }
+  await seedGenesis({ participant: SURVIVOR, generation: 1 }, { recordId: SURVIVOR });
+  // Built from the FAR end inwards, because both endpoints of a merge must
+  // still be roots: migration 042 refuses a merge INTO a record that was
+  // itself merged away.
+  await mergeRecordInto("participant-x9-leaf", "participant-x9-mid", "mutation.x9.merge.leaf");
+  await mergeRecordInto("participant-x9-mid", "participant-x9-near", "mutation.x9.merge.mid");
+  await mergeRecordInto("participant-x9-near", SURVIVOR, "mutation.x9.merge.near");
+  // Erased leaf-first, which is the only order the chain allows: a record with
+  // an unerased record merged into it is refused.
+  for (const level of levels) {
+    const erased = await eraseRecordAtHead(`participant-${level}`, `mutation.x9.erase.${level}`, `tombstone-x9-${level}`);
+    assert.equal(erased.result.verified, true, `${level}: ${erased.result.rejection ?? ""}`);
+  }
+  // FIXTURE PRECONDITION: the database is fully satisfied. Every key has
+  // destruction evidence, so nothing here depends on the DB helper refusing.
+  const evidenced = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_pii_key_erasures WHERE event = 'key_destroyed'`,
+  );
+  assert.equal(evidenced.rows[0].n, levels.length);
+
+  const leafKey = keyOf.get("x9-leaf")!;
+  const asked: string[] = [];
+  const partial = {
+    ...TEST_PII_KEYS,
+    dataKeyState: async (input: Parameters<typeof TEST_PII_KEYS.dataKeyState>[0]) => {
+      asked.push(input.keyRef);
+      // The provider that does not hold the oldest key any more.
+      return input.keyRef === leafKey ? ("unknown" as const) : TEST_PII_KEYS.dataKeyState(input);
+    },
+  } as typeof TEST_PII_KEYS;
+
+  const refused = await eraseRecordAtHead(
+    SURVIVOR, "mutation.x9.survivor", "tombstone-x9-survivor", "subject_erasure_request",
+    createPostgresTrustedMemoryStore(writePool, readPool, { piiKeys: partial }),
+  );
+  // THE ASSERTION. A one-edge scope never asks this question at all.
+  assert.ok(asked.includes(leafKey), `the leaf's key was never asked about: ${JSON.stringify(asked)}`);
+  assert.equal(
+    refused.result.verified,
+    false,
+    "the survivor was erased while a key three hops away could not be confirmed",
+  );
+  assert.equal(refused.result.rejection, "key_destruction_not_proven");
+  assert.equal(await nonceConsumed(refused.receipt.authorizationId), false);
+  const obligations = await store().listKeyDestructionObligations({ actor: SCOPE });
+  assert.deepEqual(
+    obligations.map((o) => o.keyRef),
+    [leafKey],
+    "only the unprovable key becomes an obligation",
+  );
+  assert.equal(obligations[0]!.notProvenReason, "PROVIDER_ANSWERED_UNKNOWN");
+
+  // POSITIVE CONTROL: the same survivor, asked of a provider that can speak
+  // for all three, erases. So the refusal is that one key and not the depth.
+  const allowed = await eraseRecordAtHead(SURVIVOR, "mutation.x9.survivor.ok", "tombstone-x9-ok");
+  assert.equal(allowed.result.verified, true, allowed.result.rejection ?? "");
+  // And no level's address survives anywhere in the database.
+  for (const level of levels) {
+    assert.deepEqual(await plaintextSightings(`person-${level}@example.com`), []);
+  }
+});
+
+test("X-10 K-14: the MEASURABLE boundary of what a subject erasure reaches in ordinary record content", async () => {
+  // ---- THE DISCLOSED RESIDUAL, MEASURED RATHER THAN DESCRIBED --------
+  //
+  // The 8a0bf05 reports disclose that "an address split across multiple
+  // ordinary content fields may remain in clear record content until that
+  // record itself is deleted", and the founder's SIXTH priority asks for an
+  // explicit determination with measurable semantics — not a magical PII
+  // detector.
+  //
+  // This test IS the determination. Reading the code first showed the
+  // disclosure understates it in one way and overstates it in another, so
+  // both are pinned here:
+  //
+  //   `alias_plaintext_in_record_content` guards ONE mutation —
+  //   `assign_alias` — and checks the normalized and observed alias as
+  //   CONTIGUOUS, case-insensitive substrings anywhere in the proposed
+  //   content. It is not applied to `create` or `correct` at all.
+  //
+  // What that actually means, and what this test proves:
+  //
+  //   1. SUPPORTED: a subject erasure destroys the subject's OWN content on
+  //      every version — contiguous address, split address, anything. Writing
+  //      an identifier into the subject's own record is NOT a residual.
+  //   2. NOT SUPPORTED: the same identifier in ANOTHER record's content
+  //      survives, contiguous or split. That record is not in the subject's
+  //      canonical merge set, and subject erasure does not reach outside it.
+  //   3. Why it is not simply fixed: reaching it needs either a reverse index
+  //      of subject identifiers — which is the very material the vault exists
+  //      to keep out of the clear — or a detector that recognises an
+  //      identifier assembled across fields. Neither is in W1.3.
+  //
+  // DETERMINATION: option (B). Outside the W1.3 erasure contract, and
+  // BLOCKING later production privacy claims. Recorded in
+  // docs/WAVE1_BLOCKER_REGISTER.md and surfaced to AEGIS as a residual, not
+  // as a closed finding.
+  await bindVictimAddress();
+  const local = VICTIM_NORMALIZED.split("@")[0]!;
+  const domain = VICTIM_NORMALIZED.split("@")[1]!;
+
+  // (1) The subject's OWN content, carrying the address contiguously. Note
+  // that `correct` accepts it — the guard is on `assign_alias` only — which is
+  // itself part of the measurement.
+  const subjectHead = await store().readHead(SCOPE, PARTICIPANT);
+  const leaking = { participant: PARTICIPANT, note: `reach me at ${VICTIM_ADDRESS}`, part: local, rest: domain };
+  const correctReceipt = await issue(
+    authorization({
+      action: "correct",
+      targetRecordId: PARTICIPANT,
+      expectedHead: headOf(subjectHead!.version, subjectHead!.contentDigest),
+      proposedContent: leaking,
+    }),
+  );
+  const corrected = await store().correct({
+    actor: SCOPE,
+    authorizationId: correctReceipt.authorizationId,
+    recordId: PARTICIPANT,
+    proposedContent: leaking,
+    mutationReceiptId: "mutation.x10.correct",
+  });
+  assert.equal(corrected.verified, true, corrected.rejection ?? "");
+  assert.notDeepEqual(await plaintextSightings(VICTIM_NORMALIZED), [], "fixture precondition");
+
+  // (2) ANOTHER record, carrying the same address contiguously AND split
+  // across two fields.
+  await seedGenesis(
+    { note: `cc: ${VICTIM_ADDRESS}`, localPart: local, domainPart: domain },
+    { recordId: "participant-x10-bystander" },
+  );
+
+  const erased = await eraseRecordAtHead(PARTICIPANT, "mutation.x10.erase", "tombstone-x10");
+  assert.equal(erased.result.verified, true, erased.result.rejection ?? "");
+
+  // ---- WHAT THE CONTRACT DELIVERS -----------------------------------
+  // The subject's own content is gone from every version it ever had.
+  // Asserted as ABSENCE OF THE IDENTIFIER, not as "content is null": the
+  // deletion appends its own final version whose content is the deletion
+  // ORDER, which legitimately is not null and carries no subject material.
+  const subjectRows = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_record_versions
+      WHERE record_id = $1
+        AND (payload->'content')::text ILIKE '%' || $2 || '%'`,
+    [PARTICIPANT, local],
+  );
+  assert.equal(subjectRows.rows[0].n, 0, "the subject's own content must not keep the identifier on any version");
+  // The alias, its index and its key are gone.
+  assert.equal(await aliases().resolveAlias(SCOPE, VICTIM_NORMALIZED), null);
+
+  // ---- WHAT THE CONTRACT DOES NOT DELIVER, EXACTLY ------------------
+  // The bystander's content still holds the address, contiguously and split.
+  const bystander = await adminPool.query(
+    `SELECT payload->'content' AS content FROM memory_record_versions
+      WHERE record_id = 'participant-x10-bystander' ORDER BY version DESC LIMIT 1`,
+  );
+  const content = JSON.stringify(bystander.rows[0].content);
+  assert.ok(content.includes(local), `the residual is the point of this test: ${content}`);
+  assert.ok(content.includes(domain), content);
+  // Stated as a measurement rather than a hope: the ONLY record still holding
+  // it is the one outside the subject's canonical merge set.
+  const sightings = await plaintextSightings(VICTIM_NORMALIZED);
+  assert.deepEqual(
+    [...sightings].sort(),
+    // ONE physical residual, surfaced twice: `memory_records_retrievable` is a
+    // VIEW over `memory_record_versions`. Named exactly, so a future change
+    // that puts the identifier anywhere else — an index, a receipt, a
+    // tombstone, another table — is a failure here rather than a footnote.
+    ["memory_record_versions.payload", "memory_records_retrievable.payload"],
+    `unexpected residual locations: ${JSON.stringify(sightings)}`,
+  );
+  // And it is exactly the bystander: the subject's own rows hold nothing.
+  const whose = await adminPool.query(
+    `SELECT DISTINCT record_id FROM memory_record_versions
+      WHERE (payload->'content')::text ILIKE '%' || $1 || '%' ORDER BY record_id`,
+    [local],
+  );
+  assert.deepEqual(whose.rows.map((r) => r.record_id), ["participant-x10-bystander"]);
+});
+
 // ---------------------------------------------------------------------------
 // R — NO PROVIDER CALL HOLDS A DATABASE CONNECTION (reliability K-02)
 // ---------------------------------------------------------------------------

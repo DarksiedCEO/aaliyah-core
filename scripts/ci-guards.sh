@@ -77,6 +77,20 @@ else
   sed 's/^/    /' /tmp/contracts-provenance.out
 fi
 
+# 8. The full suite's executed set must be the COMMIT's set.
+#    Red team K-19 against 8a0bf05: `.gitignore` excludes `coverage`, and the
+#    full-suite glob walks the filesystem, so `tests/coverage/*.test.ts` was
+#    discovered and EXECUTED while `git status` stayed empty and the evidence
+#    recorded `git.dirty: false`. Asked here as well as inside `npm test`,
+#    because a guard that answers in under a second is worth having before
+#    anyone pays for a suite.
+if node scripts/test-watchdog.mjs --verify-discovery >/tmp/discovery.out 2>&1; then
+  ok "the full suite's executed set is bound to the commit"
+else
+  bad "test discovery is not bound to the commit:"
+  sed 's/^/    /' /tmp/discovery.out
+fi
+
 echo
 if [ "$fail" -ne 0 ]; then
   echo "RELEASE GUARDS: FAIL"; exit 1

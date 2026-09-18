@@ -1063,3 +1063,201 @@ Reports are at `aaliyah-w13-evidence/03581a3/reviews/`.
 **Freeze of `7f10e19`: superseded before review.**
 - Suite passed twice, 1018/1018. Release guards PASS. 26/27 targeted mutants KILLED.
 - The one survivor, M54-03, was MIS-SPECIFIED: it filtered on the literal `local-test/v1`, which K-9's rows carry anyway. The regression it meant to model is a filter on the store's OWN provider id, and that corrected mutant is run at the next freeze.
+
+---
+
+## W1.3 FIFTH HOSTILE CHAIN — `8a0bf05`, AND THE REMEDIATION AFTER IT
+
+Reports are at `aaliyah-w13-evidence/8a0bf05/reviews/`. Findings that landed
+after the candidate was frozen were held outside the repository so the SHA
+under review was not changed while reviewers judged it
+(`aaliyah-w13-evidence/8a0bf05/OPEN-FINDINGS-INHERITED.md`); they are all here
+now.
+
+| Reviewer | Verdict at `8a0bf05` |
+| --- | --- |
+| Test Falsifiability | TEST_TRUTH_GREEN (and: no independent mutation-fuzz proof at that SHA) |
+| Security | SECURITY_GREEN, scoped — one MEDIUM, three LOW |
+| Reliability | **RELIABILITY_RED** — one CRITICAL, one HIGH |
+| Red Team | **BLOCK** — one HIGH, one MEDIUM, plus register hygiene |
+| Integration Marshal | **BLOCK** — one CRITICAL |
+| Release Guardian / AEGIS Ω | not run |
+
+### THE STALE "STILL OPEN" LIST IS SUPERSEDED
+
+Red team B3 was right: the "Still open" list around line 993 was not updated
+when W1BR-047 and W1BR-048 closed two of its items, the 03581a3 reliability
+result was never recorded at all, and the red team's own B1 appeared nowhere.
+**That list is superseded by the register below.** Every finding recovered from
+evidence against `8a0bf05` — including the four items the 03581a3 reliability
+review left open, whose code was unchanged at that SHA — carries an explicit
+disposition here. Nothing is a backlog item.
+
+### FOUNDER DECISION — SURVIVOR ERASURE, OPTION B, LOCKED
+
+When a merged-in key cannot be AUTHORITATIVELY confirmed destroyed, Aaliyah
+must not represent the subject as erased. The state is
+`ERASURE_PENDING_SETTLEMENT` / `KEY_DESTRUCTION_NOT_PROVEN` and it stays
+unresolved until an evidence-bound settlement resolves it. UNKNOWN never
+becomes ERASED because a row says destroyed, a retry budget expired, the
+provider is unavailable, the key cannot be found, an operator says "probably
+gone", or time elapsed. Database evidence alone does not substitute for
+authoritative key-provider destruction proof.
+
+Implemented by migration 055 and `src/application/memory/wave1KeyDestruction.ts`.
+Settlement is bounded and is **not** an administrative bypass; each required
+property is enforced where a caller cannot reach it, and each is listed against
+K-01/K-09 below.
+
+### REGISTER
+
+| ID | Sev | Reviewer | Finding | Disposition | Proven by |
+| --- | --- | --- | --- | --- | --- |
+| K-01 | CRITICAL | Integration | With `piiKeys: null` — the actual production wiring, no production KMS provisioned — `state` is forced to null, null is never `"destroyed"`, and every survivor of a merge whose absorbed record ever carried a PII binding is refused subject erasure PERMANENTLY, including its own content, even where the merged-in key was genuinely destroyed with evidence. Undisclosed. | **CLOSED.** OPTION B: the question is three-valued, an unprovable key yields `key_destruction_not_proven` with a durable, listable obligation naming WHY, and a bounded settlement resolves it. Both reachable states are covered: evidence-says-destroyed-but-unaskable, and evidence-pending-with-no-provider (RV5-U-7). | S-1, S-2, S-2b, S-3, S-3b, S-4..S-10; obligation ledger listable |
+| K-02 | CRITICAL | Reliability | Survivor-erasure provider calls ran INSIDE the open `mutate()` transaction holding the record's advisory lock and a pool slot, with no application timeout; `pool.max` concurrent ordinary erasures during provider latency exhaust the write pool for every tenant. | **CLOSED.** The proof phase runs before `BEGIN`, holding nothing — sound because destruction latches — and the transaction re-reads the in-scope key set under the record's lock, refusing any key the proof phase did not answer for. Every provider call has an explicit deadline. | R-1 (probe1: no transaction and no record lock held ACROSS the call, measured as durations), R-2 (probe2: an unrelated mutation completes WHILE the provider is hung) |
+| K-03 | HIGH | Red Team B1 | A subject erasure reported `verified:true` while the subject's OWN key was live and a pre-erasure ciphertext copy still decrypted. Needed only a provider outage plus one `restore`: the second erasure wrote no new `erasure_committed` rows and the tombstone-scoped denominator was empty. | **CLOSED.** The completeness denominator is the SUBJECT's canonical merge set, whatever tombstone recorded a key and whatever state its owning record is now in. | RT5-R1 and RT5-R1b (both deletion reasons), RT5-R2 |
+| K-04 | HIGH | Reliability | The evidenced-key audit had no batch bound and re-confirmed every historically destroyed key on every pass forever; no per-call provider timeout; `server.ts` awaits that pass before `app.listen()`. | **CLOSED.** Its own limit plus round-robin ordering by least-recently-audited: constant cost per pass, total coverage, and volume moves a forged row towards the front of the queue rather than away from it. Per-call deadlines throughout. | R-3 (probe3: bounded AND every key still reached), R-4 (probe4: a never-answering provider is abandoned and named PROVIDER_TIMEOUT), K-7, K-8 |
+| K-05 | HIGH | Reliability (03581a3, unchanged at 8a0bf05) | Every bound was the SERVER's. A SIGSTOPped backend held boot 30s past its 10s bound; no `query_timeout`, no TCP keepalive. | **CLOSED.** Pools carry `query_timeout` (35s, above the 30s statement bound so a live server's own `57014` still wins) and keepalives; migrations get a wider ceiling with their wider server bounds. A query that trips the ceiling leaves the connection AMBIGUOUS, so it is destroyed rather than reused. | A pass-through TCP proxy that completes the real handshake then stops relaying — harsher than SIGSTOP, since the server's own timeout fires and cannot arrive — abandoned at 35.03s, with a transparency control |
+| K-06 | HIGH | Reliability (03581a3, unchanged) | `CREATE TABLE IF NOT EXISTS aaliyah_mail_migrations` ran outside any lock; 2-way and 3-way concurrent migrators crashed N-1 with `23505` on `pg_type_typname_nsp_index`, and `server.ts` turns that into `process.exit(1)`. | **CLOSED.** A session advisory lock needs no table, so it is taken first and covers the creation; `LOCK TABLE` is kept to bind a migrator running an older build. | A positive control proving bare concurrent `IF NOT EXISTS` really crashes N-1 with 23505 on this server, then 2, 3 and 5 concurrent migrators all fulfilling with the ledger applied exactly once and no session lock left held |
+| K-07 | MEDIUM | Security NEW-1 / Red Team B2 | The stores named tables UNQUALIFIED under `SET LOCAL ROLE` on the default `"$user", public` path; granted CREATE on the database, the mutator shadowed `memory_identity_edges` and a survivor's erasure verified over a LIVE key with forged evidence (ATK-P1). | **CLOSED.** `enterMemoryRole` strips `"$user"` and re-appends `pg_temp` LAST, in one statement, for every store. Schemas the OPERATOR configured are kept — that is a deployment decision, and it is what lets a read-back pool be pointed at a divergent schema, which a dozen tests rely on. | ATK-P1 reproduced with the grant in place and refused, with a negative control proving the schema is otherwise uncreatable; plus a direct test of the three path properties and of `SET LOCAL` not leaking |
+| K-08 | MEDIUM | Red Team B2 | Five more widenings produced NO map diff and all WORKED: CREATE ON DATABASE, a view in another schema, a SECURITY DEFINER function in another schema, a granted `pg_catalog` function (`pg_read_file` read 29,950 bytes of `postgresql.conf`), and a function owner change. TEMP/CONNECT through PUBLIC undeclared. | **CLOSED.** The map has a `databases` section (with `acldefault`, so the implicit PUBLIC CONNECT/TEMPORARY is stated), scans every non-system schema and names it in each entry, has a `catalogFunctions` section for explicit `pg_catalog` grants, and records owners. | A positive control per widening: ten in one test plus W2/W3 in another, each applied, reported by name, reverted, map restored |
+| K-09 | MEDIUM | Security NEW-2 | A merged-in key the store's provider cannot confirm (lost key, provider migration) blocked the survivor's erasure permanently. Fails closed, undisclosed, no operator path. | **CLOSED** with K-01. Named `PROVIDER_DOES_NOT_OWN_KEY` / `PROVIDER_ANSWERED_UNKNOWN` rather than skipped, and settleable. An obligation that heals because the owning provider finally answers is closed as resolved BY PROVIDER, not by settlement, so the ledger does not accumulate rows that healed on their own. | S-10, K-9 |
+| K-10 | MEDIUM | Reliability (03581a3) | `server.ts` awaited both recovery passes in ONE try/catch, so a `reconcilePending` rejection skipped erasure completion entirely — and silently, since the catch spoke only of reconciliation. | **CLOSED.** Two independent passes, each reporting its own result or its own failure; `notProven` is surfaced separately from `pending`, so a permanent state no longer looks like a counter that has not moved yet. | A REAL spawned `server.ts` with both passes made to fail by privilege: both failures appear, and the process still boots |
+| K-11 | MEDIUM | Reliability (03581a3) | `destroyed` was incremented unconditionally after `ON CONFLICT DO NOTHING`, so two racing passes over ten keys reported 15 and 16. | **CLOSED.** Counted from rows that actually landed. A new `repaired` count carries the case the rowCount check would otherwise silence: a forged `key_destroyed` row already holds the evidence slot, so a real destruction of a live key would have reported zero. | R-5 (two racing passes sum to the ledger), K-6, K-7, K-8, K-9 |
+| K-12 | MEDIUM | Integration | `tests/support/sharedMemoryTables.ts`'s advisory lock is per-database and structurally cannot protect cluster-wide DDL (`ALTER ROLE`, proven empirically) from a concurrent file on another database in the same cluster. | **BOUNDED_AND_PROVEN_NONBLOCKING.** See "Cluster-scoped DDL" below: the boundary is now written down, no RLS exists anywhere in `src/` or `tests/`, and BYPASSRLS has no effect without policies. Not exploited. | The reviewer's own empirical proof (`pg_try_advisory_lock` from another database succeeded while the first was held); grep for RLS across the repository |
+| K-13 | MEDIUM | Integration / founder | Migration 047 is NOT rolling-update safe and NOT rollback safe, and no full-stop procedure was written down. | **DISCLOSED, documented, NOT DEPLOYED.** See "Migration 047 deployment" below. Production: **NOT PROVEN**. | The register section below; migration replay and upgrade suites |
+| K-14 | MEDIUM | Founder SIXTH priority | An address in ordinary record content may remain in the clear until that record is deleted. | **DETERMINATION (B): outside the W1.3 erasure contract, and BLOCKING later production privacy claims.** Measured, not described — see "The clear-content residual" below. Surfaced to AEGIS as a residual, not as a closed finding. | X-10, which pins both what the contract destroys and the exact two locations (one physical row, surfaced through a view) where the residual survives |
+| K-15 | LOW | Red Team B3 | Register hygiene: the "Still open" list was stale, the 03581a3 reliability result was never recorded, B1 appeared nowhere. | **CLOSED.** This section. The stale list is explicitly superseded and every recovered finding has a disposition. | — |
+| K-16 | LOW | Security F4 | PUBLIC EXECUTE on two SECURITY DEFINER helpers handed a login role with NO GRANTS a hold id and a full nonce row while direct SELECT was denied. | **CLOSED** by migration 056. `aaliyah_memory_restricting_hold` is granted to the three roles that call it; `aaliyah_memory_spent_nonce` to none, because it is called only from inside other SECURITY DEFINER guards, which run as owner. | The declared privilege map, which now shows exactly three grantees for the first and none for the second |
+| K-17 | LOW | Security F5 | Grants wider than the code needs; no runtime code in `src/` uses the issuer or revoker roles at all. | **CLOSED** by migration 056: the reconciler's blind-index SELECT and the issuer's/revoker's SELECT on bindings, blind indexes and key erasures are revoked. New grants in 055 were written against call sites rather than tables. | Full suite green after the trim; the declared map |
+| K-18 | LOW | Red Team | Producer-chosen alias ids can carry the address and survive a verified erasure; `carriesPlaintext` checks only record content. | **BOUNDED_AND_PROVEN_NONBLOCKING, DISCLOSED.** See "The alias-id residual" below. | RT5-O1 as the reviewer executed it; the semantics are stated below rather than claimed closed |
+| K-19 | LOW | Red Team | Full-suite discovery picked up git-ignored test directories while `git.dirty=false`, so the executed set was not bound to the SHA. | **CLOSED.** An ignored discovered file is refused before anything is spawned; an untracked-but-not-ignored file is allowed because `git status` reports it; an unverifiable binding refuses a FULL_SUITE verdict. | A negative control planting a git-ignored probe (FAIL, counts null, under 10s) and a positive control on a clean tree |
+| K-20 | LOW | Integration | Both `ABORT_REASON` maps were `Record<string, …>`, so a new rejection compiled and silently reported `policy_rejected`. | **CLOSED.** Both are exhaustive over their rejection enums, with no `??` fallback at the call site. | A negative control: adding an unmapped rejection fails `tsc` in both stores |
+| K-21 | NOT_VERIFIED | Reliability (03 and 03581a3) | fd and memory exhaustion never executed, twice disclosed. Reconciliation-versus-pool-exhaustion not separately probed. | **STILL NOT_VERIFIED, and named as such.** Not rounded up, not closed, and not claimed. It is the one item in this round that no evidence here covers. | — |
+| K-22 | LOW | Reliability (03581a3) | Evidenced-key audit cost O(all evidenced rows, all time). | **CLOSED** by K-04's bound and ordering. | R-3 |
+| K-23 | MEDIUM | Founder FOURTH priority | The merge-chain cap must remain exactly 16 valid / 17 rejected, and the erasure contract must hold across the WHOLE chain, not the nearest hop. | **CLOSED.** The cap is unchanged and re-proven; the erasure scope is the transitive closure. | D-1 (16 valid, 17 refused, nonce unspent, plus a branch control), D-2 (the database refuses the 17th even past the store), X-9 (a three-hop chain where a key three hops away is asked about and refuses the survivor, with a positive control) |
+
+### Cluster-scoped DDL — the boundary, written down (K-12)
+
+`lockSharedMemoryTables` takes a PostgreSQL **advisory lock**, and advisory
+locks are **per-database**. It therefore excludes concurrent files on the SAME
+database, which covers the class it was built for: `TRUNCATE`, table `GRANT`s
+and `LOCK TABLE` on shared tables.
+
+It does **not** and cannot cover **cluster-scoped** DDL: `ALTER ROLE`,
+`CREATE`/`DROP ROLE`, `ALTER DATABASE`. Role attributes are cluster-wide, and
+the integration review proved the gap empirically — a second
+`pg_try_advisory_lock` on the same key from another database on the same
+cluster succeeded immediately while the first was held.
+
+Why it is non-blocking today, stated as facts rather than as comfort:
+`ENABLE ROW LEVEL SECURITY` and `CREATE POLICY` appear nowhere in `src/` or
+`tests/`, so `BYPASSRLS` has no functional effect; and no test file on any
+other database reads a memory role's attributes. A future test that asserts a
+role attribute from a suite on a different database would be unprotected, which
+is what this entry exists to tell its author.
+
+### Migration 047 deployment — full stop, and NOT AUTHORIZED (K-13)
+
+Migration 047 is **NOT rolling-update safe and NOT rollback safe**, and that
+disclosure is preserved rather than rewritten away. It refuses to run over an
+existing plaintext alias binding, and the code that writes bindings before and
+after it disagrees about where the identifier lives. **No deployment is
+authorized now. Production: NOT PROVEN. This is documentation and test
+evidence only.**
+
+If a full-stop deployment is ever authorized, these are its preconditions and
+steps, in order:
+
+1. **Preconditions.** A verified backup that restores to a running database;
+   the exact candidate SHA and its migration set recorded; `pnpm test` green
+   against a copy of production data at the current schema; every writer
+   identified, including workers and cron, not only HTTP instances.
+2. **Maintenance mode.** Refuse writes at the edge first, so nothing is
+   half-written while the writers are still being stopped.
+3. **Writer shutdown.** Every writer stopped and CONFIRMED stopped by
+   `pg_stat_activity`, not by a deploy tool's opinion. `runMailMigrations`
+   serializes concurrent migrators (K-06), which bounds an accident; it is not
+   a substitute for stopping writers.
+4. **Backup.** Taken AFTER the writers are confirmed stopped, so the restore
+   point is a quiet database.
+5. **Migration.** `runMailMigrations` once, from one instance.
+6. **Verification.** The ledger's last id is the expected one; every expected
+   trigger, helper and privilege is present — the declared privilege map is the
+   check, section by section, including trigger enablement; a read-only smoke
+   of the erasure path.
+7. **Failure behavior.** Each migration is one all-or-nothing transaction, so a
+   crash mid-migration leaves the ledger and the schema agreeing (proven by the
+   03 reliability review's mid-054 crash probe). A migration that FAILS leaves
+   the database at the previous migration; do not retry blindly — read the
+   error, because 047's refusal over a plaintext binding is a data problem and
+   not a transient one.
+8. **Recovery.** 047 is NOT rollback safe: there is no down-migration. Recovery
+   is RESTORE FROM BACKUP, which is why step 4 is not optional.
+9. **Restart ordering.** Migrator instance first and confirmed at the expected
+   ledger id; then readers; then writers; then maintenance mode off.
+
+### The clear-content residual — the determination (K-14)
+
+**Determination: (B) outside the W1.3 erasure contract, and blocking later
+production privacy claims.** No PII detector is introduced, and none is
+pretended to.
+
+What `alias_plaintext_in_record_content` actually guards, read from the code
+and pinned by X-10: ONE mutation, `assign_alias`, checking the normalized and
+observed alias as CONTIGUOUS case-insensitive substrings anywhere in the
+proposed content. It is not applied to `create` or `correct`.
+
+**Supported semantics, measured:**
+
+- A subject erasure destroys the subject's own content on every version it ever
+  had, whether an identifier in it was contiguous or split across fields, plus
+  its alias envelopes, blind indexes and data keys, across the whole canonical
+  merge set.
+- An `assign_alias` whose successor content carries the alias contiguously is
+  refused, and spends nothing.
+
+**Limitations, measured:**
+
+- An identifier in ANOTHER record's content survives the subject's erasure,
+  contiguous or split. That record is not in the subject's canonical merge set.
+- No detection of an identifier assembled across fields, encoded,
+  transliterated or paraphrased, in any record.
+- X-10 pins the exact surviving locations — `memory_record_versions.payload`
+  and the `memory_records_retrievable` VIEW over it, i.e. one physical row —
+  and asserts the subject's own rows keep nothing. A change that puts the
+  identifier anywhere else fails that test rather than becoming a footnote.
+
+**Why it is not simply fixed:** reaching it needs either a reverse index of
+subject identifiers — which is the very material the vault exists to keep out
+of the clear — or a detector that recognises an identifier assembled across
+fields. Producers are responsible for not writing subject identifiers into
+ordinary content, and the store cannot verify that they have not.
+
+### The alias-id residual (K-18)
+
+`aliasId` is chosen by the PRODUCER, and a producer may put the address in it:
+`alias.victim.person.example.com` is accepted, and after a verified erasure
+`victim.person` still appears in `memory_alias_bindings.alias_id`, in record
+payloads and in receipts. The contract regex blocks `@`, which stops the
+obvious form and not the deliberate one.
+
+**BOUNDED_AND_PROVEN_NONBLOCKING, and disclosed rather than closed.** The
+bound: an alias id is opaque to every control in W1.3 — nothing resolves,
+compares or indexes on it as an identifier — so this is a residual in
+EVIDENCE, not a path to resolving an erased subject. The same producer
+responsibility as K-14 applies, and the same reason applies for not "fixing"
+it: refusing a producer-chosen id that MIGHT encode subject material needs the
+detector this wave does not have. A derived, keyed alias id would close it and
+is a W1.4-or-later change, not a quiet edit here.
+
+### What this round did NOT prove
+
+- **K-21, fd and memory exhaustion: NOT_VERIFIED.** Not attempted, not
+  rounded up.
+- **Production cloud KMS/HSM: NOT PROVEN**, and explicitly outside the local
+  W1.3 certification boundary. Every key result here is against the local test
+  provider.
+- **Production: NOT CERTIFIED. Fortress: NOT CERTIFIED.** Nothing is pushed,
+  merged or deployed.
+- **Remote CI: not proven.** Only local runs.
