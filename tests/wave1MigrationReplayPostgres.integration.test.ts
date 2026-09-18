@@ -272,6 +272,178 @@ async function withFreshDatabase<T>(
   }
 }
 
+/**
+ * The ledger creation as a PRE-K-06 build issued it: no advisory lock, and the
+ * table lock it then takes cannot protect a table that does not exist yet.
+ * This is the other participant a real first rollout has, and it cannot be
+ * made to take a lock it does not know about.
+ */
+async function migrateLikeAnOlderBuild(url: string): Promise<void> {
+  const pool = new Pool({ connectionString: url, max: 1 });
+  pool.on("error", () => undefined);
+  const client = await pool.connect();
+  try {
+    await client.query(`CREATE TABLE IF NOT EXISTS aaliyah_mail_migrations (
+      id text PRIMARY KEY,
+      applied_at timestamptz NOT NULL DEFAULT now()
+    )`);
+    await client.query("BEGIN");
+    await client.query("LOCK TABLE aaliyah_mail_migrations IN ACCESS EXCLUSIVE MODE");
+    await client.query("SELECT id FROM aaliyah_mail_migrations");
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+    await pool.end().catch(() => undefined);
+  }
+}
+
+test("INT-DIGEST: an applied migration whose CONTENT changed is refused, and a fresh apply is fully digested", async () => {
+  // ---- WHAT THE INTEGRATION REVIEW OF 86d33c9 FOUND, HIGH -----------
+  // The ledger recorded only an id, so EDITING an already-applied migration's
+  // SQL was completely silent. The reviewer proved it against the real
+  // compiled runner: migrate through 055, weaken 055's trigger function to a
+  // no-op, re-run `runMailMigrations` — success reported, weakened definition
+  // still live, nothing said.
+  //
+  // W1BR-014 already refuses the neighbouring case (a ledger ROW deleted and
+  // an older migration replayed). It did not cover "row present, content
+  // edited" — and that variant is not hypothetical: it happened during this
+  // round's own remediation, and the only reason anyone noticed was that T-1
+  // happens to assert a property of a function 055 redefines.
+  await withFreshDatabase("digest", async (url) => {
+    const pool = new Pool({ connectionString: url, max: 2 });
+    pool.on("error", () => undefined);
+    try {
+      await runMailMigrations(pool);
+      // A FRESH apply is fully digested, in ONE run. On a fresh database
+      // 001..056 are applied before 057 exists, so the runner has to look
+      // again afterwards — the first version of this fix did not, and left
+      // every row undigested until a second run.
+      const counted = await pool.query(
+        `SELECT count(*)::int AS rows, count(sql_digest)::int AS digested
+           FROM aaliyah_mail_migrations`,
+      );
+      assert.equal(
+        counted.rows[0].digested,
+        counted.rows[0].rows,
+        `${counted.rows[0].rows - counted.rows[0].digested} applied migrations have no digest`,
+      );
+      assert.ok((counted.rows[0].rows as number) >= 57);
+      // Re-running is still a clean no-op.
+      await runMailMigrations(pool);
+
+      // THE REFUSAL. The digest is rewritten rather than the SQL, which is the
+      // same comparison from the ledger's side and does not need a mutated
+      // build to demonstrate.
+      await pool.query(
+        `UPDATE aaliyah_mail_migrations SET sql_digest = 'sha256:' || repeat('a', 64)
+          WHERE id = $1`,
+        ["055_memory_key_destruction_settlement"],
+      );
+      await assert.rejects(
+        () => runMailMigrations(pool),
+        /055_memory_key_destruction_settlement was applied with different content/,
+      );
+      // Refused BEFORE anything was applied: the ledger is untouched.
+      const after = await pool.query(
+        `SELECT count(*)::int AS n FROM aaliyah_mail_migrations`,
+      );
+      assert.equal(after.rows[0].n, counted.rows[0].rows);
+    } finally {
+      await pool.end().catch(() => undefined);
+    }
+  });
+});
+
+test("K-06 REOPENED: the real migrator survives a concurrent OLDER build on a FRESH database", async () => {
+  // ---- WHAT THE 86d33c9 RELIABILITY REVIEW FALSIFIED ----------------
+  // The first fix for K-06 serialized migrators on a session advisory lock and
+  // then claimed `LOCK TABLE` would "bind a migrator running an OLDER build of
+  // this function, which knows nothing about this key". It does not, and the
+  // reviewer proved it 10 trials out of 10 on a fresh database: an advisory
+  // lock serializes only the participants that TAKE it, an older build races
+  // the `CREATE TABLE` directly, and `LOCK TABLE` cannot protect a table that
+  // does not exist yet. The instance that died was the NEW one, with the
+  // original defect's exact error — `23505` on `pg_type_typname_nsp_index`.
+  //
+  // An older build cannot be bound, so this build no longer tries to win that
+  // race; it tolerates losing it. Ten trials, because one is luck.
+  for (let trial = 0; trial < 10; trial += 1) {
+    await withFreshDatabase(`old_new_${trial}`, async (url) => {
+      const pool = new Pool({ connectionString: url, max: 2 });
+      pool.on("error", () => undefined);
+      try {
+        const [real, older] = await Promise.allSettled([
+          runMailMigrations(pool),
+          migrateLikeAnOlderBuild(url),
+        ]);
+        // THE ASSERTION. The real migrator must fulfil whatever the other
+        // participant does; the older build is allowed to lose, because
+        // nothing in this repository can change what it does.
+        assert.equal(
+          real.status,
+          "fulfilled",
+          `trial ${trial}: the real migrator was crashed by an older build: ${
+            real.status === "rejected" ? String(real.reason) : ""
+          }`,
+        );
+        void older;
+        const check = new Pool({ connectionString: url, max: 1 });
+        check.on("error", () => undefined);
+        try {
+          const ledger = await check.query(
+            `SELECT count(*)::int AS n, count(DISTINCT id)::int AS d FROM aaliyah_mail_migrations`,
+          );
+          assert.equal(ledger.rows[0].n, ledger.rows[0].d, `trial ${trial}: duplicate ledger rows`);
+          assert.ok((ledger.rows[0].n as number) >= 56, `trial ${trial}: only ${ledger.rows[0].n} applied`);
+          const held = await check.query(
+            `SELECT count(*)::int AS n FROM pg_locks
+              WHERE locktype = 'advisory'
+                AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`,
+          );
+          assert.equal(held.rows[0].n, 0, `trial ${trial}: a session advisory lock survived`);
+        } finally {
+          await check.end();
+        }
+      } finally {
+        await pool.end().catch(() => undefined);
+      }
+    });
+  }
+});
+
+test("K-06: a STEADY-STATE database is raced cleanly by an older build too", async () => {
+  // The reviewer measured this half as already sound (5/5). Pinned so a future
+  // change to the tolerant creation cannot quietly break the ordinary case,
+  // where the ledger already exists and `LOCK TABLE` really does serialize.
+  await withFreshDatabase("old_new_steady", async (url) => {
+    const seed = new Pool({ connectionString: url, max: 1 });
+    seed.on("error", () => undefined);
+    try {
+      await runMailMigrations(seed);
+    } finally {
+      await seed.end();
+    }
+    const pool = new Pool({ connectionString: url, max: 2 });
+    pool.on("error", () => undefined);
+    try {
+      for (let trial = 0; trial < 5; trial += 1) {
+        const [real, older] = await Promise.allSettled([
+          runMailMigrations(pool),
+          migrateLikeAnOlderBuild(url),
+        ]);
+        assert.equal(real.status, "fulfilled", `trial ${trial}: ${real.status === "rejected" ? String(real.reason) : ""}`);
+        assert.equal(older.status, "fulfilled", `trial ${trial}: the older build lost a race it should win here`);
+      }
+    } finally {
+      await pool.end().catch(() => undefined);
+    }
+  });
+});
+
 test("POSITIVE CONTROL: bare concurrent CREATE TABLE IF NOT EXISTS really does crash N-1 with 23505", async () => {
   // Proves the hazard is real on THIS server, so the refusal below is about
   // the runner's ordering and not about `IF NOT EXISTS` being safe anyway.

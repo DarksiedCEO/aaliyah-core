@@ -6142,6 +6142,209 @@ test("S-12: the DATABASE refuses settled destruction evidence unless the settlem
   assert.equal(forB.rows[0].settlement_receipt_id, "settlement-s12-b");
 });
 
+test("S-13: a settlement answers ONLY for its own tenant's key, even when a key reference collides", async () => {
+  // ---- WHAT THE SECURITY REVIEW OF 86d33c9 FOUND, HIGH, EXECUTED ----
+  // `settlementProven` took ONE scope — derived from the FIRST row of the
+  // batch — and returned a map keyed by `key_ref` ALONE, which the caller then
+  // applied to every row in the batch. `src/server.ts` runs the completion
+  // pass with NO tenant filter at boot, so one tenant's sound
+  // PROVEN_DESTROYED settlement satisfied a DIFFERENT tenant's identical key
+  // reference: the second tenant's live key was reported resolved and NO
+  // obligation was recorded for it. The same root cause has a quieter second
+  // effect whenever the ordering goes the other way — every other tenant's
+  // valid settlement is simply ignored.
+  //
+  // Nothing in the schema makes a key reference globally unique:
+  // `memory_pii_key_erasures_once` is UNIQUE (tenant, workspace, key_ref,
+  // event), which says a key is unique WITHIN a scope and says nothing across
+  // scopes. So the collision is built here deliberately rather than waited for.
+  const { binding, tombstoneId, authorizationId } = await survivorWithAnUnprovableMergedKey();
+  const store0 = NO_VAULT();
+  // A refused attempt FIRST, so the first tenant has an obligation for the
+  // positive control to close. An obligation records what a real attempt could
+  // not establish; a settlement does not conjure one into being.
+  const refused = await eraseRecordAtHead(
+    SURVIVOR, "mutation.s13.refused", "tombstone-s13-refused", "subject_erasure_request", store0,
+  );
+  assert.equal(refused.result.rejection, "key_destruction_not_proven");
+  const settled = await store0.settleKeyDestruction(
+    settlementFor(binding, tombstoneId, authorizationId),
+  );
+  assert.equal(settled.recorded, true, JSON.stringify(settled));
+
+  // A SECOND TENANT holding the SAME key reference, with its erasure committed
+  // and NO settlement of its own. Copied from the first tenant's real rows —
+  // so every shape is one the store itself produced — with the guards stood
+  // down for the copy and RE-ENABLED before the commit, because committing
+  // with them down leaves them down for every later test in this file.
+  const OTHER_TENANT = "tenant-hold-second";
+  // The second tenant needs its own cross-workspace policy row, because
+  // `memory_alias_bindings_policy_fk` makes a binding reference one. Real
+  // tenant state, not a hole punched through a constraint.
+  await setAliasPolicy({ ...SCOPE, tenantId: OTHER_TENANT });
+  const client = await adminPool.connect();
+  try {
+    await client.query("BEGIN");
+    // ALL user triggers, named as a class rather than one at a time: the copy
+    // is a fixture and every guard on the table would refuse it for a
+    // different reason. `ENABLE TRIGGER USER` below restores exactly this set.
+    await client.query(`ALTER TABLE memory_alias_bindings DISABLE TRIGGER USER`);
+    await client.query(`ALTER TABLE memory_pii_key_erasures DISABLE TRIGGER USER`);
+    // Every column but the surrogate key, so the copy gets its own `id`.
+    await client.query(
+      `INSERT INTO memory_alias_bindings
+         (tenant_id, workspace_id, principal_id, user_id, cross_workspace_policy,
+          scope_key, alias_id, skeleton_algorithm, normalization_profile,
+          canonical_participant_id, script_code, restriction_level,
+          subject_participant_id, source_evidence_ref, source_evidence_digest,
+          observed_at, fresh_until, authorization_id, mutation_receipt_id,
+          bound_at, removed_at, removed_by_mutation_receipt_id,
+          removed_authorization_id, payload, created_at, pii_envelope,
+          pii_key_ref, pii_key_version, pii_erased_at, pii_erasure_tombstone_id)
+       SELECT $1, workspace_id, principal_id, user_id, cross_workspace_policy,
+              scope_key, alias_id, skeleton_algorithm, normalization_profile,
+              canonical_participant_id, script_code, restriction_level,
+              subject_participant_id, source_evidence_ref, source_evidence_digest,
+              observed_at, fresh_until, authorization_id, mutation_receipt_id,
+              bound_at, removed_at, removed_by_mutation_receipt_id,
+              removed_authorization_id,
+              -- memory_alias_bindings_tenant_binding requires the payload own
+              -- scope to agree with the column, so the copy rewrites both.
+              jsonb_set(payload, '{scope,tenantId}', to_jsonb($1::text)),
+              created_at, pii_envelope,
+              pii_key_ref, pii_key_version, pii_erased_at, pii_erasure_tombstone_id
+         FROM memory_alias_bindings
+        WHERE alias_id = 'alias-pii-001' AND tenant_id = $2`,
+      [OTHER_TENANT, SCOPE.tenantId],
+    );
+    await client.query(
+      `INSERT INTO memory_pii_key_erasures
+         (tenant_id, workspace_id, tombstone_id, alias_id,
+          binding_mutation_receipt_id, key_ref, provider_id, event)
+       SELECT $1, workspace_id, tombstone_id, alias_id,
+              binding_mutation_receipt_id, key_ref, provider_id, 'erasure_committed'
+         FROM memory_pii_key_erasures
+        WHERE tenant_id = $2 AND key_ref = $3 AND event = 'erasure_committed'`,
+      [OTHER_TENANT, SCOPE.tenantId, binding.pii_key_ref],
+    );
+    await client.query(`ALTER TABLE memory_alias_bindings ENABLE TRIGGER USER`);
+    await client.query(`ALTER TABLE memory_pii_key_erasures ENABLE TRIGGER USER`);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+  // ---- THE ORDERING THE DEFECT NEEDS -------------------------------
+  // `due` is the PENDING rows followed by the EVIDENCED ones, each by id. The
+  // defect took its single scope from `due[0]`, so it only leaks when the
+  // SETTLED tenant is first — and the first tenant is only first if both rows
+  // are evidenced. So the second tenant gets a mutator-forged `key_destroyed`
+  // row, exactly as the security reviewer's reproduction did: its key is still
+  // ALIVE, and the database's evidence is the thing that lies about it. This
+  // is a real writable-evidence path, not a hole punched through a constraint —
+  // the erasure guard permits it because a matching `erasure_committed` exists.
+  await runAs(
+    "aaliyah_memory_mutator",
+    `INSERT INTO memory_pii_key_erasures
+       (tenant_id, workspace_id, tombstone_id, alias_id,
+        binding_mutation_receipt_id, key_ref, provider_id, event)
+     SELECT tenant_id, workspace_id, tombstone_id, alias_id,
+            binding_mutation_receipt_id, key_ref, provider_id, 'key_destroyed'
+       FROM memory_pii_key_erasures
+      WHERE tenant_id = $1 AND key_ref = $2 AND event = 'erasure_committed'`,
+    [OTHER_TENANT, binding.pii_key_ref],
+  );
+  // ...and the batch really is ordered with the settled tenant FIRST. The
+  // evidenced branch orders by least-recently-audited (NULLS FIRST), and the
+  // first tenant already has an audit row from its honest erasure — so without
+  // this the UNAUDITED second tenant sorts first, `scope` comes from IT, no
+  // settlement is found for anyone, and the test passes against the defect it
+  // exists to catch. Verified that way: instrumenting the unfixed store showed
+  // `due=[second, first]` and an empty proof map.
+  await runAs(
+    "aaliyah_memory_mutator",
+    `INSERT INTO memory_pii_key_audits
+       (tenant_id, workspace_id, key_ref, last_audited_at, last_state, audits)
+     VALUES ($1, $2, $3, now(), 'unknown', 1)
+     ON CONFLICT (tenant_id, workspace_id, key_ref) DO UPDATE
+        SET last_audited_at = now()`,
+    [OTHER_TENANT, SCOPE.workspaceId, binding.pii_key_ref],
+  );
+  const ordering = await adminPool.query(
+    `SELECT c.tenant_id
+       FROM memory_pii_key_erasures AS c
+       LEFT JOIN memory_pii_key_audits AS au
+         ON au.tenant_id = c.tenant_id AND au.workspace_id = c.workspace_id
+        AND au.key_ref = c.key_ref
+      WHERE c.key_ref = $1 AND c.event = 'erasure_committed'
+      ORDER BY au.last_audited_at ASC NULLS FIRST, c.id`,
+    [binding.pii_key_ref],
+  );
+  assert.deepEqual(
+    ordering.rows.map((r) => r.tenant_id),
+    [SCOPE.tenantId, OTHER_TENANT],
+    "the settled tenant must come first, or the defect this test exists for cannot fire",
+  );
+
+  // The guards really are back on. A committed `DISABLE TRIGGER` is how two
+  // tombstone guards were silently stood down earlier in this round, and the
+  // only way to know is to look.
+  const enabled = await adminPool.query(
+    `SELECT count(*)::int AS n FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+      WHERE NOT t.tgisinternal AND t.tgenabled <> 'O'
+        AND c.relname IN ('memory_alias_bindings', 'memory_pii_key_erasures')`,
+  );
+  assert.equal(enabled.rows[0].n, 0, "the fixture left a guard disabled");
+
+  // FIXTURE PRECONDITIONS: the collision is real, and only the FIRST tenant
+  // has a settlement.
+  const collision = await adminPool.query(
+    `SELECT count(DISTINCT tenant_id)::int AS tenants FROM memory_pii_key_erasures
+      WHERE key_ref = $1 AND event = 'erasure_committed'`,
+    [binding.pii_key_ref],
+  );
+  assert.equal(collision.rows[0].tenants, 2, "the fixture must create a cross-tenant key collision");
+  const settlements = await adminPool.query(
+    `SELECT count(*)::int AS n FROM memory_key_destruction_settlements WHERE tenant_id = $1`,
+    [OTHER_TENANT],
+  );
+  assert.equal(settlements.rows[0].n, 0, "the second tenant must have no settlement of its own");
+
+  // THE UNFILTERED PASS — exactly what src/server.ts runs at boot.
+  const pass = await store0.completePendingAliasErasures();
+
+  // THE ASSERTION. The second tenant's key is NOT answered for by the first
+  // tenant's settlement: it is unproven, and it has an obligation.
+  assert.ok(
+    pass.notProven >= 1,
+    `the second tenant's live key was reported resolved: ${JSON.stringify(pass)}`,
+  );
+  const obligations = await adminPool.query(
+    `SELECT tenant_id, state, not_proven_reason FROM memory_key_destruction_obligations
+      WHERE key_ref = $1 ORDER BY tenant_id`,
+    [binding.pii_key_ref],
+  );
+  const forOther = obligations.rows.filter((r) => r.tenant_id === OTHER_TENANT);
+  assert.equal(
+    forOther.length,
+    1,
+    `no obligation recorded for the second tenant: ${JSON.stringify(obligations.rows)}`,
+  );
+  assert.equal(forOther[0].state, "KEY_DESTRUCTION_NOT_PROVEN");
+  assert.equal(forOther[0].not_proven_reason, "NO_PROVIDER_CONFIGURED");
+
+  // POSITIVE CONTROL, the other half of the same defect: the FIRST tenant's
+  // own settlement still answers for its own key. A fix that simply ignored
+  // every settlement in an unfiltered batch would pass the assertion above and
+  // break this one.
+  const forFirst = obligations.rows.filter((r) => r.tenant_id === SCOPE.tenantId);
+  assert.equal(forFirst.length, 1, JSON.stringify(obligations.rows));
+  assert.equal(forFirst[0].state, "PROVEN_DESTROYED");
+  assert.equal(forFirst[0].not_proven_reason, "SETTLED");
+});
+
 test("S-4: NO SELF-VERIFICATION — a settlement whose authority is also its verifier is refused, in the store and in the database", async () => {
   const { binding, tombstoneId, authorizationId } = await survivorWithAnUnprovableMergedKey();
   const same = await NO_VAULT().settleKeyDestruction(

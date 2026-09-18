@@ -706,12 +706,12 @@ test("U-0 at 049: a binding commits and an alias mutation is left UNKNOWN, by th
   unknownAuthorizationId = second.receipt.authorizationId;
 });
 
-test("U-1 050–056 apply over the populated database, and refuse nothing that is already there", async () => {
+test("U-1 050–057 apply over the populated database, and refuse nothing that is already there", async () => {
   assert.ok(boundBefore && unknownAuthorizationId, "U-0 must have run");
   await runMailMigrations(adminPool);
   const applied = await appliedMigrations();
-  assert.equal(applied.at(-1), "056_memory_least_privilege_trim");
-  for (const id of ["050_memory_alias_authorization_action_bound", "051_memory_erasure_reaches_merged_records", "052_memory_alias_reconciliation_derivable", "053_memory_merge_chain_bounded", "054_memory_merged_erasure_requires_destroyed_keys", "055_memory_key_destruction_settlement", "056_memory_least_privilege_trim"]) {
+  assert.equal(applied.at(-1), "057_migration_content_digest");
+  for (const id of ["050_memory_alias_authorization_action_bound", "051_memory_erasure_reaches_merged_records", "052_memory_alias_reconciliation_derivable", "053_memory_merge_chain_bounded", "054_memory_merged_erasure_requires_destroyed_keys", "055_memory_key_destruction_settlement", "056_memory_least_privilege_trim", "057_migration_content_digest"]) {
     assert.ok(applied.includes(id), id);
   }
   const triggers = await adminPool.query(

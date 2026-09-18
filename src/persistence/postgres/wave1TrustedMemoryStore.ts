@@ -2597,38 +2597,74 @@ export function createPostgresTrustedMemoryStore(
    * its own evidence is not weak evidence, it is a contradiction, and it
    * proves nothing.
    */
+  /**
+   * The map key. A key reference is unique WITHIN a scope — the schema says so
+   * (`memory_pii_key_erasures_once UNIQUE (tenant_id, workspace_id, key_ref,
+   * event)`) and says nothing about across scopes — so a lookup keyed by
+   * `key_ref` alone is a cross-tenant lookup, whatever the caller intended.
+   */
+  const scopedKey = (tenantId: string, workspaceId: string, keyRef: string) =>
+    `${tenantId}\u0000${workspaceId}\u0000${keyRef}`;
+
   async function settlementProven(
-    scope: { tenantId: string; workspaceId: string },
-    keyRefs: readonly string[],
+    keys: ReadonlyArray<{ tenantId: string; workspaceId: string; keyRef: string }>,
   ): Promise<Map<string, { receiptId: string; sound: boolean }>> {
     const proven = new Map<string, { receiptId: string; sound: boolean }>();
-    if (keyRefs.length === 0) return proven;
+    if (keys.length === 0) return proven;
     const client = await pool.connect();
     let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       await enterRole(client, mutationRole);
+      // ---- MATCHED ON THE WHOLE SCOPE, NOT ON THE KEY REFERENCE -------
+      //
+      // Security review of 86d33c9, HIGH, executed: this took ONE scope —
+      // derived from the first row of an unfiltered batch — and returned a map
+      // keyed by `key_ref` alone, which the caller then applied to EVERY row
+      // in the batch. The boot completion pass runs unfiltered, so one
+      // tenant's sound PROVEN_DESTROYED settlement satisfied a DIFFERENT
+      // tenant's identical key reference: the second tenant's live key was
+      // reported resolved and NO obligation was recorded for it. The reviewer
+      // reproduced it deterministically, and the same root cause has a quieter
+      // second effect whenever the ordering goes the other way — every other
+      // tenant's valid settlement is simply ignored.
+      //
+      // The pairs are passed in and matched three columns wide. `unnest` with
+      // `WITH ORDINALITY` is not needed; a join against the arrays is enough,
+      // and it keeps one round trip for the whole batch.
       const rows = await client.query(
-        `SELECT settlement_receipt_id, key_ref, evidence, evidence_digest
-           FROM public.memory_key_destruction_settlements
-          WHERE tenant_id = $1 AND workspace_id = $2
-            AND key_ref = ANY($3::text[])
-            AND decision = $4
-          ORDER BY id`,
-        [scope.tenantId, scope.workspaceId, [...keyRefs], SETTLEMENT_DECISION_THAT_SATISFIES],
+        `SELECT s.settlement_receipt_id, s.tenant_id, s.workspace_id, s.key_ref,
+                s.evidence, s.evidence_digest
+           FROM public.memory_key_destruction_settlements AS s
+           JOIN unnest($1::text[], $2::text[], $3::text[])
+                  AS want(tenant_id, workspace_id, key_ref)
+             ON want.tenant_id = s.tenant_id
+            AND want.workspace_id = s.workspace_id
+            AND want.key_ref = s.key_ref
+          WHERE s.decision = $4
+          ORDER BY s.id`,
+        [
+          keys.map((k) => k.tenantId),
+          keys.map((k) => k.workspaceId),
+          keys.map((k) => k.keyRef),
+          SETTLEMENT_DECISION_THAT_SATISFIES,
+        ],
       );
       await client.query("COMMIT");
       for (const row of rows.rows as Array<{
         settlement_receipt_id: string;
+        tenant_id: string;
+        workspace_id: string;
         key_ref: string;
         evidence: unknown;
         evidence_digest: string;
       }>) {
         const sound = settlementEvidenceDigest(row.evidence) === row.evidence_digest;
-        const already = proven.get(row.key_ref);
+        const mapKey = scopedKey(row.tenant_id, row.workspace_id, row.key_ref);
+        const already = proven.get(mapKey);
         // One unsound settlement taints the key: we do not go looking for a
         // second opinion that happens to agree with us.
-        proven.set(row.key_ref, {
+        proven.set(mapKey, {
           receiptId: row.settlement_receipt_id,
           sound: sound && (already?.sound ?? true),
         });
@@ -2700,12 +2736,18 @@ export function createPostgresTrustedMemoryStore(
     }
     const unproven = [...answers.entries()]
       .filter(([, answer]) => answer.proof === "NOT_PROVEN")
-      .map(([keyRef]) => keyRef);
-    const settled = await settlementProven(scope, unproven);
+      .map(([keyRef]) => ({
+        tenantId: scope.tenantId,
+        workspaceId: scope.workspaceId,
+        keyRef,
+      }));
+    const settled = await settlementProven(unproven);
 
     return rows.map((row) => {
       const answer = answers.get(row.key_ref)!;
-      const settlement = settled.get(row.key_ref);
+      const settlement = settled.get(
+        scopedKey(row.tenant_id, row.workspace_id, row.key_ref),
+      );
       const base = {
         tenantId: row.tenant_id,
         workspaceId: row.workspace_id,
@@ -2970,17 +3012,18 @@ export function createPostgresTrustedMemoryStore(
 
     // Which unaskable keys an independently verified settlement covers. Asked
     // once for the whole batch rather than once per key.
+    // EVERY ROW'S OWN SCOPE. The batch is not one tenant's: the boot pass runs
+    // with no tenant filter at all (src/server.ts), which is how one tenant's
+    // settlement came to answer for another's key (security review of
+    // 86d33c9, HIGH).
     const unaskable = due
       .filter((row) => piiKeys === null || row.provider_id !== piiKeys.providerId)
-      .map((row) => row.key_ref);
-    const scope = {
-      tenantId: filter.tenantId ?? due[0]?.tenant_id ?? "",
-      workspaceId: filter.workspaceId ?? due[0]?.workspace_id ?? "",
-    };
-    const settlementProof =
-      unaskable.length > 0 && scope.tenantId !== ""
-        ? await settlementProven(scope, unaskable)
-        : new Map<string, { receiptId: string; sound: boolean }>();
+      .map((row) => ({
+        tenantId: row.tenant_id,
+        workspaceId: row.workspace_id,
+        keyRef: row.key_ref,
+      }));
+    const settlementProof = await settlementProven(unaskable);
 
     for (const row of due) {
       // ---- A KEY THIS STORE CANNOT ASK ABOUT --------------------------
@@ -2991,7 +3034,9 @@ export function createPostgresTrustedMemoryStore(
       // Under OPTION B it is either proven by a settlement or it is recorded,
       // by name, as NOT PROVEN.
       if (piiKeys === null || row.provider_id !== piiKeys.providerId) {
-        const settlement = settlementProof.get(row.key_ref);
+        const settlement = settlementProof.get(
+          scopedKey(row.tenant_id, row.workspace_id, row.key_ref),
+        );
         if (settlement !== undefined && settlement.sound) {
           settled += 1;
           provenDestroyed.push(row);

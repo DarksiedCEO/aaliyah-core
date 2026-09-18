@@ -229,12 +229,20 @@ test("POSITIVE CONTROL: each widening the first map could not see IS reported, t
         await pool.query(widening.revert);
       }
     }
+    // ---- COMPARED INSIDE THE LOCK ---------------------------------
+    // The test-falsifiability review of 86d33c9 caught this as a real
+    // NONDETERMINISM, empirically: this comparison used to run AFTER
+    // `sharedTableLock.release()`, and the K-10 boot test in
+    // wave1PoolResiliencePostgres takes the SAME advisory key and transiently
+    // revokes exactly two privileges mid-test. One run in four came back with
+    // a diff naming precisely those two privileges and nothing else. The suite
+    // was reporting a privilege narrowing that no code had made.
+    const restored = await memoryPrivilegeMap(pool);
+    for (const section of Object.keys(EXPECTED)) {
+      assert.deepEqual([...restored[section]!].sort(), [...EXPECTED[section]!].sort(), section);
+    }
   } finally {
     await sharedTableLock.release();
-  }
-  const restored = await memoryPrivilegeMap(pool);
-  for (const section of Object.keys(EXPECTED)) {
-    assert.deepEqual([...restored[section]!].sort(), [...EXPECTED[section]!].sort(), section);
   }
 });
 
@@ -307,9 +315,15 @@ test("POSITIVE CONTROL: a widened grant IS reported as a difference, then remove
       JSON.stringify(actual.tables),
     );
     assert.ok(!EXPECTED.tables!.includes("aaliyah_memory_reconciler public.memory_alias_bindings SELECT"));
+    // Removed, checked inside the lock for the same reason as above.
+    await pool.query(`REVOKE SELECT ON memory_alias_bindings FROM aaliyah_memory_reconciler`);
+    assert.ok(
+      !(await memoryPrivilegeMap(pool)).tables!.includes(
+        "aaliyah_memory_reconciler public.memory_alias_bindings SELECT",
+      ),
+    );
   } finally {
     await pool.query(`REVOKE SELECT ON memory_alias_bindings FROM aaliyah_memory_reconciler`);
     await sharedTableLock.release();
   }
-  assert.ok(!(await memoryPrivilegeMap(pool)).tables!.includes("aaliyah_memory_reconciler public.memory_alias_bindings SELECT"));
 });

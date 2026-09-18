@@ -115,7 +115,6 @@
     "aaliyah_memory_mutator public.memory_key_destruction_obligations.not_proven_reason UPDATE",
     "aaliyah_memory_mutator public.memory_key_destruction_obligations.observations UPDATE",
     "aaliyah_memory_mutator public.memory_key_destruction_obligations.resolved_by UPDATE",
-    "aaliyah_memory_mutator public.memory_key_destruction_obligations.settled_by UPDATE",
     "aaliyah_memory_mutator public.memory_key_destruction_obligations.state UPDATE",
     "aaliyah_memory_mutator public.memory_pii_key_audits.audits UPDATE",
     "aaliyah_memory_mutator public.memory_pii_key_audits.last_audited_at UPDATE",

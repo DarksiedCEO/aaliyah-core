@@ -1,5 +1,24 @@
+import * as crypto from "node:crypto";
 import type { Pool } from "pg";
-import { boundedQuery, isConnectionAmbiguous, MIGRATION_BOUNDS, releaseClient } from "./pool";
+import {
+  boundedQuery,
+  isConnectionAmbiguous,
+  MIGRATION_BOUNDS,
+  releaseClient,
+  type BoundedQuery,
+} from "./pool";
+
+/**
+ * The digest of a migration's SQL, as the ledger records it.
+ *
+ * Over the SQL text exactly as this build carries it. That is the thing whose
+ * change the integration review of 86d33c9 showed was undetectable: the ledger
+ * held an id and nothing else, so an edited migration re-ran as a no-op and
+ * reported success with the old definition still live.
+ */
+function migrationDigest(sql: string): string {
+  return `sha256:${crypto.createHash("sha256").update(sql, "utf8").digest("hex")}`;
+}
 
 /**
  * The advisory-lock key concurrent migrators serialize on, BEFORE the ledger
@@ -5635,8 +5654,14 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
     -- for an operator.
     GRANT SELECT, INSERT ON memory_key_destruction_obligations
       TO aaliyah_memory_mutator;
+    -- NOT settled_by. Security review of 86d33c9, LOW, executed: with it,
+    -- the mutation role could rewrite an obligation to claim a settlement that
+    -- does not exist. No mutator code path writes it: recordObligations
+    -- writes the observation columns, and clearHealedObligations writes
+    -- resolved_by = PROVIDER, which the CHECK requires to leave settled_by
+    -- NULL. Only the settler names a settlement.
     GRANT UPDATE (state, not_proven_reason, observations, last_observed_at,
-                  resolved_by, settled_by)
+                  resolved_by)
       ON memory_key_destruction_obligations TO aaliyah_memory_mutator;
     GRANT SELECT ON memory_key_destruction_obligations
       TO aaliyah_memory_reader, aaliyah_memory_settler;
@@ -5706,6 +5731,44 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
     REVOKE SELECT ON memory_alias_bindings, memory_alias_blind_indexes, memory_pii_key_erasures
       FROM aaliyah_memory_issuer, aaliyah_memory_revoker`,
   },
+  {
+    // ------------------------------------------------------------------
+    // AN APPLIED MIGRATION'S CONTENT CANNOT CHANGE UNDER THE LEDGER.
+    //
+    // Integration review of 86d33c9, HIGH, executed against the real compiled
+    // runner: the ledger recorded only an id, so EDITING an already-applied
+    // migration's SQL was completely silent. The reviewer migrated a scratch
+    // database through 055, weakened 055's trigger function to a no-op, re-ran
+    // the real `runMailMigrations` — and it returned successfully with the
+    // weakened function still live and nothing reported.
+    //
+    // W1BR-014 already covers the neighbouring hazard — a ledger ROW deleted
+    // and the migration replayed — and refuses an older ordinal over a newer
+    // one. It does not cover "row present, content edited", and that variant
+    // is not hypothetical: it happened during this very round. Migration 055
+    // was edited after being applied to the implementation database, and the
+    // only reason anyone noticed was that T-1 happens to assert a property of
+    // one of the functions 055 redefines. Nothing was checking.
+    //
+    // So the ledger now records a digest of the SQL that was applied, and the
+    // runner refuses to proceed when an applied migration's content no longer
+    // matches it.
+    //
+    // DISCLOSED LIMIT: rows written before this migration have no digest, so
+    // the runner BACKFILLS them from the current source on its next run. A
+    // database whose migration content was already edited before 057 has that
+    // edit blessed, once, silently — there is nothing to compare it against.
+    // Only edits made after the backfill are detectable.
+    // ------------------------------------------------------------------
+    id: "057_migration_content_digest",
+    sql: `ALTER TABLE aaliyah_mail_migrations
+      ADD COLUMN IF NOT EXISTS sql_digest text;
+    ALTER TABLE aaliyah_mail_migrations
+      DROP CONSTRAINT IF EXISTS aaliyah_mail_migrations_digest_shape;
+    ALTER TABLE aaliyah_mail_migrations
+      ADD CONSTRAINT aaliyah_mail_migrations_digest_shape
+        CHECK (sql_digest IS NULL OR sql_digest ~ '^sha256:[0-9a-f]{64}$')`,
+  },
 ];
 
 /**
@@ -5732,6 +5795,61 @@ function migrationOrdinal(id: string): number {
  * 3ba769f integration review). A name that is not a migration id is refused
  * before anything is applied.
  */
+/**
+ * SQLSTATEs a LOST race to create the same table produces. PostgreSQL does not
+ * make `CREATE TABLE IF NOT EXISTS` atomic against a concurrent creator, so
+ * the loser sees one of:
+ *   `42P07` duplicate_table — the `IF NOT EXISTS` check and the creation are
+ *           not one step, and another session finished in between;
+ *   `23505` unique_violation — the same race one layer down, on a catalog
+ *           index. The observed one is `pg_type_typname_nsp_index`: a
+ *           duplicate row for the table's implicit ROW TYPE.
+ */
+const LEDGER_RACE_LOST = new Set(["42P07", "23505"]);
+
+/**
+ * CREATE THE LEDGER, AND DO NOT MIND LOSING THE RACE TO CREATE IT.
+ *
+ * Reliability review of 86d33c9, HIGH: the previous fix serialized migrators
+ * on a session advisory lock and then claimed `LOCK TABLE` would bind anything
+ * running an OLDER build. It does not. An advisory lock binds only the
+ * participants that take it, and an older build races this statement directly
+ * — 10 trials out of 10 on a fresh database, and the instance that died was
+ * the NEW one.
+ *
+ * An older build cannot be bound, so it is not the thing to fix. What matters
+ * is that losing the race is HARMLESS: whoever won created the same table with
+ * the same definition, so the loser's job is to notice that and carry on. The
+ * `PRIMARY KEY` on `id` means the two definitions cannot disagree in a way
+ * that matters here, and the ledger's contents are read under `LOCK TABLE`
+ * afterwards.
+ *
+ * Deliberately OUTSIDE any transaction: inside one, a duplicate-object error
+ * aborts the transaction that was about to apply the migrations, which is how
+ * a tolerable race becomes a failed deployment.
+ */
+async function createLedgerToleratingARace(bounded: BoundedQuery): Promise<void> {
+  try {
+    await bounded(
+      `CREATE TABLE IF NOT EXISTS aaliyah_mail_migrations (
+        id text PRIMARY KEY,
+        applied_at timestamptz NOT NULL DEFAULT now()
+      )`,
+    );
+    return;
+  } catch (error) {
+    const code = (error as { code?: unknown } | null)?.code;
+    if (typeof code !== "string" || !LEDGER_RACE_LOST.has(code)) throw error;
+    // Lost the race. Confirm the winner actually left a ledger behind rather
+    // than assuming it: a duplicate-object error from something that is NOT
+    // this table would otherwise be swallowed here.
+    const present = await bounded(
+      `SELECT to_regclass('public.aaliyah_mail_migrations') IS NOT NULL AS present`,
+    );
+    if (present.rows[0]?.present !== true) throw error;
+  }
+}
+
 export async function runMailMigrations(
   pool: Pool,
   options: { through?: string } = {},
@@ -5765,10 +5883,30 @@ export async function runMailMigrations(
     // deploy but one died at boot.
     //
     // A session advisory lock needs no table, so it is taken FIRST and covers
-    // the creation itself. `LOCK TABLE` below is kept as well: it binds a
+    // the creation against every migrator that TAKES IT.
+    //
+    // ---- AND AN OLDER BUILD CANNOT BE BOUND AT ALL ---------------------
+    //
+    // The first version of this fix claimed `LOCK TABLE` would "bind a
     // migrator running an OLDER build of this function, which knows nothing
-    // about this key.
+    // about this key." The reliability review of 86d33c9 falsified that, 10
+    // trials out of 10 on a fresh database, and it was simply wrong: an
+    // advisory lock serializes only the participants that take it, an older
+    // build races the CREATE TABLE directly, and LOCK TABLE cannot protect a
+    // table that does not exist yet. The build that died was THIS one, with
+    // the original defect's exact error.
+    //
+    // So this build no longer tries to WIN that race — it TOLERATES it. The
+    // creation happens outside any transaction, and the duplicate-object
+    // errors a lost race produces are swallowed after confirming the ledger
+    // really is there. Outside a transaction, losing the race poisons
+    // nothing; inside one, the same error would abort the transaction that
+    // was about to apply the migrations.
+    //
+    // `LOCK TABLE` is still taken below, where it does serialize an older
+    // build — once the table exists, which is the only state it can lock.
     await bounded("SELECT pg_advisory_lock(hashtextextended($1, 0))", [LEDGER_LOCK_KEY]);
+    await createLedgerToleratingARace(bounded);
   } catch (error) {
     ambiguous = error;
     releaseClient(client, error);
@@ -5778,19 +5916,49 @@ export async function runMailMigrations(
     await bounded("BEGIN");
     await bounded(`SET LOCAL lock_timeout = '${MIGRATION_BOUNDS.lockTimeoutMs}ms'`);
     await bounded(`SET LOCAL statement_timeout = '${MIGRATION_BOUNDS.statementTimeoutMs}ms'`);
-    await bounded(
-      `CREATE TABLE IF NOT EXISTS aaliyah_mail_migrations (
-        id text PRIMARY KEY,
-        applied_at timestamptz NOT NULL DEFAULT now()
-      )`,
-    );
-    // Serialize concurrent migrators that predate the advisory lock above.
+    // Serialize concurrent migrators, including one running an older build:
+    // by here the ledger exists, so there is something to lock.
     await bounded("LOCK TABLE aaliyah_mail_migrations IN ACCESS EXCLUSIVE MODE");
-    const applied = new Set(
-      (await bounded("SELECT id FROM aaliyah_mail_migrations")).rows.map(
-        (r: { id: string }) => r.id as string,
-      ),
-    );
+    // The digest column exists only from 057 onward, so a pre-057 database is
+    // read without it rather than refused.
+    const hasDigest =
+      ((
+        await bounded(
+          `SELECT count(*)::int AS n FROM information_schema.columns
+            WHERE table_name = 'aaliyah_mail_migrations' AND column_name = 'sql_digest'`,
+        )
+      ).rows[0].n as number) === 1;
+    const appliedRows = (
+      await bounded(
+        hasDigest
+          ? "SELECT id, sql_digest FROM aaliyah_mail_migrations"
+          : "SELECT id, NULL::text AS sql_digest FROM aaliyah_mail_migrations",
+      )
+    ).rows as Array<{ id: string; sql_digest: string | null }>;
+    const applied = new Set(appliedRows.map((r) => r.id));
+    const recordedDigest = new Map(appliedRows.map((r) => [r.id, r.sql_digest]));
+
+    // ---- AN APPLIED MIGRATION'S CONTENT MUST NOT HAVE CHANGED --------
+    //
+    // Integration review of 86d33c9, HIGH: the ledger recorded only an id, so
+    // editing an already-applied migration's SQL was silent — proven against
+    // the real runner by weakening a trigger function 055 defines and re-running
+    // this function, which reported success with the weakened definition live.
+    //
+    // Checked BEFORE anything is applied, because the point is to refuse the
+    // run rather than to notice afterwards.
+    for (const migration of MIGRATIONS) {
+      const recorded = recordedDigest.get(migration.id);
+      if (recorded === undefined || recorded === null) continue;
+      const actual = migrationDigest(migration.sql);
+      if (recorded !== actual) {
+        throw new Error(
+          `migration ${migration.id} was applied with different content ` +
+            `(${recorded}) than this build carries (${actual}). The database ` +
+            `does not hold what this source says it holds. Refusing.`,
+        );
+      }
+    }
     // ---- MIGRATIONS ARE NOT INDEPENDENTLY REPLAYABLE (W1BR-014) ----------
     //
     // Several migrations use CREATE OR REPLACE to HARDEN a definition an
@@ -5823,8 +5991,41 @@ export async function runMailMigrations(
         );
       }
       await bounded(migration.sql);
-      await bounded("INSERT INTO aaliyah_mail_migrations (id) VALUES ($1)", [migration.id]);
+      await bounded(
+        hasDigest
+          ? "INSERT INTO aaliyah_mail_migrations (id, sql_digest) VALUES ($1, $2)"
+          : "INSERT INTO aaliyah_mail_migrations (id) VALUES ($1)",
+        hasDigest ? [migration.id, migrationDigest(migration.sql)] : [migration.id],
+      );
       if (migration.id === options.through) break;
+    }
+    // ---- BACKFILL, ONCE, AND DISCLOSED -------------------------------
+    // Rows written before 057 have no digest. They are filled in from the
+    // current source, which means a content edit made BEFORE 057 existed is
+    // blessed here — there is nothing to compare it against. Only edits after
+    // this point are detectable, and the register says so.
+    //
+    // The column's presence is re-read HERE rather than reused from the top of
+    // the run. On a fresh database, 001..056 are applied before 057 exists, so
+    // their inserts cannot carry a digest and `hasDigest` was false when they
+    // ran — checking again afterwards is what makes a first apply end up fully
+    // digested instead of waiting for a second run. A failed statement would
+    // abort this transaction, so this asks rather than catching.
+    const digestColumnNow =
+      ((
+        await bounded(
+          `SELECT count(*)::int AS n FROM information_schema.columns
+            WHERE table_name = 'aaliyah_mail_migrations' AND column_name = 'sql_digest'`,
+        )
+      ).rows[0].n as number) === 1;
+    if (digestColumnNow) {
+      for (const migration of MIGRATIONS) {
+        await bounded(
+          `UPDATE aaliyah_mail_migrations SET sql_digest = $2
+            WHERE id = $1 AND sql_digest IS NULL`,
+          [migration.id, migrationDigest(migration.sql)],
+        );
+      }
     }
     await bounded("COMMIT");
   } catch (error) {

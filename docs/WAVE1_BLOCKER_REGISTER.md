@@ -1118,9 +1118,9 @@ K-01/K-09 below.
 | K-03 | HIGH | Red Team B1 | A subject erasure reported `verified:true` while the subject's OWN key was live and a pre-erasure ciphertext copy still decrypted. Needed only a provider outage plus one `restore`: the second erasure wrote no new `erasure_committed` rows and the tombstone-scoped denominator was empty. | **CLOSED.** The completeness denominator is the SUBJECT's canonical merge set, whatever tombstone recorded a key and whatever state its owning record is now in. | RT5-R1 and RT5-R1b (both deletion reasons), RT5-R2 |
 | K-04 | HIGH | Reliability | The evidenced-key audit had no batch bound and re-confirmed every historically destroyed key on every pass forever; no per-call provider timeout; `server.ts` awaits that pass before `app.listen()`. | **CLOSED.** Its own limit plus round-robin ordering by least-recently-audited: constant cost per pass, total coverage, and volume moves a forged row towards the front of the queue rather than away from it. Per-call deadlines throughout. | R-3 (probe3: bounded AND every key still reached), R-4 (probe4: a never-answering provider is abandoned and named PROVIDER_TIMEOUT), K-7, K-8 |
 | K-05 | HIGH | Reliability (03581a3, unchanged at 8a0bf05) | Every bound was the SERVER's. A SIGSTOPped backend held boot 30s past its 10s bound; no `query_timeout`, no TCP keepalive. | **CLOSED.** Pools carry `query_timeout` (35s, above the 30s statement bound so a live server's own `57014` still wins) and keepalives; migrations get a wider ceiling with their wider server bounds. A query that trips the ceiling leaves the connection AMBIGUOUS, so it is destroyed rather than reused. | A pass-through TCP proxy that completes the real handshake then stops relaying — harsher than SIGSTOP, since the server's own timeout fires and cannot arrive — abandoned at 35.03s, with a transparency control |
-| K-06 | HIGH | Reliability (03581a3, unchanged) | `CREATE TABLE IF NOT EXISTS aaliyah_mail_migrations` ran outside any lock; 2-way and 3-way concurrent migrators crashed N-1 with `23505` on `pg_type_typname_nsp_index`, and `server.ts` turns that into `process.exit(1)`. | **CLOSED.** A session advisory lock needs no table, so it is taken first and covers the creation; `LOCK TABLE` is kept to bind a migrator running an older build. | A positive control proving bare concurrent `IF NOT EXISTS` really crashes N-1 with 23505 on this server, then 2, 3 and 5 concurrent migrators all fulfilling with the ledger applied exactly once and no session lock left held |
+| K-06 | HIGH | Reliability (03581a3, unchanged) | `CREATE TABLE IF NOT EXISTS aaliyah_mail_migrations` ran outside any lock; 2-way and 3-way concurrent migrators crashed N-1 with `23505` on `pg_type_typname_nsp_index`, and `server.ts` turns that into `process.exit(1)`. | **CLOSED — at the second attempt.** A session advisory lock covers the creation against every migrator that TAKES it, and the ledger creation now also TOLERATES losing the race (`42P07`/`23505`, then confirm the ledger is really there), outside any transaction. **The first attempt's rationale was wrong and is retracted below.** | A positive control proving bare concurrent `IF NOT EXISTS` really crashes N-1 with 23505 on this server; 2, 3 and 5 concurrent migrators all fulfilling with the ledger applied exactly once and no session lock left held; and the reliability reviewer's own probe — the real migrator racing a simulated OLDER build, 10 trials on a fresh database plus 5 on a steady-state one — which FAILS against the pre-fix code and passes after it |
 | K-07 | MEDIUM | Security NEW-1 / Red Team B2 | The stores named tables UNQUALIFIED under `SET LOCAL ROLE` on the default `"$user", public` path; granted CREATE on the database, the mutator shadowed `memory_identity_edges` and a survivor's erasure verified over a LIVE key with forged evidence (ATK-P1). | **CLOSED.** `enterMemoryRole` strips `"$user"` and re-appends `pg_temp` LAST, in one statement, for every store. Schemas the OPERATOR configured are kept — that is a deployment decision, and it is what lets a read-back pool be pointed at a divergent schema, which a dozen tests rely on. | ATK-P1 reproduced with the grant in place and refused, with a negative control proving the schema is otherwise uncreatable; plus a direct test of the three path properties and of `SET LOCAL` not leaking |
-| K-08 | MEDIUM | Red Team B2 | Five more widenings produced NO map diff and all WORKED: CREATE ON DATABASE, a view in another schema, a SECURITY DEFINER function in another schema, a granted `pg_catalog` function (`pg_read_file` read 29,950 bytes of `postgresql.conf`), and a function owner change. TEMP/CONNECT through PUBLIC undeclared. | **CLOSED.** The map has a `databases` section (with `acldefault`, so the implicit PUBLIC CONNECT/TEMPORARY is stated), scans every non-system schema and names it in each entry, has a `catalogFunctions` section for explicit `pg_catalog` grants, and records owners. | A positive control per widening: ten in one test plus W2/W3 in another, each applied, reported by name, reverted, map restored |
+| K-08 | MEDIUM | Red Team B2 | Five more widenings produced NO map diff and all WORKED: CREATE ON DATABASE, a view in another schema, a SECURITY DEFINER function in another schema, a granted `pg_catalog` function (`pg_read_file` read 29,950 bytes of `postgresql.conf`), and a function owner change. TEMP/CONNECT through PUBLIC undeclared. | **CLOSED.** The map has a `databases` section (with `acldefault`, so the implicit PUBLIC CONNECT/TEMPORARY is stated — though see G-07: that NULL branch is structurally unreachable under this harness and is not claimed as tested), scans every non-system schema and names it in each entry, has a `catalogFunctions` section for explicit `pg_catalog` grants, and records owners. | A positive control per widening: ten in one test plus W2/W3 in another, each applied, reported by name, reverted, map restored |
 | K-09 | MEDIUM | Security NEW-2 | A merged-in key the store's provider cannot confirm (lost key, provider migration) blocked the survivor's erasure permanently. Fails closed, undisclosed, no operator path. | **CLOSED** with K-01. Named `PROVIDER_DOES_NOT_OWN_KEY` / `PROVIDER_ANSWERED_UNKNOWN` rather than skipped, and settleable. An obligation that heals because the owning provider finally answers is closed as resolved BY PROVIDER, not by settlement, so the ledger does not accumulate rows that healed on their own. | S-10, K-9 |
 | K-10 | MEDIUM | Reliability (03581a3) | `server.ts` awaited both recovery passes in ONE try/catch, so a `reconcilePending` rejection skipped erasure completion entirely — and silently, since the catch spoke only of reconciliation. | **CLOSED.** Two independent passes, each reporting its own result or its own failure; `notProven` is surfaced separately from `pending`, so a permanent state no longer looks like a counter that has not moved yet. | A REAL spawned `server.ts` with both passes made to fail by privilege: both failures appear, and the process still boots |
 | K-11 | MEDIUM | Reliability (03581a3) | `destroyed` was incremented unconditionally after `ON CONFLICT DO NOTHING`, so two racing passes over ten keys reported 15 and 16. | **CLOSED.** Counted from rows that actually landed. A new `repaired` count carries the case the rowCount check would otherwise silence: a forged `key_destroyed` row already holds the evidence slot, so a real destruction of a live key would have reported zero. | R-5 (two racing passes sum to the ledger), K-6, K-7, K-8, K-9 |
@@ -1136,6 +1136,28 @@ K-01/K-09 below.
 | K-21 | NOT_VERIFIED | Reliability (03 and 03581a3) | fd and memory exhaustion never executed, twice disclosed. Reconciliation-versus-pool-exhaustion not separately probed. | **STILL NOT_VERIFIED, and named as such.** Not rounded up, not closed, and not claimed. It is the one item in this round that no evidence here covers. | — |
 | K-22 | LOW | Reliability (03581a3) | Evidenced-key audit cost O(all evidenced rows, all time). | **CLOSED** by K-04's bound and ordering. | R-3 |
 | K-23 | MEDIUM | Founder FOURTH priority | The merge-chain cap must remain exactly 16 valid / 17 rejected, and the erasure contract must hold across the WHOLE chain, not the nearest hop. | **CLOSED.** The cap is unchanged and re-proven; the erasure scope is the transitive closure. | D-1 (16 valid, 17 refused, nonce unspent, plus a branch control), D-2 (the database refuses the 17th even past the store), X-9 (a three-hop chain where a key three hops away is asked about and refuses the survivor, with a positive control) |
+
+### RETRACTED: what K-06's first fix claimed, and why it was false
+
+The register said, of the first K-06 fix: *"`LOCK TABLE` is kept to bind a
+migrator running an OLDER build of this function, which knows nothing about
+this key."*
+
+**That was false, and the reliability review of 86d33c9 falsified it 10 trials
+out of 10 on a fresh database.** A `pg_advisory_lock` serializes only the
+participants that take it. An older build issues a bare
+`CREATE TABLE IF NOT EXISTS` with no advisory lock, races this build's creation
+directly, and `LOCK TABLE` cannot protect a table that does not exist yet. The
+instance that died was THIS one, with the original defect's exact error. On a
+steady-state database, where the ledger already exists and there is something
+to lock, the same pair raced cleanly 5/5 — so the gap was precisely the
+first-rollout case K-06 was opened for.
+
+It is worth recording WHY the wrong claim was written: it asserted enforcement
+for a mechanism that cannot enforce it, and no test drove it, because the
+tests all raced the NEW build against ITSELF. An older build cannot be bound at
+all — so the fix is not to win that race but to make losing it harmless, which
+is what the second attempt does.
 
 ### Cluster-scoped DDL — the boundary, written down (K-12)
 
@@ -1327,3 +1349,81 @@ is its own. Evidence: `aaliyah-w13-evidence/k21-probes/`.
   properties worth proving are that an aborted process leaves no torn state and
   cannot be read as a pass; both are proven elsewhere (P-6, and the watchdog's
   process-exit and SIGKILL attacks) but not under memory pressure specifically.
+
+---
+
+## W1.3 SIXTH HOSTILE CHAIN — `86d33c9`, AND WHAT THE GAUNTLET FOUND
+
+Five reviewers ran against `86d33c9` in isolated immutable worktrees with
+isolated databases. **Three returned blocking verdicts.** Every finding below
+was substantiated, and three of them are defects in the previous round's own
+remediation — including one register claim that was simply false.
+
+| Reviewer | Verdict at `86d33c9` |
+| --- | --- |
+| Test Falsifiability | **BLOCK** — one HIGH nondeterminism, one structural gap, one MEDIUM survivor |
+| Security | **BLOCK** — one HIGH tenant crossover, one LOW over-grant, one LOW disclosed residual |
+| Reliability | **RELIABILITY_RED** — one HIGH, reopening K-06 |
+| Integration Marshal | **BLOCK** — one HIGH, plus three lower findings |
+| Red Team | (recorded when it reports) |
+
+| ID | Sev | Reviewer | Finding | Disposition | Proven by |
+| --- | --- | --- | --- | --- | --- |
+| G-01 | HIGH | Reliability | **K-06 REOPENED.** The register claimed `LOCK TABLE` would "bind a migrator running an OLDER build". It does not: an advisory lock serializes only participants that take it, an older build races the `CREATE TABLE` directly, and `LOCK TABLE` cannot protect a table that does not exist yet. 10 trials out of 10 on a fresh database, and the instance that died was THIS one. Steady state raced cleanly 5/5. | **CLOSED.** This build no longer tries to win that race; it TOLERATES losing it. Ledger creation moved out of the transaction and swallows `42P07`/`23505` after confirming the ledger is really there. See the retraction above. | The reviewer's own probe as a test: the real migrator against a simulated pre-K-06 build, 10 fresh-database trials and 5 steady-state ones. FAILS against `86d33c9`, passes after — verified in a disposable worktree |
+| G-02 | HIGH | Security | **TENANT CROSSOVER.** `settlementProven` took ONE scope — from the first row of the batch — and returned a map keyed by `key_ref` ALONE, which the caller applied to EVERY row. `src/server.ts` runs the completion pass unfiltered at boot, so one tenant's sound PROVEN_DESTROYED settlement satisfied a DIFFERENT tenant's identical key reference: the second tenant's live key reported resolved, NO obligation recorded. The same root cause silently IGNORES other tenants' valid settlements when the ordering goes the other way. Nothing makes a key reference globally unique — `memory_pii_key_erasures_once` is UNIQUE per scope. | **CLOSED.** Matched three columns wide (tenant, workspace, key_ref) in one round trip, and the map is keyed by the whole scope. Both callers pass their own rows' scopes. | S-13, which builds the collision deliberately, forces the batch ordering the defect needs, and asserts BOTH halves: the unsettled tenant is unproven with an obligation, and the settled tenant's own settlement still answers for its own key. FAILS against `86d33c9`, passes after |
+| G-03 | LOW | Security | The MUTATION role held `UPDATE (… settled_by)` on the obligation ledger and could rewrite a row to claim a settlement that does not exist. Wider than any mutator code path writes. | **CLOSED.** `settled_by` removed from the mutator's column grant; only the settler names a settlement. Confined to the advisory ledger either way — the erasure verdict reads evidence and settlements, not obligations. | The declared privilege map, which lost exactly that one column entry |
+| G-04 | LOW | Security | `enterMemoryRole` deliberately KEEPS operator-configured session schemas, and the stores name their tables unqualified — so a session `search_path` an OPERATOR controls still shadows them. | **BOUNDED_AND_PROVEN_NONBLOCKING, DISCLOSED.** See "The kept-schema residual" below. The attacker-reachable vector (`$user`) is closed and the reviewer re-confirmed ATK-P1 refused; reaching this needs operator-level control of the session path, which is the disclosed trust boundary. | The reviewer's own execution: ATK-P1 closed, `ALTER ROLE … SET search_path` inert under `SET LOCAL ROLE`, all 35 SECURITY DEFINER functions pinned |
+| G-05 | HIGH | Test Falsifiability | **NONDETERMINISM.** Four clean full-suite runs gave PASS, FAIL, PASS, PASS. Root-caused, not dismissed as load: the privileges suite released the shared advisory lock BEFORE its final "everything is restored" comparison, and the K-10 boot test takes the same key and transiently revokes exactly two privileges. The failing diff named precisely those two and nothing else. | **CLOSED.** Both trailing comparisons moved inside the lock. This is the SECOND time this exact window appeared in this round — the first was found by the implementer, and the fix did not cover the other two call sites. | The reviewer's empirical hit plus the code path; the comparisons now sit inside the `try` that holds the lock |
+| G-06 | — | Test Falsifiability | **NO INDEPENDENT DISCRIMINATION PROOF.** The 39-mutant sweep is the implementer's own. Per the gate's contract that does not satisfy it, and the same absence was flagged at `8a0bf05` and answered by self-certification. | **ADDRESSED by dispatching an independent `mutation-fuzz` reviewer** against the exact SHA, as an eighth reviewer. Its verdict is recorded with the others. | Reviewer 8's report |
+| G-07 | MEDIUM | Test Falsifiability | A mutant removing the `COALESCE(d.datacl, acldefault(...))` NULL fallback in the privilege map SURVIVED: `datacl` is NULL only for the bootstrap `postgres` database, and every database created with `CREATE DATABASE` inherits a non-null ACL from `template1`, so the NULL branch is unreachable under this harness. The K-08 entry cites that line as proof that the implicit PUBLIC CONNECT/TEMPORARY is stated. | **STRUCTURALLY_UNREACHABLE_WITH_PROOF, and the K-08 wording is corrected.** The `COALESCE` is KEPT — it is correct for a bootstrap database and costs nothing — but it is no longer cited as tested. What IS tested is that the `databases` section reports `GRANT CREATE ON DATABASE` (W1), which is the widening that mattered. | The reviewer's surviving mutant, and the W1 positive control that does discriminate |
+| G-08 | HIGH | Integration | **AN EDITED MIGRATION IS SILENT.** The ledger recorded only an id, so changing an already-applied migration's SQL was undetectable — proven against the real compiled runner by weakening a function 055 defines and re-running, which reported success with the weakened definition live. W1BR-014 covers the row-deleted variant, not this one. And it is not hypothetical: it happened in this round, and was noticed only because T-1 happens to assert a property of one of those functions. | **CLOSED** by migration 057: the ledger records a digest of the SQL applied, and the runner refuses before applying anything when an applied migration's content no longer matches. | INT-DIGEST: a fresh apply is fully digested in ONE run (the first version of the fix left every row undigested until a second run), re-running is a clean no-op, and a changed digest is refused with the ledger untouched |
+| G-09 | MEDIUM | Integration | No HTTP or CLI surface lets an operator LIST or SETTLE `memory_key_destruction_obligations` against a running instance — only raw SQL. K-01's disposition says "listable", which is true at the service layer and not operationally. | **DISCLOSED, and the K-01 wording is corrected below.** `listKeyDestructionObligations` and `settleKeyDestruction` exist on the service; no route or command reaches them. An operator surface needs an authorization design and belongs to a later wave, not to a quiet edit here. | The reviewer booted the real `dist/src/server.js` and searched the routes |
+| G-10 | LOW | Integration | A stray `freeze-suite-last.json` from the superseded `7847904` sat in this candidate's evidence folder and could be mistaken for a third data point. | **CLOSED.** Removed, and the checksum file regenerated. | The evidence directory's `SHA256SUMS` |
+| G-11 | LOW | Integration | An ambient `AALIYAH_DATABASE_URL` reroutes unrelated unit tests through `applicationStoreFromEnv()`'s singleton to a shared Postgres store, deterministically failing four tests. Only Postgres-specific files should set it. Cost the reviewer two full-suite runs. | **DISCLOSED** below, so the next reviewer does not pay for it again. Not a candidate defect: the suite's own contract is that `AALIYAH_TEST_DATABASE_URL` is the one to export. | The reviewer root-caused it to `src/persistence/applicationState.ts` and reproduced the clean result with only the test variable set |
+
+### The kept-schema residual (G-04)
+
+`enterMemoryRole` strips `"$user"` and forces `pg_temp` last, and KEEPS every
+other schema the session was configured with. That is deliberate, and the
+trade-off is worth stating plainly rather than leaving in a code comment:
+
+- what it closes: the attacker-reachable vector. A role granted CREATE on the
+  database can create a schema named after itself, and `"$user"` used to put it
+  first on the path — ATK-P1. With `"$user"` gone, and with `SET LOCAL ROLE`
+  ignoring a role's own `ALTER ROLE … SET search_path`, an entered role has no
+  way to influence name resolution at all. The security reviewer re-confirmed
+  both.
+- what it keeps open: an operator who controls the SESSION path — through a
+  connection string, `ALTER DATABASE … SET`, or a compromised login role that
+  can both `ALTER ROLE` itself and create a schema — can still shadow an
+  unqualified name. That is the same trust boundary as a DBA, and it is where
+  this residual lives.
+- why it is kept: an explicit schema list on a connection string is a
+  deployment decision, and a store that silently discarded it would be
+  overriding its operator. It is also the mechanism a dozen tests use to point
+  a read-back pool at a deliberately divergent schema, which is how this store
+  proves it never reports success on a read-back that disagrees with the
+  commit — the single most important property in the file.
+- the falsifier, if the trade is ever judged wrong: schema-qualify every
+  identifier the stores issue, or discard all non-public schemas. Either
+  removes the residual, and the second one costs those tests their mechanism.
+
+### Corrected: K-01's "listable" (G-09)
+
+The obligation ledger is listable through the memory service
+(`listKeyDestructionObligations`) and settleable through it
+(`settleKeyDestruction`). **Neither is reachable from outside the process**:
+there is no HTTP route and no CLI command. An operator facing an
+`ERASURE_PENDING_SETTLEMENT` today reads `memory_key_destruction_obligations`
+with SQL. That is a real operational gap, it is disclosed rather than closed,
+and it does not change what the state MEANS — which is the part Option B
+required.
+
+### For the next reviewer: do not export `AALIYAH_DATABASE_URL` (G-11)
+
+Export `AALIYAH_TEST_DATABASE_URL` and nothing else. With
+`AALIYAH_DATABASE_URL` also set, `applicationStoreFromEnv()`'s process-wide
+singleton (`src/persistence/applicationState.ts`) reroutes unrelated unit tests
+to a shared Postgres store and four of them fail deterministically. The
+Postgres-specific files set what they need themselves. Two reviewers have now
+lost runs to this; it is written down so a third does not.
