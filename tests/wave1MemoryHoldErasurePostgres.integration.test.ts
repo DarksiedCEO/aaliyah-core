@@ -5186,18 +5186,37 @@ test("ATK-P1 K-07: a mutator that can CREATE a schema named after itself cannot 
   }
 });
 
-test("K-07: the pinned path drops \"$user\" and pg_temp's precedence, and KEEPS what the operator configured", async () => {
-  // The three properties `enterMemoryRole` exists for, read back from the
-  // SERVER inside the transaction rather than from the string it sent.
+test("K-07: the pinned path is a CONSTANT — nothing from the session can influence resolution", async () => {
+  // ---- THIS TEST USED TO ASSERT THE VULNERABILITY ---------------------
+  //
+  // Its third assertion was `after === "pg_catalog, operator_choice, public,
+  // pg_temp"` — that the pin KEEPS what the session configured — justified in
+  // its own comment as "a store that silently discarded it would be overriding
+  // its operator, and would break every read-back-divergence fixture in this
+  // repository". A search_path attack against 40b6bd5, executed as the real
+  // runtime role on a disposable database, falsified both halves:
+  //
+  //   `ALTER ROLE <self> SET search_path = opsched, public`  -> SUCCEEDED,
+  //     with no privilege beyond holding that login. So the path is set by
+  //     whoever holds the credential, not by "the operator".
+  //   the old pin produced `pg_catalog, opsched, public, pg_temp`
+  //   as aaliyah_memory_mutator, an unqualified read of
+  //     `memory_pii_key_erasures` returned a FABRICATED row from opsched
+  //     while public held none
+  //   and `aaliyah_memory_unerased_merged_records(text,text,text)` — the
+  //     helper the DATABASE's erasure guard calls — resolved to opsched too.
+  //     New functions carry EXECUTE for PUBLIC by default, so that required
+  //     no grant at all.
+  //
+  // The path is now a constant. This test asserts that constant, and that the
+  // session cannot move it.
   const probe = new Pool({
     connectionString: DB_URL,
     max: 1,
-    // `$User` deliberately, not `$user`. Red team B3 / mutant M1: the strip
-    // compared literal lowercase strings, and PostgreSQL carries the casing
-    // the caller wrote — so `$User` survived and still resolved to the current
-    // role's schema, while this test's own assertion was case-SENSITIVE and
-    // could not see it.
-    options: `${process.env.PGOPTIONS ?? ""} -c search_path="$User",operator_choice,public`,
+    // Everything an attacker or a misconfiguration could put here at once:
+    // `$User` in hostile casing (red team B3 / mutant M1), a schema of their
+    // choosing ahead of public, and pg_temp named FIRST.
+    options: `${process.env.PGOPTIONS ?? ""} -c search_path=pg_temp,"$User",operator_choice,public`,
   });
   try {
     const client = await probe.connect();
@@ -5205,18 +5224,23 @@ test("K-07: the pinned path drops \"$user\" and pg_temp's precedence, and KEEPS 
       await client.query("BEGIN");
       const before = (await client.query(`SELECT current_setting('search_path') AS p`)).rows[0].p as string;
       assert.match(before, /\$user/i, "fixture precondition: the session must start with $user on the path");
+      assert.match(before, /operator_choice/, "fixture precondition: and with a foreign schema");
       await enterMemoryRole(client, "aaliyah_memory_reader");
       const after = (await client.query(`SELECT current_setting('search_path') AS p`)).rows[0].p as string;
-      // 1. `"$user"` is GONE — the attack surface ATK-P1 used — in ANY casing.
-      assert.doesNotMatch(after, /\$user/i, after);
-      // 2. `pg_temp` is LAST, not first-by-omission.
-      assert.match(after, /, pg_temp$/, after);
-      // 3. The operator's own schema is still there, in order. A store that
-      //    silently discarded it would be overriding its operator, and would
-      //    break every read-back-divergence fixture in this repository.
-      assert.equal(after, "pg_catalog, operator_choice, public, pg_temp");
+
+      // THE WHOLE ASSERTION: a constant, whatever the session asked for.
+      assert.equal(
+        after,
+        "pg_catalog, public, pg_temp",
+        `the session influenced the pinned path: ${after}`,
+      );
+      // Stated individually too, so a failure says WHICH property broke.
+      assert.doesNotMatch(after, /\$user/i, "$user survived in some casing");
+      assert.doesNotMatch(after, /operator_choice/, "a session-chosen schema survived");
+      assert.match(after, /, pg_temp$/, "pg_temp is not last");
+
       await client.query("ROLLBACK");
-      // 4. SET LOCAL: nothing leaked onto the pooled connection.
+      // SET LOCAL: nothing leaked onto the pooled connection.
       const leaked = (await client.query(`SELECT current_setting('search_path') AS p`)).rows[0].p as string;
       assert.equal(leaked, before);
     } finally {
@@ -5224,6 +5248,61 @@ test("K-07: the pinned path drops \"$user\" and pg_temp's precedence, and KEEPS 
     }
   } finally {
     await probe.end();
+  }
+});
+
+test("K-07b: a role's OWN persistent search_path cannot reach this store's name resolution", async () => {
+  // The attack's first link, which needed no privilege: a login role setting
+  // its own `search_path` with `ALTER ROLE <self> SET`. PostgreSQL allows it —
+  // `search_path` is USERSET — so it is not something a grant can prevent.
+  // What can be prevented is it MATTERING.
+  const role = "aaliyah_k07b_probe";
+  await adminPool.query(`DROP ROLE IF EXISTS ${role}`);
+  await adminPool.query(`CREATE ROLE ${role} LOGIN PASSWORD 'probe'`);
+  await adminPool.query(`GRANT aaliyah_memory_reader TO ${role}`);
+  try {
+    // The role poisons its own path. This SUCCEEDS, and that is the point.
+    const asRole = new URL(DB_URL);
+    asRole.username = role;
+    asRole.password = "probe";
+    const own = new Pool({ connectionString: asRole.href, max: 1 });
+    own.on("error", () => undefined);
+    try {
+      await own.query(`ALTER ROLE ${role} SET search_path = operator_choice, public`);
+    } finally {
+      await own.end();
+    }
+    const stored = await adminPool.query(
+      `SELECT array_to_string(rolconfig, ',') AS c FROM pg_roles WHERE rolname = $1`,
+      [role],
+    );
+    assert.match(
+      String(stored.rows[0].c),
+      /operator_choice/,
+      "fixture precondition: the role must be able to poison its own path, or this proves nothing",
+    );
+
+    // A NEW session inherits it — and the pin ignores it anyway.
+    const poisoned = new Pool({ connectionString: asRole.href, max: 1 });
+    poisoned.on("error", () => undefined);
+    try {
+      const client = await poisoned.connect();
+      try {
+        const inherited = (await client.query(`SELECT current_setting('search_path') AS p`)).rows[0].p as string;
+        assert.match(inherited, /operator_choice/, "fixture precondition: the session must inherit it");
+        await client.query("BEGIN");
+        await enterMemoryRole(client, "aaliyah_memory_reader");
+        const after = (await client.query(`SELECT current_setting('search_path') AS p`)).rows[0].p as string;
+        assert.equal(after, "pg_catalog, public, pg_temp", `a role-level path reached the store: ${after}`);
+        await client.query("ROLLBACK");
+      } finally {
+        client.release();
+      }
+    } finally {
+      await poisoned.end();
+    }
+  } finally {
+    await adminPool.query(`DROP ROLE IF EXISTS ${role}`).catch(() => undefined);
   }
 });
 

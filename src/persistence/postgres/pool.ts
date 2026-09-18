@@ -119,61 +119,62 @@ export function boundedQuery(
  * the moment somebody adds the next one. This closes it for every statement,
  * including the ones not written yet.
  *
- * ---- WHAT IS REMOVED, AND WHAT IS DELIBERATELY KEPT --------------------
+ * ---- NOTHING IS INHERITED. THE PATH IS FIXED. -------------------------
  *
- * Exactly two entries are stripped, and neither is something an operator ever
- * chooses:
+ * This used to STRIP `"$user"` and `pg_temp` and KEEP every other schema the
+ * session was configured with, "in order", on the reasoning that an explicit
+ * schema list is set by whoever deploys the process and a store that discarded
+ * it would be overriding its operator. A search_path attack run against
+ * 40b6bd5, as the real runtime role on a disposable database, falsified that:
  *
- *   `"$user"`  is the attack. It is on PostgreSQL's DEFAULT path, it resolves
- *              to a schema named after the CURRENT ROLE, and a role holding
- *              CREATE on the database can therefore create its own shadow of
- *              any table this store reads — which is precisely what ATK-P1
- *              did. `SET LOCAL ROLE` does not apply a role's own `ALTER ROLE
- *              ... SET search_path`, so with `"$user"` gone the entered role
- *              has no way to influence name resolution at all.
- *   `pg_temp`  is searched FIRST when it is not named, so it is re-appended
- *              LAST instead — the same reason every SECURITY DEFINER guard
- *              from migration 048 onward spells it out. Red team B2 created
- *              `pg_temp.memory_identity_edges` and had it resolve unqualified.
+ *   1. A runtime login role can set its OWN persistent search_path with no
+ *      privilege at all beyond being that role — `ALTER ROLE <self> SET
+ *      search_path = opsched, public` succeeded. So "configured by whoever
+ *      deploys the process" was not true: it is configured by whoever holds
+ *      the login, which is the identity being defended against.
+ *   2. The old pin PRESERVED that schema, AHEAD of public:
+ *      `pg_catalog, opsched, public, pg_temp`.
+ *   3. Under that pin, as `aaliyah_memory_mutator`, an unqualified read of
+ *      `memory_pii_key_erasures` returned a FABRICATED row from the attacker's
+ *      schema while `public` held none.
+ *   4. Worse, `aaliyah_memory_unerased_merged_records(text,text,text)` — the
+ *      helper the DATABASE's own erasure guard calls, the one that decides
+ *      whether a survivor erasure may complete — resolved to the attacker's
+ *      schema too. New functions carry EXECUTE for PUBLIC by DEFAULT, so that
+ *      needed no grant to the memory role at all.
  *
- * Every OTHER schema the session was configured with is KEPT, in order. That
- * is not a concession: an explicit schema list on a connection string is set
- * by whoever deploys the process, and a store that silently discarded it would
- * be overriding its operator rather than defending against an attacker. It is
- * also what lets a read-back pool be pointed at a deliberately divergent
- * schema — the mechanism a dozen tests use to prove this store never reports
- * success on a read-back that disagrees with the commit, which is the single
- * most important property in this file.
+ * The only thing that had been standing in the way was that the memory roles
+ * happened to hold USAGE on no schema but `public`. That is a grant, not a
+ * property of this code, and one ordinary `GRANT USAGE` completed the attack.
  *
- * Computed in ONE statement, inside the transaction, so there is no extra
- * round trip on the hot path and no window where the path is the default one.
- * `SET LOCAL` / `set_config(..., true)` throughout, so neither the role nor
- * the path leaks onto a pooled connection when the transaction ends.
+ * So the path is now a CONSTANT. Nothing from the session, the role, the
+ * database, `PGOPTIONS` or the connection string can influence how a name in
+ * this store resolves:
  *
- * ---- AND THE COMPARISON IS CASE-INSENSITIVE ---------------------------
+ *   `pg_catalog`  first, as PostgreSQL does implicitly anyway, said out loud.
+ *   `public`      the authoritative schema, and the ONLY one.
+ *   `pg_temp`     LAST and explicit. It is searched FIRST when unnamed, which
+ *                 is how red team B2 had `pg_temp.memory_identity_edges`
+ *                 resolve unqualified.
  *
- * Red team against 86d33c9, MEDIUM (B3): this compared literal lowercase
- * strings, and a search_path carries the casing whoever set it wrote — so
- * `$User` or `$USER` survived the strip and still resolved to the current
- * role's schema. Delivered through `PGOPTIONS`, the effective path became
- * `pg_catalog, aaliyah_memory_mutator, public`. ATK-P1's HARM did not
- * reproduce, because the erasure SQL is `public.`-qualified and all 44 guards
- * pin their own path — but "`$user` is stripped" has to be TRUE, and the test
- * asserting it was itself case-sensitive and could not see the difference.
+ * Deploying this store's tables in a schema other than `public` is therefore a
+ * deliberate, validated code change to `AUTHORITATIVE_SCHEMA` below — not
+ * something a connection string can do quietly.
+ *
+ * Fixture note, because this is what the old behaviour was really buying: a
+ * dozen read-back divergence tests used a pool pointed at a shadow schema to
+ * inject divergence. That mechanism IS this vulnerability, so those tests are
+ * rebuilt on a test-only seam instead. Production posture does not bend to
+ * fixture convenience.
  */
-const PINNED_SEARCH_PATH_SQL = `
-  SELECT set_config('search_path',
-    'pg_catalog, ' ||
-    COALESCE(NULLIF((
-      -- WITH ORDINALITY and an explicit ORDER BY: a search path is an ORDERED
-      -- list, and string_agg without one is not obliged to preserve it.
-      SELECT string_agg(btrim(part), ', ' ORDER BY ord)
-        FROM unnest(string_to_array(current_setting('search_path'), ','))
-               WITH ORDINALITY AS t(part, ord)
-       -- CASE-INSENSITIVELY: see the note above this statement (B3).
-       WHERE lower(btrim(part)) NOT IN ('"$user"', '$user', 'pg_catalog', 'pg_temp')
-         AND btrim(part) <> ''
-    ), ''), 'public') || ', pg_temp', true)`;
+
+/**
+ * The one schema this store's unqualified names may resolve from. Changing it
+ * is a code change, reviewed like any other.
+ */
+export const AUTHORITATIVE_SCHEMA = "public";
+
+const PINNED_SEARCH_PATH_SQL = `SELECT set_config('search_path', 'pg_catalog, ${AUTHORITATIVE_SCHEMA}, pg_temp', true)`;
 
 export async function enterMemoryRole(
   client: { query: (sql: string) => Promise<unknown> },

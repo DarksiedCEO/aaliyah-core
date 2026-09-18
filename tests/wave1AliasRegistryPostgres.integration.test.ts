@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test, { after, before, beforeEach } from "node:test";
 import { Pool } from "pg";
+import type { PoolClient } from "pg";
 
 import {
   MEMORY_ALIAS_NORMALIZATION_VERSION,
@@ -127,6 +128,81 @@ const ATTACKER = "participant-attacker";
 
 let writePool: Pool;
 let readPool: Pool;
+/**
+ * A READ-BACK POOL WHOSE ROWS DISAGREE WITH WHAT WAS COMMITTED.
+ *
+ * The divergence fixtures here used to point a pool's `search_path` at a shadow
+ * schema holding ONE of the two relations the read-back consults, so record
+ * agreement and binding agreement stayed separable. A search_path attack
+ * against 40b6bd5 proved that mechanism IS the vulnerability being defended
+ * against — and worse, the fixture's own setup ran
+ * `GRANT USAGE ON SCHEMA ... TO aaliyah_memory_reader, aaliyah_memory_mutator`,
+ * the exact grant that completes the attack. The store's pin is now the
+ * constant `pg_catalog, public, pg_temp`, so nothing on the session can
+ * redirect a name, and the schemas and grants are gone.
+ *
+ * Separability is preserved by rewriting PER RELATION: pass `record` to make
+ * the head disagree, `binding` to make the binding disagree, either alone or
+ * both. Whatever is not given is returned untouched, exactly as the old
+ * fall-through to `public` did.
+ *
+ * Everything downstream is the real thing — the real SQL against the real
+ * schema, the store's own `headFromRow` binding check, its canonical digest
+ * recomputation and its post-state comparison all run unmodified. Nothing in
+ * `src/` can construct one of these, no flag enables it, and the store cannot
+ * tell it from an ordinary pool.
+ *
+ * The patch is removed on `release()`: the first version of this wrapper left
+ * it attached, so the pooled client went back to the SHARED pool still
+ * rewriting rows and one converted test became 26 failures in unrelated areas.
+ */
+type RowRewrite = (rows: Array<Record<string, unknown>>) => Array<Record<string, unknown>>;
+
+function divergingReadPool(
+  base: Pool,
+  rewrites: { record?: RowRewrite; binding?: RowRewrite },
+): Pool {
+  const patchClient = (client: PoolClient): PoolClient => {
+    const query = client.query.bind(client);
+    const release = client.release.bind(client);
+    const restore = (): void => {
+      (client as { query: unknown }).query = query;
+      (client as { release: unknown }).release = release;
+    };
+    (client as { release: unknown }).release = ((...args: unknown[]) => {
+      restore();
+      return (release as (...a: unknown[]) => unknown)(...args);
+    }) as unknown as PoolClient["release"];
+    (client as { query: unknown }).query = (async (...args: unknown[]) => {
+      const result = (await (query as (...a: unknown[]) => Promise<unknown>)(...args)) as {
+        rows?: Array<Record<string, unknown>>;
+        rowCount?: number;
+      };
+      const sql = typeof args[0] === "string" ? args[0] : "";
+      if (!Array.isArray(result.rows)) return result;
+      const rewrite =
+        /FROM memory_record_versions/.test(sql)
+          ? rewrites.record
+          : /FROM memory_alias_bindings/.test(sql)
+            ? rewrites.binding
+            : undefined;
+      if (rewrite === undefined) return result;
+      const rows = rewrite(result.rows);
+      return { ...result, rows, rowCount: rows.length };
+    }) as unknown as PoolClient["query"];
+    return client;
+  };
+  return new Proxy(base, {
+    get(target, prop, receiver) {
+      if (prop === "connect") {
+        return async () => patchClient(await target.connect());
+      }
+      const value = Reflect.get(target, prop, receiver) as unknown;
+      return typeof value === "function" ? (value as () => unknown).bind(target) : value;
+    },
+  }) as Pool;
+}
+
 let shadowRecordPool: Pool;
 let shadowBindingPool: Pool;
 let uncheckedPool: Pool;
@@ -3109,42 +3185,45 @@ test("a read-back whose CONTENT matches but whose post-state does not is UNKNOWN
     observedAlias: "ceo@example.com",
     participantId: VICTIM,
   });
-  // The shadow holds a record whose content digests to EXACTLY the proposed
-  // content — so the divergence branch cannot fire — but whose version is not
-  // the version that was written.
+  // The observed head digests to EXACTLY the proposed content — so the
+  // divergence branch cannot fire — but its version is not the version that
+  // was written. Only the post-state comparison can catch it. The payload
+  // mirrors every column because the store's own `headFromRow` binding check
+  // runs first and would otherwise reject the row for the wrong reason.
   const digest = memoryContentDigest(prepared.content);
-  await adminPool.query(
-    `INSERT INTO ${SHADOW_RECORD_SCHEMA}.memory_record_versions
-       (tenant_id, workspace_id, principal_id, user_id, record_id, version,
-        state, content_digest, predecessor_digest, authorization_id,
-        mutation_receipt_id, payload)
-     VALUES ($1,$2,$3,$4,$5,1,'active',$6,NULL,$7,$8,$9)`,
-    [
-      SCOPE.tenantId,
-      SCOPE.workspaceId,
-      SCOPE.principalId,
-      SCOPE.userId,
-      VICTIM,
-      digest,
-      "genesis-000000000000000000000",
-      "mutation.genesis",
-      JSON.stringify({
-        schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
-        recordId: VICTIM,
+  const observedHead = divergingReadPool(readPool, {
+    record: () => [
+      {
+        id: 999_999,
+        tenant_id: SCOPE.tenantId,
+        workspace_id: SCOPE.workspaceId,
+        principal_id: SCOPE.principalId,
+        user_id: SCOPE.userId,
+        record_id: VICTIM,
         version: 1,
         state: "active",
-        scope: SCOPE,
-        content: prepared.content,
-        contentDigest: digest,
-        predecessorDigest: null,
-        authorizationId: "genesis-000000000000000000000",
-        mutationReceiptId: "mutation.genesis",
-        createdAt: isoOffset(-120_000),
-      }),
+        content_digest: digest,
+        predecessor_digest: null,
+        authorization_id: "genesis-000000000000000000000",
+        mutation_receipt_id: "mutation.genesis",
+        payload: {
+          schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
+          recordId: VICTIM,
+          version: 1,
+          state: "active",
+          scope: SCOPE,
+          content: prepared.content,
+          contentDigest: digest,
+          predecessorDigest: null,
+          authorizationId: "genesis-000000000000000000000",
+          mutationReceiptId: "mutation.genesis",
+          createdAt: isoOffset(-120_000),
+        },
+      },
     ],
-  );
+  });
   const result = await store({
-    readBack: shadowRecordPool,
+    readBack: observedHead,
   }).assignAlias({
     actor: SCOPE,
     authorizationId: prepared.receipt.authorizationId,

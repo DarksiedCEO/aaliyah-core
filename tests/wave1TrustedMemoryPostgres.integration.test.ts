@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach } from "node:test";
 import { Pool } from "pg";
+import type { PoolClient } from "pg";
 
 import {
   MEMORY_AUTHORIZATION_NONCE_SCHEMA_VERSION,
@@ -46,10 +47,8 @@ const DB_URL =
   "postgres://postgres:test@127.0.0.1:54329/aaliyah_test";
 
 /** Schema the read-back pool is pointed at when a test needs to force divergence. */
-const SHADOW_SCHEMA = "memory_readback_shadow";
 
 /** Same shape, no CHECK constraints. See the note in `before`. */
-const UNCHECKED_SCHEMA = "memory_readback_unchecked";
 
 const EVIDENCE_DIGEST = `sha256:${"b".repeat(64)}`;
 
@@ -64,8 +63,105 @@ const RECORD_ID = "record-memory-001";
 
 let writePool: Pool;
 let readPool: Pool;
-let shadowReadPool: Pool;
-let uncheckedReadPool: Pool;
+
+/**
+ * A READ-BACK POOL WHOSE ROWS DISAGREE WITH WHAT WAS COMMITTED.
+ *
+ * ---- WHY THE OLD MECHANISM HAD TO GO ---------------------------------
+ *
+ * These tests used to force divergence with a pool whose `search_path` put a
+ * shadow schema ahead of `public`, so the read-back resolved
+ * `memory_record_versions` to a relation holding a different version. A
+ * search_path attack against 40b6bd5 proved that mechanism IS a
+ * vulnerability: a runtime role can set its own persistent `search_path` with
+ * no privilege at all, the old pin preserved it, and under that pin both the
+ * store's tables AND `aaliyah_memory_unerased_merged_records` — the helper the
+ * database's own erasure guard calls — resolved into an attacker's schema.
+ * The pin is now the constant `pg_catalog, public, pg_temp`, so no session can
+ * redirect a name, and the shadow mechanism is gone with it.
+ *
+ * ---- WHY THE DATABASE CANNOT BE USED TO FAKE THIS --------------------
+ *
+ * The obvious replacement — perturb the authoritative row between the commit
+ * and the read-back — does not work, and the reason is a property worth
+ * stating: `memory_record_versions` is APPEND-ONLY, so `UPDATE` and `DELETE`
+ * are refused outright, and inserting a competing later row is refused by the
+ * predecessor, authorization-scope and digest guards. The schema will not
+ * produce a divergent authoritative head. That is the system being correct.
+ *
+ * ---- SO THE SEAM IS THE ROW THE DATABASE HANDS BACK ------------------
+ *
+ * What these tests actually prove is the STORE'S DETECTION: that when the
+ * value read back disagrees with what was written, the outcome is UNKNOWN or
+ * DIVERGED and never success. So the fault is injected exactly where the fault
+ * lives — in the rows returned to the read-back — and everything downstream is
+ * the real thing: the real SQL runs against the real schema, and the store's
+ * own comparison, digest recomputation and `postStateAgrees` all execute
+ * unmodified against the substituted row.
+ *
+ * `readBackPool` is already a constructor argument of the store, so this needs
+ * no production seam: nothing in `src/` constructs one of these, no flag
+ * enables it, there is no runtime hook, and the store cannot distinguish it
+ * from an ordinary pool.
+ *
+ * `rewrite` receives the rows the read-back SELECT returned and returns what
+ * the store should see. Returning `[]` models a read-back that found nothing.
+ */
+function divergingReadPool(
+  base: Pool,
+  rewrite: (rows: Array<Record<string, unknown>>) => Array<Record<string, unknown>>,
+): Pool {
+  const patchClient = (client: PoolClient): PoolClient => {
+    const query = client.query.bind(client);
+    const release = client.release.bind(client);
+    const restore = (): void => {
+      (client as { query: unknown }).query = query;
+      (client as { release: unknown }).release = release;
+    };
+    // ---- THE PATCH MUST NOT SURVIVE THE CHECKOUT --------------------
+    //
+    // The first version of this wrapper patched `query` and did NOT restore
+    // it, so `release()` handed the pooled client back to the SHARED pool with
+    // the rewrite still attached. Every later checkout of that same physical
+    // connection then silently rewrote `memory_record_versions` rows: one
+    // converted test turned into 26 failures across nonces, receipts, locks
+    // and creates, none of which had anything to do with read-back divergence.
+    //
+    // A test double that leaks into shared state is the same defect class this
+    // suite exists to catch, so the restore happens on the way out, before the
+    // connection is reusable by anyone.
+    (client as { release: unknown }).release = ((...args: unknown[]) => {
+      restore();
+      return (release as (...a: unknown[]) => unknown)(...args);
+    }) as unknown as PoolClient["release"];
+    // Only the read-back's own SELECT is touched. BEGIN, the role change and
+    // the clock read pass through untouched, so the transaction the store runs
+    // is the transaction it would run in production.
+    (client as { query: unknown }).query = (async (...args: unknown[]) => {
+      const result = (await (query as (...a: unknown[]) => Promise<unknown>)(...args)) as {
+        rows?: Array<Record<string, unknown>>;
+        rowCount?: number;
+      };
+      const sql = typeof args[0] === "string" ? args[0] : "";
+      if (/FROM memory_record_versions/.test(sql) && Array.isArray(result.rows)) {
+        const rows = rewrite(result.rows);
+        return { ...result, rows, rowCount: rows.length };
+      }
+      return result;
+    }) as unknown as PoolClient["query"];
+    return client;
+  };
+  return new Proxy(base, {
+    get(target, prop, receiver) {
+      if (prop === "connect") {
+        return async () => patchClient(await target.connect());
+      }
+      const value = Reflect.get(target, prop, receiver) as unknown;
+      return typeof value === "function" ? (value as () => unknown).bind(target) : value;
+    },
+  }) as Pool;
+}
+
 let adminPool: Pool;
 // See tests/support/sharedMemoryTables.ts: this file TRUNCATEs tables another
 // suite also TRUNCATEs, and `node --test` runs files in parallel.
@@ -91,70 +187,25 @@ before(async () => {
     AALIYAH_DATABASE_URL: DB_URL,
   } as NodeJS.ProcessEnv);
 
-  // A real second relation the read-back resolves to first, used only by the
-  // divergence tests. Forcing divergence this way keeps the production read
-  // path completely untouched — no injected failure hook, no stubbed client.
-  await adminPool.query(`DROP SCHEMA IF EXISTS ${SHADOW_SCHEMA} CASCADE`);
-  await adminPool.query(`CREATE SCHEMA ${SHADOW_SCHEMA}`);
-  await adminPool.query(
-    `CREATE TABLE ${SHADOW_SCHEMA}.memory_record_versions
-       (LIKE public.memory_record_versions INCLUDING ALL)`,
-  );
-  await adminPool.query(
-    `GRANT USAGE ON SCHEMA ${SHADOW_SCHEMA}
-       TO aaliyah_memory_reader, aaliyah_memory_mutator`,
-  );
-  await adminPool.query(
-    `GRANT SELECT ON ${SHADOW_SCHEMA}.memory_record_versions
-       TO aaliyah_memory_reader, aaliyah_memory_mutator`,
-  );
-  shadowReadPool = new Pool({
-    connectionString: DB_URL,
-    max: 4,
-    options: `${process.env.PGOPTIONS ?? ""} -c search_path=${SHADOW_SCHEMA},public`,
-  });
-
-  // A relation shaped like the real one but WITHOUT its CHECK constraints.
-  // In `public`, migration 023 makes a row whose columns disagree with its
-  // jsonb payload physically unrepresentable — which would leave the
-  // application-level binding check with no reachable input and therefore no
-  // killing test. A replica, a restored backup, or a table created by
-  // something other than these migrations has no such guarantee, so the check
-  // is exercised against a relation that has no guarantee either.
-  await adminPool.query(`DROP SCHEMA IF EXISTS ${UNCHECKED_SCHEMA} CASCADE`);
-  await adminPool.query(`CREATE SCHEMA ${UNCHECKED_SCHEMA}`);
-  await adminPool.query(
-    // DEFAULTS (so the surrogate key still works) but explicitly NOT
-    // CONSTRAINTS: the CHECKs are the thing being removed.
-    `CREATE TABLE ${UNCHECKED_SCHEMA}.memory_record_versions
-       (LIKE public.memory_record_versions INCLUDING DEFAULTS)`,
-  );
-  await adminPool.query(
-    `GRANT USAGE ON SCHEMA ${UNCHECKED_SCHEMA} TO aaliyah_memory_reader`,
-  );
-  await adminPool.query(
-    `GRANT SELECT ON ${UNCHECKED_SCHEMA}.memory_record_versions
-       TO aaliyah_memory_reader`,
-  );
-  uncheckedReadPool = new Pool({
-    connectionString: DB_URL,
-    max: 2,
-    options: `${process.env.PGOPTIONS ?? ""} -c search_path=${UNCHECKED_SCHEMA},public`,
-  });
+  // NO SHADOW SCHEMAS. The divergence and binding-mismatch fixtures used to
+  // create real relations here and point a pool's `search_path` at them —
+  // including `GRANT USAGE ON SCHEMA ... TO aaliyah_memory_reader,
+  // aaliyah_memory_mutator`, which is precisely the grant that completes the
+  // search_path attack this round closed. The fault is now injected at the
+  // read-back result boundary by `divergingReadPool`, so neither the schemas
+  // nor the grants exist any more.
 });
 
 after(async () => {
-  await uncheckedReadPool.end();
-  await shadowReadPool.end();
   await readPool.end();
   await writePool.end();
-  await adminPool.query(`DROP SCHEMA IF EXISTS ${SHADOW_SCHEMA} CASCADE`);
-  await adminPool.query(`DROP SCHEMA IF EXISTS ${UNCHECKED_SCHEMA} CASCADE`);
   await sharedTableLock.release();
   await adminPool.end();
 });
 
 beforeEach(async () => {
+  // No substituted read-back row unless a test asks for one.
+  observedHeadRows = null;
   await adminPool.query(
     `TRUNCATE memory_record_versions,
               memory_authorization_receipts,
@@ -171,12 +222,6 @@ beforeEach(async () => {
               memory_key_destruction_obligations,
               memory_pii_key_audits
      RESTART IDENTITY`,
-  );
-  await adminPool.query(
-    `TRUNCATE ${SHADOW_SCHEMA}.memory_record_versions RESTART IDENTITY`,
-  );
-  await adminPool.query(
-    `TRUNCATE ${UNCHECKED_SCHEMA}.memory_record_versions RESTART IDENTITY`,
   );
   genesisCounter = 0;
 });
@@ -1333,42 +1378,27 @@ test("a read-back that disagrees with the commit reports divergence, never succe
       proposedContent: next,
     }),
   );
-  // The read-back session resolves memory_record_versions to a shadow relation
-  // holding a genuinely different version 2.
-  await seedGenesis({ note: "original" }, { schema: SHADOW_SCHEMA });
-  await adminPool.query(
-    `INSERT INTO ${SHADOW_SCHEMA}.memory_record_versions
-       (tenant_id, workspace_id, principal_id, user_id, record_id, version,
-        state, content_digest, predecessor_digest, authorization_id,
-        mutation_receipt_id, payload)
-     VALUES ($1,$2,$3,$4,$5,2,'active',$6,$7,$8,$9,$10)`,
-    [
-      SCOPE.tenantId,
-      SCOPE.workspaceId,
-      SCOPE.principalId,
-      SCOPE.userId,
-      RECORD_ID,
-      memoryContentDigest({ note: "something else entirely" }),
-      genesis,
-      receipt.authorizationId,
-      "mutation.diverge.1",
-      JSON.stringify({
-        schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
-        recordId: RECORD_ID,
-        version: 2,
-        state: "active",
-        scope: SCOPE,
-        content: { note: "something else entirely" },
-        contentDigest: memoryContentDigest({ note: "something else entirely" }),
-        predecessorDigest: genesis,
-        authorizationId: receipt.authorizationId,
-        mutationReceiptId: "mutation.diverge.1",
-        createdAt: isoOffset(0),
-      }),
-    ],
+  // The AUTHORITATIVE version 2 is rewritten to different content in the
+  // instant between the commit and the read-back, so the row the read-back
+  // finds genuinely disagrees with what was committed. No schema redirection:
+  // same pool, same SQL, same `public`.
+  // The read-back is handed a row whose CONTENT is not what was committed.
+  // Everything else — the SQL, the schema, the store's digest recomputation
+  // and its comparison — is untouched.
+  const divergent = { note: "something else entirely" };
+  const diverge = divergingReadPool(readPool, (rows) =>
+    rows.map((row) => ({
+      ...row,
+      content_digest: memoryContentDigest(divergent),
+      payload: {
+        ...(row.payload as Record<string, unknown>),
+        content: divergent,
+        contentDigest: memoryContentDigest(divergent),
+      },
+    })),
   );
 
-  const result = await store({ readBack: shadowReadPool }).correct({
+  const result = await store({ readBack: diverge }).correct({
     actor: SCOPE,
     authorizationId: receipt.authorizationId,
     recordId: RECORD_ID,
@@ -1395,9 +1425,11 @@ test("a read-back that finds nothing reports UNKNOWN, never success", async () =
       proposedContent: next,
     }),
   );
-  // The shadow relation is empty: the commit landed in public, the read-back
-  // looks somewhere that has no row at all.
-  const result = await store({ readBack: shadowReadPool }).correct({
+  // The read-back is handed NO ROWS. The commit really landed; what the
+  // read-back gets back is empty, which is the fault under test — a store that
+  // treated "nothing came back" as agreement would report success for a
+  // mutation it never confirmed.
+  const result = await store({ readBack: divergingReadPool(readPool, () => []) }).correct({
     actor: SCOPE,
     authorizationId: receipt.authorizationId,
     recordId: RECORD_ID,
@@ -2007,28 +2039,29 @@ test("a read-back whose CONTENT matches but whose post-state does not is UNKNOWN
       proposedContent: next,
     }),
   );
-  // The shadow head carries EXACTLY the authorized content, so the digest
-  // comparison is satisfied — and sits at version 9 with a predecessor that
-  // was never the head. Only the post-state comparison can catch this.
+  // The observed head carries EXACTLY the authorized content, so the digest
+  // comparison ahead of this one is satisfied — and sits at version 9 with a
+  // predecessor that was never the head. Only the post-state comparison can
+  // catch it. The payload mirrors every column because the store's own
+  // `headFromRow` binding check runs first and would otherwise reject the row
+  // for the wrong reason.
   const nextDigest = memoryContentDigest(next);
   const bogusPredecessor = `sha256:${"7".repeat(64)}`;
-  await adminPool.query(
-    `INSERT INTO ${SHADOW_SCHEMA}.memory_record_versions
-       (tenant_id, workspace_id, principal_id, user_id, record_id, version,
-        state, content_digest, predecessor_digest, authorization_id,
-        mutation_receipt_id, payload)
-     VALUES ($1,$2,$3,$4,$5,9,'active',$6,$7,$8,$9,$10)`,
-    [
-      SCOPE.tenantId,
-      SCOPE.workspaceId,
-      SCOPE.principalId,
-      SCOPE.userId,
-      RECORD_ID,
-      nextDigest,
-      bogusPredecessor,
-      receipt.authorizationId,
-      "mutation.poststate.1",
-      JSON.stringify({
+  const observed = divergingReadPool(readPool, () => [
+    {
+      id: 999_999,
+      tenant_id: SCOPE.tenantId,
+      workspace_id: SCOPE.workspaceId,
+      principal_id: SCOPE.principalId,
+      user_id: SCOPE.userId,
+      record_id: RECORD_ID,
+      version: 9,
+      state: "active",
+      content_digest: nextDigest,
+      predecessor_digest: bogusPredecessor,
+      authorization_id: receipt.authorizationId,
+      mutation_receipt_id: "mutation.poststate.1",
+      payload: {
         schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
         recordId: RECORD_ID,
         version: 9,
@@ -2040,11 +2073,11 @@ test("a read-back whose CONTENT matches but whose post-state does not is UNKNOWN
         authorizationId: receipt.authorizationId,
         mutationReceiptId: "mutation.poststate.1",
         createdAt: isoOffset(0),
-      }),
-    ],
-  );
+      },
+    },
+  ]);
 
-  const result = await store({ readBack: shadowReadPool }).correct({
+  const result = await store({ readBack: observed }).correct({
     actor: SCOPE,
     authorizationId: receipt.authorizationId,
     recordId: RECORD_ID,
@@ -2060,25 +2093,29 @@ test("a read-back whose CONTENT matches but whose post-state does not is UNKNOWN
 });
 
 test("a row whose columns disagree with its payload is refused, not reconciled", async () => {
-  // Migration 023's CHECK constraints make this unrepresentable in `public`.
-  // Against a relation without them it is trivially representable, which is
-  // the case the application-level binding check exists for.
-  await adminPool.query(
-    `INSERT INTO ${UNCHECKED_SCHEMA}.memory_record_versions
-       (tenant_id, workspace_id, principal_id, user_id, record_id, version,
-        state, content_digest, predecessor_digest, authorization_id,
-        mutation_receipt_id, payload)
-     VALUES ($1,$2,$3,$4,$5,1,'active',$6,NULL,$7,$8,$9)`,
-    [
-      SCOPE.tenantId,
-      SCOPE.workspaceId,
-      SCOPE.principalId,
-      SCOPE.userId,
-      RECORD_ID,
-      memoryContentDigest({ note: "original" }),
-      "genesis-000000000000000000000",
-      "mutation.genesis",
-      JSON.stringify({
+  // Migration 023's CHECK constraints make this UNREPRESENTABLE in `public`,
+  // which is why the fixture cannot build it in the database at all. It used to
+  // be built in a constraint-free shadow schema reached by search_path — the
+  // mechanism that turned out to be the vulnerability. The row is substituted
+  // at the read-back instead, which is the same fault at the same boundary:
+  // the database handed back a row whose columns and payload disagree, and the
+  // application-level binding check is what must catch it.
+  const digest = memoryContentDigest({ note: "original" });
+  const mismatched = divergingReadPool(readPool, () => [
+    {
+      id: 1,
+      tenant_id: SCOPE.tenantId,
+      workspace_id: SCOPE.workspaceId,
+      principal_id: SCOPE.principalId,
+      user_id: SCOPE.userId,
+      record_id: RECORD_ID,
+      version: 1,
+      state: "active",
+      content_digest: digest,
+      predecessor_digest: null,
+      authorization_id: "genesis-000000000000000000000",
+      mutation_receipt_id: "mutation.genesis",
+      payload: {
         schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
         recordId: RECORD_ID,
         // The payload claims version 7; the column says 1.
@@ -2086,18 +2123,18 @@ test("a row whose columns disagree with its payload is refused, not reconciled",
         state: "active",
         scope: SCOPE,
         content: { note: "original" },
-        contentDigest: memoryContentDigest({ note: "original" }),
+        contentDigest: digest,
         predecessorDigest: null,
         authorizationId: "genesis-000000000000000000000",
         mutationReceiptId: "mutation.genesis",
         createdAt: isoOffset(-120_000),
-      }),
-    ],
-  );
+      },
+    },
+  ]);
 
   await assert.rejects(
     () =>
-      createPostgresTrustedMemoryStore(writePool, uncheckedReadPool).readHead(
+      createPostgresTrustedMemoryStore(writePool, mismatched).readHead(
         SCOPE,
         RECORD_ID,
       ),
@@ -4325,6 +4362,46 @@ test("a genesis cannot cite an authorization id that no stored authorization car
 // ---------------------------------------------------------------------------
 
 /** The row the post-commit read-back will observe, in the unchecked schema. */
+/**
+ * The row the READ-BACK will be handed, set by `seedObservedHead`.
+ *
+ * These tests used to seed a real row into a constraint-free shadow schema and
+ * point a pool's `search_path` at it. That mechanism WAS the search_path
+ * vulnerability, so the row is substituted at the read-back instead — see
+ * `divergingReadPool`. Reset in `beforeEach`, so a test that seeds nothing
+ * gets the ordinary pool and the real row.
+ */
+let observedHeadRows: Array<Record<string, unknown>> | null = null;
+
+async function correctObserving(mutationReceiptId: string) {
+  const genesis = await seedGenesis({ note: "original" });
+  const next = { note: "corrected" };
+  const receipt = await issue(
+    authorization({
+      action: "correct",
+      expectedHead: headOf(1, genesis),
+      proposedContent: next,
+    }),
+  );
+  return {
+    genesis,
+    next,
+    run: () =>
+      createPostgresTrustedMemoryStore(
+        writePool,
+        observedHeadRows === null
+          ? readPool
+          : divergingReadPool(readPool, () => observedHeadRows as Array<Record<string, unknown>>),
+      ).correct({
+        actor: SCOPE,
+        authorizationId: receipt.authorizationId,
+        recordId: RECORD_ID,
+        proposedContent: next,
+        mutationReceiptId,
+      }),
+  };
+}
+
 async function seedObservedHead(overrides: {
   version?: number;
   state?: string;
@@ -4344,28 +4421,26 @@ async function seedObservedHead(overrides: {
   const contentDigest =
     overrides.contentDigest ?? memoryContentDigest(overrides.content);
   const predecessorDigest =
-    overrides.predecessorDigest === undefined
-      ? null
-      : overrides.predecessorDigest;
-  await adminPool.query(
-    `INSERT INTO ${UNCHECKED_SCHEMA}.memory_record_versions
-       (tenant_id, workspace_id, principal_id, user_id, record_id, version,
-        state, content_digest, predecessor_digest, authorization_id,
-        mutation_receipt_id, payload)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-    [
-      SCOPE.tenantId,
-      SCOPE.workspaceId,
-      SCOPE.principalId,
-      SCOPE.userId,
-      RECORD_ID,
+    overrides.predecessorDigest === undefined ? null : overrides.predecessorDigest;
+  // Exactly the columns `RECORD_COLUMNS` selects, so the store's own
+  // `headFromRow` and `MemoryRecordVersionSchema.parse` run unmodified against
+  // it — including the row/payload binding check, which is why the payload
+  // mirrors every column rather than being a stub.
+  observedHeadRows = [
+    {
+      id: 999_999,
+      tenant_id: SCOPE.tenantId,
+      workspace_id: SCOPE.workspaceId,
+      principal_id: scope.principalId,
+      user_id: scope.userId,
+      record_id: RECORD_ID,
       version,
       state,
-      contentDigest,
-      predecessorDigest,
-      "genesis-000000000000000000000",
-      "mutation.observed",
-      JSON.stringify({
+      content_digest: contentDigest,
+      predecessor_digest: predecessorDigest,
+      authorization_id: "genesis-000000000000000000000",
+      mutation_receipt_id: "mutation.observed",
+      payload: {
         schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
         recordId: RECORD_ID,
         version,
@@ -4376,35 +4451,10 @@ async function seedObservedHead(overrides: {
         predecessorDigest,
         authorizationId: "genesis-000000000000000000000",
         mutationReceiptId: "mutation.observed",
-        createdAt: isoOffset(-1_000),
-      }),
-    ],
-  );
-}
-
-/** Run a correction whose post-commit read-back lands on the unchecked schema. */
-async function correctObserving(mutationReceiptId: string) {
-  const genesis = await seedGenesis({ note: "original" });
-  const next = { note: "corrected" };
-  const receipt = await issue(
-    authorization({
-      action: "correct",
-      expectedHead: headOf(1, genesis),
-      proposedContent: next,
-    }),
-  );
-  return {
-    genesis,
-    next,
-    run: () =>
-      createPostgresTrustedMemoryStore(writePool, uncheckedReadPool).correct({
-        actor: SCOPE,
-        authorizationId: receipt.authorizationId,
-        recordId: RECORD_ID,
-        proposedContent: next,
-        mutationReceiptId,
-      }),
-  };
+        createdAt: isoOffset(0),
+      },
+    },
+  ];
 }
 
 test("postStateAgrees POSITIVE CONTROL: an observed head that agrees on every field reports verified", async () => {
