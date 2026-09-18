@@ -1838,3 +1838,40 @@ observable answer.
 Production: NOT CERTIFIED. Fortress: NOT CERTIFIED. Nothing pushed, merged or
 deployed. No gate may be re-run against `a9d203d`: remediation creates a new
 descendant, and every verdict above is bound to a tree that no longer exists.
+
+---
+
+## PENDING DELIVERABLE — CHECK-CONSTRAINT DROP-TEST AUDIT
+
+**Founder request, 2026-09-18. Gated on the suite reaching full green.**
+
+Report, from a **freshly migrated** database (not a database tests have run
+against — fixtures disable and re-enable triggers, so a used database is not a
+clean subject):
+
+1. the exact count of CHECK constraints in `pg_constraint` (`contype = 'c'`),
+   enumerated, not summarised;
+2. how many of those have a **drop-test**: a test that FAILS when that specific
+   constraint is dropped.
+
+The handoff asserts **67 untested**. An independent reader could not reproduce
+that number from source, so it is currently an unverified claim and must be
+treated as one until (1) and (2) are measured.
+
+**Method, and its cost, stated before it is run.** (2) is a constraint-level
+mutation sweep: for each constraint, drop it in a disposable database, run the
+suite (or a discriminating subset), and record whether anything fails. That is
+one run per constraint. At the current suite size this is hours of wall clock,
+not minutes, and it must run in a disposable worktree and database — never
+against the implementation database, whose constraints are what the rest of the
+suite relies on.
+
+**Why the number matters rather than being bookkeeping.** This round produced
+three separate findings where a database constraint was the ONLY thing holding
+an invariant while the application layer got the credit: the
+`..._resolution_named` CHECK from migration 055 (which falsified this register's
+own published proof about M-47/M-55), the `..._independent_verifier` CHECK
+behind the dead self-verification pre-check, and migration 023's CHECKs that
+make a column/payload mismatch unrepresentable. A CHECK with no drop-test is an
+invariant nobody has confirmed is load-bearing — and this register has now been
+wrong in both directions about exactly that.
