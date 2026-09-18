@@ -5228,16 +5228,30 @@ test("K-07: the pinned path is a CONSTANT — nothing from the session can influ
       await enterMemoryRole(client, "aaliyah_memory_reader");
       const after = (await client.query(`SELECT current_setting('search_path') AS p`)).rows[0].p as string;
 
-      // THE WHOLE ASSERTION: a constant, whatever the session asked for.
+      // ---- SPECIFIC FIRST, CATCH-ALL LAST -----------------------------
+      //
+      // These four ran AFTER an exact-equality assertion once, which meant
+      // none of them could ever report: the equality always failed first, so a
+      // destroyer run showed `strictEqual` for all four protections and named
+      // none of them. Assertions that cannot execute are not assertions — the
+      // same masking pattern this register keeps recording, in the test
+      // written to prove the fix for it.
+      //
+      // Ordered so each protection fails its OWN named assertion, and the
+      // equality remains as the backstop for anything these four miss.
+      assert.notEqual(
+        after,
+        before,
+        "the pin never ran: the path is still whatever the session supplied",
+      );
+      assert.doesNotMatch(after, /\$user/i, "$user survived in some casing");
+      assert.doesNotMatch(after, /operator_choice/, "a session-chosen schema survived");
+      assert.match(after, /, pg_temp$/, "pg_temp is not last");
       assert.equal(
         after,
         "pg_catalog, public, pg_temp",
         `the session influenced the pinned path: ${after}`,
       );
-      // Stated individually too, so a failure says WHICH property broke.
-      assert.doesNotMatch(after, /\$user/i, "$user survived in some casing");
-      assert.doesNotMatch(after, /operator_choice/, "a session-chosen schema survived");
-      assert.match(after, /, pg_temp$/, "pg_temp is not last");
 
       await client.query("ROLLBACK");
       // SET LOCAL: nothing leaked onto the pooled connection.
@@ -5293,6 +5307,10 @@ test("K-07b: a role's OWN persistent search_path cannot reach this store's name 
         await client.query("BEGIN");
         await enterMemoryRole(client, "aaliyah_memory_reader");
         const after = (await client.query(`SELECT current_setting('search_path') AS p`)).rows[0].p as string;
+        // Specific before catch-all, for the same reason as K-07.
+        assert.notEqual(after, inherited, "the pin never ran on a role-poisoned session");
+        assert.doesNotMatch(after, /operator_choice/, "the role's own schema reached the store");
+        assert.match(after, /, pg_temp$/, "pg_temp is not last");
         assert.equal(after, "pg_catalog, public, pg_temp", `a role-level path reached the store: ${after}`);
         await client.query("ROLLBACK");
       } finally {
