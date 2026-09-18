@@ -417,7 +417,10 @@ export const EVIDENCED_AUDIT_LIMIT = 50;
 
 /** A provider call this process stopped waiting for. */
 export class ProviderDeadlineExceeded extends Error {
-  constructor(readonly label: string, readonly deadlineMs: number) {
+  constructor(
+    readonly label: string,
+    readonly deadlineMs: number,
+  ) {
     super(`memory PII key provider: ${label} exceeded ${deadlineMs}ms`);
     this.name = "ProviderDeadlineExceeded";
   }
@@ -477,7 +480,8 @@ export function settlementEvidenceDigest(evidence: unknown): string {
  * depends on insertion order proves nothing twice.
  */
 function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (value === null || typeof value !== "object")
+    return JSON.stringify(value) ?? "null";
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   const entries = Object.entries(value as Record<string, unknown>)
     .filter(([, v]) => v !== undefined)
@@ -488,10 +492,7 @@ function canonicalJson(value: unknown): string {
 /** SQLSTATE `lock_not_available`: a `lock_timeout` expired. */
 const LOCK_NOT_AVAILABLE = "55P03";
 
-function assertRole(
-  name: string | null,
-  label: string,
-): string | null {
+function assertRole(name: string | null, label: string): string | null {
   if (name === null) return null;
   if (!ROLE_NAME.test(name)) {
     throw new Error(`trusted memory: ${label} is not a valid role identifier`);
@@ -545,14 +546,19 @@ export function createPostgresTrustedMemoryStore(
   const lockWaitMs = options.lockWaitMs ?? TRUSTED_MEMORY_LOCK_WAIT_MS;
   const piiKeys = options.piiKeys ?? null;
   const providerDeadlineMs = options.providerDeadlineMs ?? PROVIDER_DEADLINE_MS;
-  const evidencedAuditLimit = options.evidencedAuditLimit ?? EVIDENCED_AUDIT_LIMIT;
+  const evidencedAuditLimit =
+    options.evidencedAuditLimit ?? EVIDENCED_AUDIT_LIMIT;
   if (!Number.isSafeInteger(providerDeadlineMs) || providerDeadlineMs <= 0) {
-    throw new Error("trusted memory: providerDeadlineMs must be a positive integer");
+    throw new Error(
+      "trusted memory: providerDeadlineMs must be a positive integer",
+    );
   }
   if (!Number.isSafeInteger(evidencedAuditLimit) || evidencedAuditLimit <= 0) {
     // Zero would silence the audit entirely, which is how a forged
     // `key_destroyed` row stops being checked. Refused at construction.
-    throw new Error("trusted memory: evidencedAuditLimit must be a positive integer");
+    throw new Error(
+      "trusted memory: evidencedAuditLimit must be a positive integer",
+    );
   }
   if (!Number.isSafeInteger(lockWaitMs) || lockWaitMs <= 0) {
     // Zero is PostgreSQL's "wait forever". Refused at construction so it can
@@ -583,7 +589,9 @@ export function createPostgresTrustedMemoryStore(
       parsed.scope.tenantId !== row.tenant_id ||
       parsed.scope.workspaceId !== row.workspace_id
     ) {
-      throw new Error("trusted memory: record row and payload binding mismatch");
+      throw new Error(
+        "trusted memory: record row and payload binding mismatch",
+      );
     }
     return {
       recordId: parsed.recordId,
@@ -614,6 +622,7 @@ export function createPostgresTrustedMemoryStore(
     recordId: string,
   ): Promise<TrustedMemoryHead | null> {
     const client = await readBackPool.connect();
+    let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       await enterRole(client, readBackRole);
@@ -636,10 +645,11 @@ export function createPostgresTrustedMemoryStore(
       const row = result.rows[0] as RecordRow | undefined;
       return row ? headFromRow(row) : null;
     } catch (error) {
+      ambiguous = error;
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      releaseClient(client, ambiguous);
     }
   }
 
@@ -720,16 +730,18 @@ export function createPostgresTrustedMemoryStore(
   /** Append a terminal receipt on its own connection, under the mutation role. */
   async function appendTerminal(receipt: MemoryMutationReceipt): Promise<void> {
     const client = await pool.connect();
+    let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       await enterRole(client, mutationRole);
       await persistReceipt(client, receipt, "terminal");
       await client.query("COMMIT");
     } catch (error) {
+      ambiguous = error;
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      releaseClient(client, ambiguous);
     }
   }
 
@@ -742,7 +754,9 @@ export function createPostgresTrustedMemoryStore(
    * rule in each is three rules — and the one that drifts turns a refusal into
    * an unparseable receipt, which is the same as no evidence at all.
    */
-  function expectedHeadKindFor(action: MemoryAction): MemoryExpectedHead["kind"] {
+  function expectedHeadKindFor(
+    action: MemoryAction,
+  ): MemoryExpectedHead["kind"] {
     return action === "create" ? "no_prior_version" : "version";
   }
 
@@ -846,9 +860,12 @@ export function createPostgresTrustedMemoryStore(
     // An ATTEMPT, filed where attempts go — never as a terminal mutation
     // receipt under an id a later real mutation may carry. See
     // memoryMutationAttempts.ts.
-    await appendMutationAttempt({ pool, role: mutationRole, receipt, rejection }).catch(
-      () => undefined,
-    );
+    await appendMutationAttempt({
+      pool,
+      role: mutationRole,
+      receipt,
+      rejection,
+    }).catch(() => undefined);
   }
 
   async function abortResult(
@@ -884,9 +901,12 @@ export function createPostgresTrustedMemoryStore(
         abortReason: ABORT_REASON[rejection],
       },
     });
-    await appendMutationAttempt({ pool, role: mutationRole, receipt, rejection }).catch(
-      () => undefined,
-    );
+    await appendMutationAttempt({
+      pool,
+      role: mutationRole,
+      receipt,
+      rejection,
+    }).catch(() => undefined);
     return { verified: false, rejection, receipt };
   }
 
@@ -963,9 +983,12 @@ export function createPostgresTrustedMemoryStore(
     // The identity order and the counterparty it names, filled in only for the
     // two graph actions. Null everywhere else, so the edge write below cannot
     // fire for an action that never parsed one.
-    let identityEdge:
-      | { kind: MemoryIdentityEdgeKind; toRecordId: string; reason: string; evidenceRef: string }
-      | null = null;
+    let identityEdge: {
+      kind: MemoryIdentityEdgeKind;
+      toRecordId: string;
+      reason: string;
+      evidenceRef: string;
+    } | null = null;
 
     // ---- WHICH RECORDS THIS MUTATION MUST HOLD --------------------------
     // Every action holds the record it targets. A merge or split ALSO holds
@@ -1050,11 +1073,17 @@ export function createPostgresTrustedMemoryStore(
         if (isConnectionAmbiguous(error)) {
           return { verified: false, rejection: "record_busy", receipt: null };
         }
-        return { verified: false, rejection: "storage_rejected", receipt: null };
+        return {
+          verified: false,
+          rejection: "storage_rejected",
+          receipt: null,
+        };
       }
     }
 
     const client = await pool.connect();
+
+    let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       // BOUNDED. Found by the b3efc82 reliability review: with the record's
@@ -1605,7 +1634,10 @@ export function createPostgresTrustedMemoryStore(
                 counterparty.recordId,
               ],
             );
-            if ((hops.rows[0].hops as number) > MEMORY_CANONICAL_RESOLUTION_MAX_DEPTH) {
+            if (
+              (hops.rows[0].hops as number) >
+              MEMORY_CANONICAL_RESOLUTION_MAX_DEPTH
+            ) {
               throw new MutationAborted("identity_chain_too_deep");
             }
           }
@@ -1768,8 +1800,7 @@ export function createPostgresTrustedMemoryStore(
           ],
         );
         const heldRow = releasedHold.rows[0] as
-          | { hold_id: string; released_at: Date }
-          | undefined;
+          { hold_id: string; released_at: Date } | undefined;
 
         // Every obligation over this record has expired — the live ones
         // aborted above — so this is the latest one that ever bound it.
@@ -1809,8 +1840,7 @@ export function createPostgresTrustedMemoryStore(
               }
             : { state: "none" },
           destroyedFieldNames,
-          derivedData:
-            deletion?.derivedData ?? unknownDerivativeDispositions(),
+          derivedData: deletion?.derivedData ?? unknownDerivativeDispositions(),
           cacheIndexPropagation: deletion?.cacheIndexPropagation ?? "unknown",
           downstreamPropagation: deletion?.downstreamPropagation ?? [],
         });
@@ -1991,7 +2021,7 @@ export function createPostgresTrustedMemoryStore(
       // Released BEFORE any receipt is emitted. Emitting a receipt takes a
       // second connection, and holding two at once turns a small pool into a
       // self-deadlock under the concurrency this store exists to survive.
-      client.release();
+      releaseClient(client, ambiguous);
     }
 
     if (failure !== null) {
@@ -2042,6 +2072,7 @@ export function createPostgresTrustedMemoryStore(
     let readBackDigest: string;
     try {
       const readClient = await readBackPool.connect();
+      let ambiguous: unknown;
       try {
         await readClient.query("BEGIN");
         await enterRole(readClient, readBackRole);
@@ -2074,7 +2105,7 @@ export function createPostgresTrustedMemoryStore(
             )
           : "";
       } finally {
-        readClient.release();
+        releaseClient(readClient, ambiguous);
       }
     } catch {
       return await finishUnknown(
@@ -2235,6 +2266,7 @@ export function createPostgresTrustedMemoryStore(
   ): Promise<MemoryTombstone | null> {
     if (!MemoryIdSchema.safeParse(tombstoneId).success) return null;
     const client = await readBackPool.connect();
+    let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       await enterRole(client, readBackRole);
@@ -2260,10 +2292,11 @@ export function createPostgresTrustedMemoryStore(
       // "here is an accounting we could not validate".
       return parsed.success ? parsed.data : null;
     } catch (error) {
+      ambiguous = error;
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      releaseClient(client, ambiguous);
     }
   }
 
@@ -2284,6 +2317,7 @@ export function createPostgresTrustedMemoryStore(
   ): Promise<TrustedMemoryRecord | null> {
     if (!MemoryIdSchema.safeParse(recordId).success) return null;
     const client = await readBackPool.connect();
+    let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       await enterRole(client, readBackRole);
@@ -2314,10 +2348,11 @@ export function createPostgresTrustedMemoryStore(
         scope: head.scope,
       };
     } catch (error) {
+      ambiguous = error;
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      releaseClient(client, ambiguous);
     }
   }
 
@@ -2430,6 +2465,17 @@ export function createPostgresTrustedMemoryStore(
     notProvenReasons: Record<string, number>;
     /** In-scope committed erasures: the denominator. */
     erased: number;
+    /**
+     * OBLIGATIONS THIS PASS COULD NOT WRITE.
+     *
+     * Red team against a9d203d, HIGH: this number did not exist, and a batch
+     * that failed to record ANY obligation reported exactly the same counts as
+     * one that recorded them all. The obligation ledger is the operator's only
+     * route out of ERASURE_PENDING_SETTLEMENT, so a silent failure to write it
+     * strands a subject with no visible reason. Non-zero here means an
+     * operator must look, and `src/server.ts` logs it distinctly.
+     */
+    obligationsUnrecorded: number;
   };
 
   type InScopeKeyRow = {
@@ -2547,8 +2593,14 @@ export function createPostgresTrustedMemoryStore(
    * None of them is rounded up.
    */
   async function askProvider(
-    row: Pick<InScopeKeyRow, "tenant_id" | "workspace_id" | "key_ref" | "provider_id">,
-  ): Promise<{ proof: KeyDestructionProof; reason: KeyNotProvenReason | null }> {
+    row: Pick<
+      InScopeKeyRow,
+      "tenant_id" | "workspace_id" | "key_ref" | "provider_id"
+    >,
+  ): Promise<{
+    proof: KeyDestructionProof;
+    reason: KeyNotProvenReason | null;
+  }> {
     if (piiKeys === null) {
       // The production wiring today. Not an error, and not a destruction.
       return { proof: "NOT_PROVEN", reason: "NO_PROVIDER_CONFIGURED" };
@@ -2578,8 +2630,10 @@ export function createPostgresTrustedMemoryStore(
             : "PROVIDER_UNAVAILABLE",
       };
     }
-    if (state === "destroyed") return { proof: "PROVEN_DESTROYED", reason: null };
-    if (state === "active") return { proof: "PROVEN_NOT_DESTROYED", reason: null };
+    if (state === "destroyed")
+      return { proof: "PROVEN_DESTROYED", reason: null };
+    if (state === "active")
+      return { proof: "PROVEN_NOT_DESTROYED", reason: null };
     // `unknown` is the provider saying it cannot answer. It is NOT "gone".
     return { proof: "NOT_PROVEN", reason: "PROVIDER_ANSWERED_UNKNOWN" };
   }
@@ -2607,7 +2661,11 @@ export function createPostgresTrustedMemoryStore(
     `${tenantId}\u0000${workspaceId}\u0000${keyRef}`;
 
   async function settlementProven(
-    keys: ReadonlyArray<{ tenantId: string; workspaceId: string; keyRef: string }>,
+    keys: ReadonlyArray<{
+      tenantId: string;
+      workspaceId: string;
+      keyRef: string;
+    }>,
   ): Promise<Map<string, { receiptId: string; sound: boolean }>> {
     const proven = new Map<string, { receiptId: string; sound: boolean }>();
     if (keys.length === 0) return proven;
@@ -2659,7 +2717,8 @@ export function createPostgresTrustedMemoryStore(
         evidence: unknown;
         evidence_digest: string;
       }>) {
-        const sound = settlementEvidenceDigest(row.evidence) === row.evidence_digest;
+        const sound =
+          settlementEvidenceDigest(row.evidence) === row.evidence_digest;
         const mapKey = scopedKey(row.tenant_id, row.workspace_id, row.key_ref);
         const already = proven.get(mapKey);
         // One unsound settlement taints the key: we do not go looking for a
@@ -2732,7 +2791,8 @@ export function createPostgresTrustedMemoryStore(
     >();
     for (const row of rows) {
       // One question per distinct key, however many bindings name it.
-      if (!answers.has(row.key_ref)) answers.set(row.key_ref, await askProvider(row));
+      if (!answers.has(row.key_ref))
+        answers.set(row.key_ref, await askProvider(row));
     }
     const unproven = [...answers.entries()]
       .filter(([, answer]) => answer.proof === "NOT_PROVEN")
@@ -2760,7 +2820,12 @@ export function createPostgresTrustedMemoryStore(
         subjectRecordId: row.subject_record_id,
       };
       if (answer.proof === "PROVEN_DESTROYED") {
-        return { ...base, proof: answer.proof, notProvenReason: null, provenBySettlement: false };
+        return {
+          ...base,
+          proof: answer.proof,
+          notProvenReason: null,
+          provenBySettlement: false,
+        };
       }
       if (answer.proof === "PROVEN_NOT_DESTROYED") {
         // The provider says the key is ALIVE. Where the database claimed
@@ -2769,7 +2834,9 @@ export function createPostgresTrustedMemoryStore(
         return {
           ...base,
           proof: answer.proof,
-          notProvenReason: row.evidenced ? ("CONTRADICTORY_EVIDENCE" as const) : null,
+          notProvenReason: row.evidenced
+            ? ("CONTRADICTORY_EVIDENCE" as const)
+            : null,
           provenBySettlement: false,
         };
       }
@@ -2801,21 +2868,48 @@ export function createPostgresTrustedMemoryStore(
    * by the time this runs, and failing to write the bookkeeping must not turn
    * a clean refusal into an error that looks like something else.
    */
+  /**
+   * THE LEDGER IS PER-ROW, AND ITS FAILURES ARE COUNTED.
+   *
+   * Red team against a9d203d, HIGH: every obligation in a batch used to share
+   * one transaction and one silent catch. Delete the
+   * `WHERE ... settled_by IS NULL` guard on the upsert and a SETTLED row's
+   * refusal — raised by 055's `..._resolution_named` CHECK, and now also by
+   * 058's trigger — aborted the WHOLE batch, rolled back every other key's
+   * obligation, and reported nothing: the reviewer observed identical
+   * `{pending:2, notProven:2}` counts with a second key's obligation present
+   * in one run and absent in the other. The obligation ledger is the
+   * operator's only route out of ERASURE_PENDING_SETTLEMENT, so losing it
+   * silently is the worst available failure.
+   *
+   * Two changes, each falsifiable on its own:
+   *   - a SAVEPOINT per row, so one row's refusal cannot take the batch with
+   *     it (held by the test that fails one row deliberately);
+   *   - a returned `failed` count, so a refusal is VISIBLE (held by the test
+   *     that asserts it is zero on the ordinary path — which is what makes the
+   *     `settled_by IS NULL` guard itself falsifiable again).
+   */
   async function recordObligations(
     assessments: readonly KeyDestructionAssessment[],
-  ): Promise<void> {
+  ): Promise<{ recorded: number; failed: number }> {
     const unresolved = assessments.filter(
-      (a) => a.proof === "NOT_PROVEN" || a.notProvenReason === "CONTRADICTORY_EVIDENCE",
+      (a) =>
+        a.proof === "NOT_PROVEN" ||
+        a.notProvenReason === "CONTRADICTORY_EVIDENCE",
     );
-    if (unresolved.length === 0) return;
+    if (unresolved.length === 0) return { recorded: 0, failed: 0 };
     const client = await pool.connect();
     let ambiguous: unknown;
+    let recorded = 0;
+    let failed = 0;
     try {
       await client.query("BEGIN");
       await enterRole(client, mutationRole);
       for (const a of unresolved) {
-        await client.query(
-          `INSERT INTO public.memory_key_destruction_obligations
+        await client.query("SAVEPOINT obligation");
+        try {
+          await client.query(
+            `INSERT INTO public.memory_key_destruction_obligations
              (tenant_id, workspace_id, subject_record_id, alias_id, key_ref,
               provider_id, binding_mutation_receipt_id, erasure_tombstone_id,
               state, not_proven_reason)
@@ -2825,27 +2919,41 @@ export function createPostgresTrustedMemoryStore(
                   last_observed_at = now(),
                   not_proven_reason = EXCLUDED.not_proven_reason
             WHERE public.memory_key_destruction_obligations.settled_by IS NULL`,
-          [
-            a.tenantId,
-            a.workspaceId,
-            a.subjectRecordId,
-            a.aliasId,
-            a.keyRef,
-            a.providerId,
-            a.bindingMutationReceiptId,
-            a.tombstoneId,
-            a.notProvenReason ?? "PROVIDER_ANSWERED_UNKNOWN",
-          ],
-        );
+            [
+              a.tenantId,
+              a.workspaceId,
+              a.subjectRecordId,
+              a.aliasId,
+              a.keyRef,
+              a.providerId,
+              a.bindingMutationReceiptId,
+              a.tombstoneId,
+              a.notProvenReason ?? "PROVIDER_ANSWERED_UNKNOWN",
+            ],
+          );
+          await client.query("RELEASE SAVEPOINT obligation");
+          recorded += 1;
+        } catch (error) {
+          // An AMBIGUOUS connection cannot be rolled back to a savepoint and
+          // must not be spoken to again — that is a batch-level failure and it
+          // propagates. Anything else is THIS row's problem, and the rest of
+          // the batch still has a ledger to write.
+          if (isConnectionAmbiguous(error)) throw error;
+          await client.query("ROLLBACK TO SAVEPOINT obligation");
+          failed += 1;
+        }
       }
       await client.query("COMMIT");
     } catch (error) {
       ambiguous = error;
       await client.query("ROLLBACK").catch(() => undefined);
+      failed = unresolved.length;
+      recorded = 0;
       if (isConnectionAmbiguous(error)) throw error;
     } finally {
       releaseClient(client, ambiguous);
     }
+    return { recorded, failed };
   }
 
   /**
@@ -2962,9 +3070,16 @@ export function createPostgresTrustedMemoryStore(
           // Every provider's evidence, not only this one's: a key this store
           // cannot ask about stays counted rather than disappearing (security
           // review of 03581a3, F2).
-          [filter.tenantId ?? null, filter.workspaceId ?? null, evidencedAuditLimit],
+          [
+            filter.tenantId ?? null,
+            filter.workspaceId ?? null,
+            evidencedAuditLimit,
+          ],
         );
-        due = [...(found.rows as DueKeyRow[]), ...(evidenced.rows as DueKeyRow[])];
+        due = [
+          ...(found.rows as DueKeyRow[]),
+          ...(evidenced.rows as DueKeyRow[]),
+        ];
       }
       await client.query("COMMIT");
     } catch (error) {
@@ -3017,7 +3132,9 @@ export function createPostgresTrustedMemoryStore(
     // settlement came to answer for another's key (security review of
     // 86d33c9, HIGH).
     const unaskable = due
-      .filter((row) => piiKeys === null || row.provider_id !== piiKeys.providerId)
+      .filter(
+        (row) => piiKeys === null || row.provider_id !== piiKeys.providerId,
+      )
       .map((row) => ({
         tenantId: row.tenant_id,
         workspaceId: row.workspace_id,
@@ -3068,7 +3185,10 @@ export function createPostgresTrustedMemoryStore(
         if (claimed.proof === "NOT_PROVEN") {
           audits.push({
             row,
-            state: claimed.reason === "PROVIDER_ANSWERED_UNKNOWN" ? "unknown" : "unreachable",
+            state:
+              claimed.reason === "PROVIDER_ANSWERED_UNKNOWN"
+                ? "unknown"
+                : "unreachable",
           });
           countNotProven(row, claimed.reason ?? "PROVIDER_ANSWERED_UNKNOWN");
           continue;
@@ -3108,7 +3228,9 @@ export function createPostgresTrustedMemoryStore(
           if (!row.evidenced) {
             countNotProven(
               row,
-              state === "unknown" ? "PROVIDER_ANSWERED_UNKNOWN" : "CONTRADICTORY_EVIDENCE",
+              state === "unknown"
+                ? "PROVIDER_ANSWERED_UNKNOWN"
+                : "CONTRADICTORY_EVIDENCE",
             );
           }
           continue;
@@ -3126,6 +3248,7 @@ export function createPostgresTrustedMemoryStore(
         continue;
       }
       const writer = await pool.connect();
+      let ambiguous: unknown;
       let writerAmbiguous: unknown;
       try {
         await writer.query("BEGIN");
@@ -3167,7 +3290,10 @@ export function createPostgresTrustedMemoryStore(
     }
 
     await recordAudits(audits).catch(() => undefined);
-    await recordObligations(unresolved).catch(() => undefined);
+    const ledger = await recordObligations(unresolved).catch(() => ({
+      recorded: 0,
+      failed: unresolved.length,
+    }));
     // A key the provider has now confirmed destroyed closes its own
     // obligation. Without this, every transient outage would leave a row open
     // forever and an operator could not tell a genuinely unresolved key from
@@ -3182,6 +3308,7 @@ export function createPostgresTrustedMemoryStore(
       notProven,
       notProvenReasons,
       erased,
+      obligationsUnrecorded: ledger.failed,
     };
   }
 
@@ -3284,9 +3411,12 @@ export function createPostgresTrustedMemoryStore(
     request: TrustedMemoryDeleteRequest,
   ): Promise<TrustedMemoryDeleteResult> {
     const result = await mutate("delete", request, request);
-    if (!result.verified) return { ...result, tombstone: null, aliasErasure: null };
+    if (!result.verified)
+      return { ...result, tombstone: null, aliasErasure: null };
     const tombstoneId = request.tombstoneId ?? request.mutationReceiptId;
-    const tombstone = await readTombstone(request.actor, tombstoneId).catch(() => null);
+    const tombstone = await readTombstone(request.actor, tombstoneId).catch(
+      () => null,
+    );
     // ---- SCOPED TO THE SUBJECT, NOT TO THIS TOMBSTONE -----------------
     // Red team B1, HIGH, executed (K-03). Scoped to `tombstoneId`, a second
     // subject erasure after a `restore` found an EMPTY denominator — the alias
@@ -3316,8 +3446,13 @@ export function createPostgresTrustedMemoryStore(
             keysPending: keys.pending,
             keysNotProven: keys.notProven,
             notProvenReasons: keys.notProvenReasons,
+            obligationsUnrecorded: keys.obligationsUnrecorded,
           };
-    if (tombstone === null || aliasErasure === null || aliasErasure.keysPending > 0) {
+    if (
+      tombstone === null ||
+      aliasErasure === null ||
+      aliasErasure.keysPending > 0
+    ) {
       return {
         verified: false,
         // A key whose destruction cannot be PROVEN is a different state from a
@@ -3382,7 +3517,9 @@ export function createPostgresTrustedMemoryStore(
     request: KeyDestructionSettlementRequest,
   ): Promise<KeyDestructionSettlementResult> {
     const text = (value: unknown): boolean =>
-      typeof value === "string" && value.trim().length > 0 && value.length <= 200;
+      typeof value === "string" &&
+      value.trim().length > 0 &&
+      value.length <= 200;
     if (
       !text(request.settlementReceiptId) ||
       !text(request.tenantId) ||
@@ -3406,15 +3543,73 @@ export function createPostgresTrustedMemoryStore(
     ) {
       return { recorded: false, rejection: "settlement_malformed" };
     }
-    // Refused here as well as by the database, so the rejection a caller sees
-    // names the actual problem instead of a constraint name.
-    if (request.settlementAuthorityId === request.verifierPrincipalId) {
-      return { recorded: false, rejection: "settlement_self_verified" };
+    // ---- NO PRE-CHECK FOR SELF-VERIFICATION, DELIBERATELY --------------
+    //
+    // There used to be one here:
+    //
+    //     if (request.settlementAuthorityId === request.verifierPrincipalId)
+    //       return { recorded: false, rejection: "settlement_self_verified" };
+    //
+    // The test-falsifiability review of a9d203d proved it DEAD: disabling it
+    // alone left 124/124 passing, S-4 included — the test that claims this is
+    // checked "in the store AND in the database... so the store's check is an
+    // answer and not the enforcement". The catch below remaps the database's
+    // own `..._independent_verifier` CHECK violation to the SAME rejection
+    // value, so removing the pre-check changed nothing observable. Its stated
+    // justification — "so the caller sees the actual problem instead of a
+    // constraint name" — was already being delivered by that remapping.
+    //
+    // Sixth instance of this project's standing defect: two layers over one
+    // invariant, arranged so neither is individually falsifiable. Removed
+    // rather than wrapped in a new test, because with it gone the two
+    // remaining layers are each held by one half of S-4 — the DATABASE CHECK
+    // by the raw insert, and the TRANSLATION by the store call, which can now
+    // only return `settlement_self_verified` by way of the mapper.
+    // ---- THE PROVIDER'S OWN ANSWER WINS -------------------------------
+    //
+    // Security review of a9d203d, HIGH, executed: this function never asked
+    // the provider ANYTHING. A settlement claiming destruction was accepted
+    // over a key whose provider was available, owned the key and reported it
+    // `active`, and the acceptance then flipped
+    // `aaliyah_memory_unerased_merged_records` from refuse to ACCEPT — so a
+    // survivor erasure completed with the key alive. Migration 055's comment
+    // already asserted the rule ("the provider's own answer always wins, and
+    // a settlement stands in only where the provider structurally cannot
+    // answer"); this is the first code that makes it true.
+    //
+    // ONLY a decision that would SATISFY erasure is gated. The other six
+    // outcomes — including PROVEN_NOT_DESTROYED, which is an operator AGREEING
+    // with the provider — record a fact about an unresolved key and must stay
+    // recordable whatever the provider says.
+    //
+    // Asked with NO transaction open and no client held: a metered provider
+    // call inside an open transaction is the pool-exhaustion defect priority
+    // THREE names, and this function goes on to take a connection below.
+    if (request.decision === SETTLEMENT_DECISION_THAT_SATISFIES) {
+      const live = await askProvider({
+        tenant_id: request.tenantId,
+        workspace_id: request.workspaceId,
+        key_ref: request.keyRef,
+        provider_id: request.providerId,
+      });
+      if (live.proof === "PROVEN_NOT_DESTROYED") {
+        // The provider can answer and the key is ALIVE. A settlement claiming
+        // otherwise is the fabricated provider evidence the founder's
+        // decision forbids by name.
+        return {
+          recorded: false,
+          rejection: "settlement_contradicted_by_provider",
+        };
+      }
+      // PROVEN_DESTROYED (the provider agrees) and every NOT_PROVEN reason —
+      // no provider configured, not the owner, unavailable, timed out,
+      // answered unknown — all leave the settlement admissible. That set is
+      // exactly "the provider could not answer", plus the case where it
+      // answered and agreed.
     }
     const evidenceDigest = settlementEvidenceDigest(request.evidence);
     const satisfies = request.decision === SETTLEMENT_DECISION_THAT_SATISFIES;
-    const resolves =
-      satisfies || request.decision === "PROVEN_NOT_DESTROYED";
+    const resolves = satisfies || request.decision === "PROVEN_NOT_DESTROYED";
     const successorState = satisfies
       ? "PROVEN_DESTROYED"
       : request.decision === "PROVEN_NOT_DESTROYED"
@@ -3430,25 +3625,65 @@ export function createPostgresTrustedMemoryStore(
       // Replaying a settlement must be free. Repointing a receipt id at a
       // DIFFERENT decision must not be, because a receipt that can mean two
       // things is not a receipt.
+      // ---- A REPLAY IS THE SAME REQUEST, ALL OF IT ---------------------
+      //
+      // Security review of a9d203d, HIGH: this compared SEVEN columns —
+      // key_ref, provider_id, decision, evidence_digest, authority, verifier,
+      // nonce — and none of tenant, workspace, subject, alias, key version,
+      // binding receipt, authorization or tombstone. The comparison returns
+      // BEFORE the insert, so `scope_unique` (which this file's own header
+      // calls "the whole of action-specific") and
+      // `aaliyah_memory_settlement_binds_real_key()` are both skipped.
+      // Observed:
+      //
+      //   SAME receipt id, different scope/authorization/tombstone/subject
+      //     -> {recorded:true, replay:true}
+      //   SAME receipt id under ANOTHER TENANT
+      //     -> {recorded:true, replay:true}
+      //   rows actually stored: 1, bound to the ORIGINAL scope
+      //
+      // So a caller learned "recorded" for a settlement that was never
+      // recorded for the scope it named, and the reviewer's negative control
+      // (an unused receipt id with the same forged fields) proves the receipt
+      // id was the whole of it.
+      //
+      // Every bound field is compared now, by selecting them all. Listing the
+      // columns rather than digesting the request is deliberate: a digest
+      // would have to be stored, and a stored digest computed by the same code
+      // that compares it proves only that the code is consistent with itself.
       const existing = await client.query(
-        `SELECT key_ref, provider_id, decision, evidence_digest,
-                settlement_authority_id, verifier_principal_id, nonce
+        `SELECT tenant_id, workspace_id, subject_record_id, alias_id, key_ref,
+                key_version, provider_id, binding_mutation_receipt_id,
+                erasure_authorization_id, erasure_tombstone_id,
+                destruction_attempt_id, decision, evidence_digest,
+                settlement_authority_id, verifier_principal_id, nonce,
+                policy_version
            FROM public.memory_key_destruction_settlements
           WHERE settlement_receipt_id = $1
           LIMIT 1`,
         [request.settlementReceiptId],
       );
       if (existing.rowCount === 1) {
-        const row = existing.rows[0] as Record<string, string>;
+        const row = existing.rows[0] as Record<string, unknown>;
         await client.query("COMMIT");
         const same =
+          row.tenant_id === request.tenantId &&
+          row.workspace_id === request.workspaceId &&
+          row.subject_record_id === request.subjectRecordId &&
+          row.alias_id === request.aliasId &&
           row.key_ref === request.keyRef &&
+          Number(row.key_version) === request.keyVersion &&
           row.provider_id === request.providerId &&
+          row.binding_mutation_receipt_id === request.bindingMutationReceiptId &&
+          row.erasure_authorization_id === request.erasureAuthorizationId &&
+          row.erasure_tombstone_id === request.erasureTombstoneId &&
+          row.destruction_attempt_id === request.destructionAttemptId &&
           row.decision === request.decision &&
           row.evidence_digest === evidenceDigest &&
           row.settlement_authority_id === request.settlementAuthorityId &&
           row.verifier_principal_id === request.verifierPrincipalId &&
-          row.nonce === request.nonce;
+          row.nonce === request.nonce &&
+          row.policy_version === KEY_DESTRUCTION_POLICY_VERSION;
         return same
           ? { recorded: true, replay: true, evidenceDigest }
           : { recorded: false, rejection: "settlement_receipt_conflict" };
@@ -3563,6 +3798,17 @@ export function createPostgresTrustedMemoryStore(
         if (constraint.endsWith("independent_verifier")) {
           return { recorded: false, rejection: "settlement_self_verified" };
         }
+        if (constraint.endsWith("evidence_bound")) {
+          // Red team against a9d203d, HIGH: `evidence: null` was accepted and
+          // a subject reported ERASED over a live key. Migration 059 is the
+          // enforcement; this is the translation, and it is the ONLY way this
+          // rejection can be produced — there is deliberately no store-side
+          // pre-check to mask it.
+          return {
+            recorded: false,
+            rejection: "settlement_evidence_insufficient",
+          };
+        }
         if (constraint !== "" && !constraint.endsWith("digest_shape")) {
           return { recorded: false, rejection: "settlement_malformed" };
         }
@@ -3612,14 +3858,17 @@ export function createPostgresTrustedMemoryStore(
         aliasId: row.alias_id as unknown as string,
         keyRef: row.key_ref as unknown as string,
         providerId: row.provider_id as unknown as string,
-        bindingMutationReceiptId: row.binding_mutation_receipt_id as unknown as string,
+        bindingMutationReceiptId:
+          row.binding_mutation_receipt_id as unknown as string,
         erasureTombstoneId: row.erasure_tombstone_id as unknown as string,
         state: row.state as unknown as KeyDestructionObligation["state"],
         notProvenReason: row.not_proven_reason as unknown as KeyNotProvenReason,
         observations: row.observations as unknown as number,
         firstObservedAt: row.first_observed_at as unknown as Date,
         lastObservedAt: row.last_observed_at as unknown as Date,
-        resolvedBy: (row.resolved_by as unknown as KeyDestructionObligation["resolvedBy"]) ?? null,
+        resolvedBy:
+          (row.resolved_by as unknown as KeyDestructionObligation["resolvedBy"]) ??
+          null,
         settledBy: (row.settled_by as unknown as string | null) ?? null,
       }));
     } catch (error) {
@@ -3644,6 +3893,7 @@ export function createPostgresTrustedMemoryStore(
         pending: done.pending,
         notProven: done.notProven,
         notProvenReasons: done.notProvenReasons,
+        obligationsUnrecorded: done.obligationsUnrecorded,
       };
     },
     restore: (request) => mutate("restore", request),

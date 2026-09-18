@@ -1,5 +1,5 @@
 import type { MemoryMutationReceipt } from "@aaliyah/contracts/v1";
-import { enterMemoryRole } from "./pool";
+import { enterMemoryRole, releaseClient } from "./pool";
 import type { Pool } from "pg";
 
 /**
@@ -34,6 +34,7 @@ export async function appendMutationAttempt(input: {
     throw new Error("memory attempts: only an aborted outcome is an attempt");
   }
   const client = await input.pool.connect();
+  let ambiguous: unknown;
   try {
     await client.query("BEGIN");
     if (input.role !== null) {
@@ -67,9 +68,10 @@ export async function appendMutationAttempt(input: {
     );
     await client.query("COMMIT");
   } catch (error) {
+    ambiguous = error;
     await client.query("ROLLBACK").catch(() => undefined);
     throw error;
   } finally {
-    client.release();
+    releaseClient(client, ambiguous);
   }
 }

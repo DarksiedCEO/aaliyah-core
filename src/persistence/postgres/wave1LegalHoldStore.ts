@@ -5,7 +5,7 @@ import {
   type MemoryAction,
 } from "@aaliyah/contracts/v1";
 import type { Pool, PoolClient } from "pg";
-import { enterMemoryRole } from "./pool";
+import { enterMemoryRole, releaseClient } from "./pool";
 
 import {
   MemoryRetentionObligationSchema,
@@ -119,6 +119,7 @@ export function createPostgresLegalHoldStore(
     run: (client: PoolClient) => Promise<T>,
   ): Promise<T> {
     const client = await pool.connect();
+    let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       await enterRole(client, holdRole);
@@ -126,10 +127,11 @@ export function createPostgresLegalHoldStore(
       await client.query("COMMIT");
       return value;
     } catch (error) {
+      ambiguous = error;
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      releaseClient(client, ambiguous);
     }
   }
 
@@ -372,6 +374,7 @@ export function createPostgresLegalHoldStore(
     holdId: string,
   ): Promise<LegalHoldView | null> {
     const client = await readPool.connect();
+    let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       await enterRole(client, readRole);
@@ -425,10 +428,11 @@ export function createPostgresLegalHoldStore(
         ),
       };
     } catch (error) {
+      ambiguous = error;
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      releaseClient(client, ambiguous);
     }
   }
 
@@ -438,6 +442,7 @@ export function createPostgresLegalHoldStore(
     action: MemoryAction,
   ): Promise<string | null> {
     const client = await readPool.connect();
+    let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       await enterRole(client, readRole);
@@ -449,10 +454,11 @@ export function createPostgresLegalHoldStore(
       await client.query("COMMIT");
       return (result.rows[0]?.hold_id as string | null) ?? null;
     } catch (error) {
+      ambiguous = error;
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      releaseClient(client, ambiguous);
     }
   }
 

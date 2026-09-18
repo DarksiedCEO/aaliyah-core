@@ -208,6 +208,38 @@ export const KEY_DESTRUCTION_SETTLEMENT_REJECTIONS = [
   "settlement_not_evidence_bound",
   /** A settlement already resolved this key for this erasure request. */
   "settlement_already_resolved",
+  /**
+   * THE EVIDENCE IS NOT EVIDENCE.
+   *
+   * The founder's decision requires a settlement to be evidence-bound and
+   * forbids a settlement authority from fabricating provider evidence. Until
+   * the a9d203d red team, `evidence` was typed `unknown` and validated
+   * NOWHERE — not by the store, and not by the database, where
+   * `evidence jsonb NOT NULL` accepts the jsonb value `null` because JSON null
+   * is a value. `evidence: null` was accepted, digested to sha256("null"),
+   * counted as a sound settlement, wrote destruction evidence, and returned
+   * `verified: true` for a subject whose key the provider still reported as
+   * ACTIVE. No forgery and no privilege abuse: the documented path.
+   */
+  "settlement_evidence_insufficient",
+  /**
+   * THE PROVIDER CAN ANSWER, AND IT SAYS THE KEY IS ALIVE.
+   *
+   * Security review of a9d203d, HIGH: `settleKeyDestruction` never asked the
+   * provider anything. A settlement claiming PROVEN_DESTROYED was accepted
+   * over a key whose provider was AVAILABLE, owned the key, and reported it
+   * `active` — and that acceptance flipped
+   * `aaliyah_memory_unerased_merged_records` from refuse to accept, so the
+   * database's own erasure guard let a survivor erasure through while the key
+   * was alive. Migration 055's own comment claimed "the provider's own answer
+   * always wins, and a settlement stands in only where the provider
+   * structurally cannot answer"; nothing implemented either clause.
+   *
+   * A settlement that contradicts an answer the provider actually gave is not
+   * a settlement. It is the fabricated provider evidence the founder's
+   * decision forbids by name.
+   */
+  "settlement_contradicted_by_provider",
   /** The database refused it. */
   "settlement_storage_rejected",
 ] as const;

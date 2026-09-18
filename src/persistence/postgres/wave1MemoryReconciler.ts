@@ -1,5 +1,5 @@
 import type { Pool, PoolClient } from "pg";
-import { enterMemoryRole } from "./pool";
+import { enterMemoryRole, releaseClient } from "./pool";
 
 /**
  * RECONCILING AN UNKNOWN OUTCOME.
@@ -159,6 +159,7 @@ export function createPostgresMemoryReconciler(
    */
   async function findUnresolved(limit = 100): Promise<UnresolvedMutation[]> {
     const client = await pool.connect();
+    let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       await enterRole(client);
@@ -204,10 +205,11 @@ export function createPostgresMemoryReconciler(
         targetRecordId: row.target_record_id,
       }));
     } catch (error) {
+      ambiguous = error;
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      releaseClient(client, ambiguous);
     }
   }
 
@@ -239,6 +241,7 @@ export function createPostgresMemoryReconciler(
   ): Promise<MemoryReconciliation> {
     const { scope, mutationReceiptId } = unresolved;
     const client = await pool.connect();
+    let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       // Bounded, for the same reason the mutation path is: a reconciliation
@@ -485,10 +488,11 @@ export function createPostgresMemoryReconciler(
       }
       return fromRow(winner, true);
     } catch (error) {
+      ambiguous = error;
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      releaseClient(client, ambiguous);
     }
   }
 
@@ -510,6 +514,7 @@ export function createPostgresMemoryReconciler(
     mutationReceiptId: string,
   ): Promise<MemoryReconciliation | null> {
     const client = await pool.connect();
+    let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       await enterRole(client);
@@ -517,10 +522,11 @@ export function createPostgresMemoryReconciler(
       await client.query("COMMIT");
       return row === undefined ? null : fromRow(row, true);
     } catch (error) {
+      ambiguous = error;
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      releaseClient(client, ambiguous);
     }
   }
 

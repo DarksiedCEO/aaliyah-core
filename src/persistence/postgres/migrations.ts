@@ -5925,6 +5925,151 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       BEFORE UPDATE ON memory_key_destruction_obligations
       FOR EACH ROW EXECUTE FUNCTION public.aaliyah_memory_settled_obligation_frozen()`,
   },
+  {
+    /*
+     * EVIDENCE MUST ACTUALLY BE EVIDENCE.
+     *
+     * Red team against a9d203d, HIGH, executed end to end: `evidence` was
+     * typed `unknown` in the request, validated nowhere in the store, and
+     * constrained only by `evidence jsonb NOT NULL` here — which accepts the
+     * jsonb value `null`, because JSON null IS a value. So a settlement
+     * carrying NO evidence was recorded, digested to sha256("null"), counted
+     * sound by `settlementProven`, wrote destruction evidence carrying its
+     * receipt id, and produced
+     * `{verified:true, keysDestroyed:1, keysNotProven:0}` for a subject whose
+     * key the provider still reported as ACTIVE, with
+     * `aaliyah_memory_unerased_merged_records` returning 0. The founder's
+     * decision says a settlement must be EVIDENCE-BOUND and that no
+     * settlement authority may fabricate provider evidence; nothing enforced
+     * either half.
+     *
+     * Enforced HERE and only here, with the store's catch translating the
+     * constraint into a named rejection. That is deliberate: a store
+     * pre-check returning the same rejection value would be masked by the
+     * translation, which is the defect this project has now hit six times
+     * (M-40, M-47, M-55, M-50, M-51, and the self-verification pre-check the
+     * a9d203d test review found dead). One enforcement, one translation, one
+     * falsifier each.
+     *
+     * ---- AND IT IS A REFERENCE, NOT PROSE (SEC-04) -------------------
+     *
+     * The first version of this constraint required a `statement` of at least
+     * twenty characters, which INVITED the defect security found in the
+     * unconstrained column it replaced: this table is append-only, so any
+     * plaintext written here survives for ever in the artifact that COMPLETES
+     * an erasure. The reviewer's scan of every text and jsonb column:
+     *
+     *     sightings of the erased address BEFORE: []
+     *     sightings AFTER:  ["memory_key_destruction_settlements.evidence"]
+     *     UPDATE (redact) as the owner -> refused: append-only
+     *     DELETE as the owner          -> refused: append-only
+     *
+     * Migration 055 named this hazard six lines from the column — "free text
+     * here would be a place for a subject's address to survive a settlement" —
+     * and then constrained the DIGEST instead.
+     *
+     * So the evidence is now a POINTER plus a digest: which kind of proof,
+     * WHERE it lives, the sha256 of the document, and when it was witnessed.
+     * The `reference` pattern forbids whitespace, so a sentence cannot be
+     * written in it. Four members exactly, nothing else, so nothing can be
+     * smuggled alongside.
+     *
+     * RESIDUAL, STATED: a determined operator can still put a short
+     * identifier-shaped string in `reference`. That is a bound, not an
+     * elimination, and the register says so rather than claiming this ends
+     * the class.
+     */
+    id: "059_settlement_evidence_bound",
+    sql: `ALTER TABLE memory_key_destruction_settlements
+      DROP CONSTRAINT IF EXISTS memory_key_destruction_settlements_evidence_bound;
+    ALTER TABLE memory_key_destruction_settlements
+      ADD CONSTRAINT memory_key_destruction_settlements_evidence_bound
+        CHECK (
+          jsonb_typeof(evidence) = 'object'
+          -- EXACTLY these four members and nothing else. Subtracting the known
+          -- keys and requiring an empty object is how a CHECK can say "no
+          -- other keys", since it cannot contain a subquery over
+          -- jsonb_object_keys.
+          AND evidence - 'kind' - 'reference' - 'referenceDigest'
+                       - 'witnessedAt' = '{}'::jsonb
+          AND evidence ?& array['kind','reference','referenceDigest','witnessedAt']
+          AND jsonb_typeof(evidence -> 'kind') = 'string'
+          AND (evidence ->> 'kind') IN (
+                'provider_decommission_certificate',
+                'provider_destruction_receipt',
+                'hsm_partition_destruction_record',
+                'key_custodian_attestation')
+          -- A REFERENCE, not prose. No whitespace, so a sentence cannot be
+          -- written here, and bounded so a blob cannot either.
+          AND jsonb_typeof(evidence -> 'reference') = 'string'
+          AND (evidence ->> 'reference') ~ '^[A-Za-z0-9._:/-]{8,200}$'
+          -- The DIGEST is what binds the decision to a document this database
+          -- deliberately does not hold.
+          AND jsonb_typeof(evidence -> 'referenceDigest') = 'string'
+          AND (evidence ->> 'referenceDigest') ~ '^sha256:[0-9a-f]{64}$'
+          AND jsonb_typeof(evidence -> 'witnessedAt') = 'string'
+          AND (evidence ->> 'witnessedAt') ~
+              '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}'
+        )`,
+  },
+  {
+    /*
+     * A SETTLEMENT POINTER MUST POINT AT A SETTLEMENT.
+     *
+     * Security review of a9d203d, HIGH, executed. Migration 055 withholds
+     * `settled_by` from the mutation role's UPDATE grant and says exactly why:
+     * "with it, the mutation role could rewrite an obligation to claim a
+     * settlement that does not exist". The grant one line ABOVE that comment
+     * is `GRANT SELECT, INSERT` — TABLE-level, which covers every column. So
+     * the mutation role could not UPDATE `settled_by`, and could INSERT it
+     * freely. Observed:
+     *
+     *     forged settled obligation INSERTED by the mutation role: true
+     *     settlements matching that receipt id: 0
+     *     ledger: state PROVEN_DESTROYED, resolvedBy SETTLEMENT,
+     *             settledBy "settlement-that-never-existed"
+     *     the key really is: active
+     *
+     * And because `UNIQUE (tenant, workspace, key_ref)` means one row per key,
+     * the forgery PRE-EMPTS the slot: the honest completion pass can never
+     * record the real state afterwards. Migration 058 then made that row
+     * unrepairable by anyone, including the owner — so the previous round's
+     * fix turned a forgeable row into a permanent one.
+     *
+     * Three changes, none of which relies on the others:
+     *
+     *   1. A FOREIGN KEY. `settled_by` must name a real settlement receipt.
+     *      This is the one that closes the forgery outright, whatever any
+     *      grant says, and it needs no trigger and no application code.
+     *   2. COLUMN-LEVEL INSERT for the mutation role, so the asymmetry between
+     *      its INSERT and UPDATE grants is gone. `settled_by` and
+     *      `resolved_by` are simply not insertable by it; both default NULL,
+     *      which is the only state an honest first observation has.
+     *   3. The same for `aaliyah_memory_reconciler`, which holds no INSERT
+     *      here today but would inherit the same hole if it ever did.
+     *
+     * The FK is added VALIDATED deliberately: a row whose `settled_by` names
+     * no settlement is corrupt, and a migration that tolerates it while
+     * claiming to fix this finding would be the same defect one layer up. If
+     * this migration fails on a populated database, that database HAS a forged
+     * or orphaned obligation and an operator must look at it.
+     */
+    id: "060_obligation_settlement_pointer_real",
+    sql: `REVOKE INSERT ON memory_key_destruction_obligations
+      FROM aaliyah_memory_mutator;
+    GRANT INSERT (tenant_id, workspace_id, subject_record_id, alias_id, key_ref,
+                  provider_id, binding_mutation_receipt_id, erasure_tombstone_id,
+                  state, not_proven_reason, observations,
+                  first_observed_at, last_observed_at)
+      ON memory_key_destruction_obligations TO aaliyah_memory_mutator;
+
+    ALTER TABLE memory_key_destruction_obligations
+      DROP CONSTRAINT IF EXISTS memory_key_destruction_obligations_settled_by_real;
+    ALTER TABLE memory_key_destruction_obligations
+      ADD CONSTRAINT memory_key_destruction_obligations_settled_by_real
+        FOREIGN KEY (settled_by)
+        REFERENCES memory_key_destruction_settlements (settlement_receipt_id)`,
+  },
 ];
 
 /**
@@ -6023,6 +6168,7 @@ export async function runMailMigrations(
   // leave the operator with an ambiguous outcome (03581a3 reliability, K-05).
   const bounded = boundedQuery(client, MIGRATION_BOUNDS.queryTimeoutMs);
   let ambiguous: unknown;
+  let inTransaction = false;
   try {
     await bounded(`SET lock_timeout = '${MIGRATION_BOUNDS.lockTimeoutMs}ms'`);
     // ---- CONCURRENT MIGRATORS SERIALIZE BEFORE THE LEDGER EXISTS --------
@@ -6071,13 +6217,28 @@ export async function runMailMigrations(
     // mechanism nothing can falsify is a claim, not a control, and this
     // register's standard is the other way round.
     await createLedgerToleratingARace(bounded);
-  } catch (error) {
-    ambiguous = error;
-    releaseClient(client, error);
-    throw error;
-  }
-  try {
+
+    // ---- ONE CLEANUP PATH, NOT TWO -----------------------------------
+    //
+    // Reliability review of a9d203d, HIGH, reproduced live with a role
+    // lacking CREATE on schema public (42501): this used to be TWO try
+    // blocks. The first covered the session `SET lock_timeout` and the
+    // ledger creation and had a catch that did
+    // `releaseClient(client, error); throw error;` with NO finally — so a
+    // real, non-race, non-ambiguous failure of the CREATE returned a
+    // perfectly healthy connection to the pool still carrying a 120s
+    // `lock_timeout`. Only the SECOND block's finally reset it, and the
+    // test written for that reset ("success AND refusal") exercised the
+    // success path and the in-transaction ordering refusal — both of which
+    // are inside the second block. The one path that leaked was the one
+    // path neither covered.
+    //
+    // The phases still have to be separate (the ledger must be created
+    // outside a transaction), but they do NOT need separate cleanup. The
+    // transaction starts here, inside the same try, and `inTransaction`
+    // tells the catch whether there is anything to roll back.
     await bounded("BEGIN");
+    inTransaction = true;
     await bounded(`SET LOCAL lock_timeout = '${MIGRATION_BOUNDS.lockTimeoutMs}ms'`);
     await bounded(`SET LOCAL statement_timeout = '${MIGRATION_BOUNDS.statementTimeoutMs}ms'`);
     // Serialize concurrent migrators, including one running an older build:
@@ -6194,9 +6355,16 @@ export async function runMailMigrations(
     await bounded("COMMIT");
   } catch (error) {
     ambiguous = error;
+    // ONLY if a transaction was actually opened. The ledger-creation phase
+    // runs before `BEGIN`, and issuing `ROLLBACK` there would be a no-op
+    // carrying a server warning — harmless, but it would also say this code
+    // does not know which phase it failed in, and it does.
+    //
     // The rollback itself is bounded and allowed to fail: on a dead backend
     // there is nothing to roll back, and the connection is destroyed below.
-    await bounded("ROLLBACK").catch(() => undefined);
+    if (inTransaction) {
+      await bounded("ROLLBACK").catch(() => undefined);
+    }
     throw error;
   } finally {
     // The session `lock_timeout` this runner raised outlives the transaction
@@ -6213,6 +6381,6 @@ export async function runMailMigrations(
     if (!broken) {
       await bounded("RESET lock_timeout").catch(() => undefined);
     }
-    client.release(broken ? true : undefined);
+    releaseClient(client, ambiguous);
   }
 }

@@ -188,6 +188,83 @@ test("the migrator leaves NO session state on the connection it returns — succ
   });
 });
 
+test("the LEDGER-CREATION phase leaves no session state either, when it fails for a real reason", async () => {
+  // ---- RELIABILITY REVIEW OF a9d203d, HIGH, REPRODUCED ---------------
+  //
+  // `runMailMigrations` used to be TWO try blocks. The first covered the
+  // session `SET lock_timeout` and the ledger's CREATE TABLE, and its catch
+  // was `releaseClient(client, error); throw error;` with NO finally. So a
+  // real, non-race, non-ambiguous failure of that CREATE — a role without
+  // CREATE on schema public, 42501 — returned a perfectly healthy connection
+  // to the pool still carrying a 120s `lock_timeout`. Only the SECOND block's
+  // finally reset it.
+  //
+  // The test written for that reset claimed "success AND refusal", and both
+  // paths it exercised were inside the second block. The one path that leaked
+  // was the one path neither covered, which is why this case names the PHASE
+  // rather than the outcome.
+  await withFreshDatabase("ledger_phase", async (url) => {
+    const admin = new Pool({ connectionString: url, max: 1 });
+    admin.on("error", () => undefined);
+    const role = "aaliyah_ledger_phase_probe";
+    try {
+      await admin.query(`DROP ROLE IF EXISTS ${role}`);
+      await admin.query(`CREATE ROLE ${role} LOGIN PASSWORD 'probe'`);
+      // It may CONNECT and it may SET, but it may not CREATE — so the failure
+      // lands exactly on the ledger's CREATE TABLE and nowhere earlier.
+      await admin.query(`REVOKE CREATE ON SCHEMA public FROM ${role}`);
+      await admin.query(`REVOKE CREATE ON SCHEMA public FROM PUBLIC`);
+      const asRole = new URL(url);
+      asRole.username = role;
+      asRole.password = "probe";
+      const pool = new Pool({ connectionString: asRole.href, max: 1 });
+      pool.on("error", () => undefined);
+      try {
+        const state = async () => {
+          const r = await pool.query(
+            `SELECT pg_backend_pid()::int AS pid, current_setting('lock_timeout') AS lt`,
+          );
+          return { pid: r.rows[0].pid as number, lockTimeout: String(r.rows[0].lt) };
+        };
+        const before = await state();
+        assert.notEqual(
+          before.lockTimeout,
+          `${MIGRATION_BOUNDS.lockTimeoutMs}ms`,
+          "fixture precondition: the baseline must differ from the migrator's raised value",
+        );
+
+        await assert.rejects(
+          () => runMailMigrations(pool),
+          (error: { code?: unknown }) => {
+            // PINNED to the permission failure. A bare rejects() would pass on
+            // any error at all and prove nothing about which phase failed.
+            assert.equal(error.code, "42501", `expected 42501, got ${String(error.code)}`);
+            return true;
+          },
+        );
+
+        const after = await state();
+        assert.equal(
+          after.pid,
+          before.pid,
+          "a non-ambiguous failure destroyed a healthy connection instead of cleaning it",
+        );
+        assert.equal(
+          after.lockTimeout,
+          before.lockTimeout,
+          "the ledger-creation phase leaked its raised lock_timeout onto a pooled connection",
+        );
+      } finally {
+        await pool.end().catch(() => undefined);
+      }
+    } finally {
+      await admin.query(`GRANT CREATE ON SCHEMA public TO PUBLIC`).catch(() => undefined);
+      await admin.query(`DROP ROLE IF EXISTS ${role}`).catch(() => undefined);
+      await admin.end().catch(() => undefined);
+    }
+  });
+});
+
 test("W1BR-014: the refusal is about ORDER, not about that one migration", async () => {
   await runMailMigrations(replayPool);
   // A different, much later migration — the rule is general.

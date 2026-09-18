@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { Pool } from "pg";
 
 import { scopedKey, type TenantScope } from "./tenantScopedStore";
-import { guardPoolErrors, MAIL_DB_POOL_BOUNDS } from "./postgres/pool";
+import { guardPoolErrors, MAIL_DB_POOL_BOUNDS, releaseClient } from "./postgres/pool";
 import {
   ExecutionResultSchema,
   parseVerifiedExecutionRecordV1,
@@ -156,6 +156,7 @@ export async function ensureIdempotentExecution<T>(
 
   const pool = idempotencyStoreInternals.buildPool();
   const client = await pool.connect();
+  let ambiguous: unknown;
   const requestHash = hashRequest(payload);
 
   try {
@@ -263,10 +264,11 @@ export async function ensureIdempotentExecution<T>(
     await client.query("COMMIT");
     return { replay: false, result: undefined };
   } catch (error) {
+    ambiguous = error;
     await client.query("ROLLBACK");
     throw error;
   } finally {
-    client.release();
+    releaseClient(client, ambiguous);
     await pool.end();
   }
 }

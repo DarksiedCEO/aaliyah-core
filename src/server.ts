@@ -149,6 +149,20 @@ async function main(): Promise<void> {
             `and stay unresolved until settled; see memory_key_destruction_obligations\n`,
         );
       }
+      // ---- AND A LEDGER THAT COULD NOT BE WRITTEN IS ITS OWN ALARM -----
+      // Red team against a9d203d, HIGH: obligations that failed to record
+      // produced IDENTICAL counts to obligations that recorded cleanly, so a
+      // subject could be left in ERASURE_PENDING_SETTLEMENT with no row
+      // naming why and nothing to tell an operator to look. The row is the
+      // only route out of that state; failing to write it is worse than
+      // failing to erase, because it is invisible.
+      if (erasures.obligationsUnrecorded > 0) {
+        process.stderr.write(
+          `trusted memory: ${erasures.obligationsUnrecorded} key destruction obligation(s) ` +
+            `COULD NOT BE RECORDED — those subjects are NOT ERASED and have NO ledger row ` +
+            `to settle against; an operator must reconcile them by hand\n`,
+        );
+      }
     } catch (error) {
       process.stderr.write(
         `trusted memory: alias key completion pass failed (${

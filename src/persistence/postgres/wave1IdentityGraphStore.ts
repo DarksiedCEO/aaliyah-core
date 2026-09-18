@@ -1,5 +1,5 @@
 import type { Pool } from "pg";
-import { enterMemoryRole } from "./pool";
+import { enterMemoryRole, releaseClient } from "./pool";
 
 import {
   createWave1MemoryService,
@@ -38,6 +38,7 @@ export function createPostgresIdentityGraph(
   return {
     async mergedInto(actor: TrustedMemoryActor, recordId: string) {
       const client = await pool.connect();
+      let ambiguous: unknown;
       try {
         await client.query("BEGIN");
         // Least privilege AND a pinned search path (K-07): `"$user"` off the
@@ -65,10 +66,11 @@ export function createPostgresIdentityGraph(
         await client.query("COMMIT");
         return (result.rows[0]?.to_record_id as string | undefined) ?? null;
       } catch (error) {
+        ambiguous = error;
         await client.query("ROLLBACK").catch(() => undefined);
         throw error;
       } finally {
-        client.release();
+        releaseClient(client, ambiguous);
       }
     },
   };

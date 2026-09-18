@@ -674,7 +674,7 @@ test("the pipeline distinguishes 'no memory for this contact' from 'memory unava
             return 0;
           },
           async completePendingErasures() {
-            return { destroyed: 0, repaired: 0, contradictions: 0, pending: 0, notProven: 0, notProvenReasons: {} };
+            return { destroyed: 0, repaired: 0, contradictions: 0, pending: 0, notProven: 0, notProvenReasons: {}, obligationsUnrecorded: 0 };
           },
           async settleKeyDestruction() {
             throw new Error("not used by this fixture");

@@ -129,6 +129,11 @@ export type Wave1MemoryService = {
      */
     notProven: number;
     notProvenReasons: Record<string, number>;
+    /**
+     * Obligations this pass could not write. Non-zero means a subject is NOT
+     * ERASED and has NO ledger row to settle against (red team, a9d203d).
+     */
+    obligationsUnrecorded: number;
   }>;
   /**
    * SETTLE one key's destruction on evidence, or record that the evidence did

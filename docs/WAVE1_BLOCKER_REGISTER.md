@@ -1577,7 +1577,17 @@ The reason is structural, not a missing test:
          Invisible: the settlement branch does not put the row in the list in
          the first place.
 
-Remove **either** and nothing changes. Remove **both** and a key proven by a
+Remove **either** and nothing changes.
+
+> **CORRECTED BY THE NINTH SECTION — DO NOT RELY ON THE NEXT SENTENCE.** This
+> passage claimed that removing BOTH produces `resolved_by = 'PROVIDER'`. Two
+> reviewers falsified that independently by execution (red team RT-3, security
+> SEC-08): migration **055**'s `..._resolution_named` CHECK refuses the write
+> on its own, whatever the application layer and 058 do. It was a masking
+> TRIPLE and the third mechanism is the load-bearing one. The classification of
+> M-47/M-55 stands; this proof does not. See the ninth section.
+
+Remove **both** and a key proven by a
 SETTLEMENT is recorded as `resolved_by = 'PROVIDER'` — a provider that, in the
 `NO_VAULT` case, was never asked at all. There is a third guard of the same
 invariant too: `recordObligations`' `ON CONFLICT ... WHERE settled_by IS NULL`.
@@ -1672,3 +1682,117 @@ provisioning followed a gauntlet symlink back into the contracts worktree and
 left an untracked nested copy; it was removed, no tracked file changed, and the
 release guard caught it). Production NOT CERTIFIED. Fortress NOT CERTIFIED.
 Nothing pushed, merged or deployed.
+
+---
+
+## W1.3 NINTH — THE a9d203d GAUNTLET, AND A CORRECTION TO THIS REGISTER
+
+Four of the eight gates ran against `a9d203d` before the candidate was
+withdrawn. **All four returned BLOCK.** Integration, independent
+mutation/fuzz, Release Guardian and AEGIS were never dispatched: a candidate
+with four blocking verdicts is not a subject for a certification gate.
+
+    reliability          BLOCK   1 CRITICAL, 1 HIGH, 1 LOW
+    test falsifiability  BLOCK   1 real survivor + gate contract unmet
+    red-team destroyer   BLOCK   2 HIGH, 6 real survivors, 3 MEDIUM, 6 LOW
+    security             BLOCK   4 HIGH, 4 MEDIUM, 1 LOW
+
+### FIRST, THE CORRECTION — THIS REGISTER PUBLISHED A FALSE PROOF
+
+The EIGHTH pass classified M-47 and M-55 `STRUCTURALLY_UNREACHABLE_WITH_PROOF`
+and stated:
+
+> "Remove **both** and a key proven by a SETTLEMENT is recorded as
+> `resolved_by = 'PROVIDER'`"
+
+**That is false, and two reviewers falsified it independently** — the red team
+(RT-3) and security (SEC-08), each by execution, neither having seen the
+other's work. With both application guards removed AND 058's trigger dropped,
+the exact statement `clearHealedObligations` issues is still refused:
+
+    ERROR: violates check constraint
+           "memory_key_destruction_obligations_resolution_named"
+
+That CHECK comes from migration **055** and predates both mutants. It requires
+`(resolved_by = 'SETTLEMENT') = (settled_by IS NOT NULL)`, so setting
+`resolved_by = 'PROVIDER'` on a row with `settled_by` set is a violation
+whatever the application layer does. Security's positive control — drop the
+trigger AND the CHECK — then returned `UPDATE 1` and `resolved_by = PROVIDER`,
+which identifies the load-bearing guard exactly.
+
+So it was a masking **triple**, not a pair, and the third mechanism is the one
+that actually holds. Consequences, stated plainly:
+
+- The **classification** of M-47 and M-55 stands. They are unreachable.
+- The **proof** was wrong and is replaced by the text above, naming 055.
+- **Migration 058 was written against an exploit that cannot occur.** It is
+  still a real control — security executed three writes that 055's CHECK
+  permits and only the trigger refuses (`not_proven_reason` rewritten on a
+  settled row, `settled_by` repointed by the settler, `state` moved to
+  `PROVEN_NOT_DESTROYED`) — but its stated justification in migration 058 and
+  in the eighth-pass entry was not the reason it was needed.
+- **`S-2c`'s discrimination is narrower than credited**: two of its five
+  refusal statements are caught by 055's CHECK, not by 058's trigger. The test
+  does not distinguish them, so it over-credits the trigger.
+- And per **SEC-02**, 058 has a cost the eighth pass did not see: it makes a
+  FORGED settled obligation unrepairable, by anyone, including the owner.
+
+How this happened is worth recording, because it is the same failure the
+register keeps describing in the code. I enumerated the guards by reading the
+two the mutants touched, reasoned about their interaction, and wrote the
+conclusion down as a proof — **without executing the removal of both.** A proof
+by reasoning about masking is exactly the kind of claim this register's own
+standard says to execute. `UNREACHABLE_WITH_PROOF` must be earned by running
+the combination, not by arguing it.
+
+### THE FINDINGS
+
+Severity as the reviewer assigned it. `CLOSED` means a falsifier exists that
+was verified to FAIL against `a9d203d` and pass after the fix.
+
+| id | sev | gate | finding | status |
+|---|---|---|---|---|
+| REL-1 | CRITICAL | reliability | Six persistence modules released pooled clients with a bare `client.release()` across twelve sites. pg-pool evicts only when an error is PASSED to `release()` or `_queryable` has already flipped, and pg sets that flag only on a real socket error — so a client-side `Query read timeout` left a connected socket with an abandoned query on the wire, returned to the idle pool. Reproduced against a wedged proxy on `findUnresolved()`, the path `src/server.ts` calls at BOOT: `idleCount:1`, next caller hung. | **CLOSED** |
+| REL-2 | HIGH | reliability | `runMailMigrations` had TWO cleanup paths. The ledger-creation phase's catch released without resetting the raised `lock_timeout`, so a real failure (42501) returned a healthy connection carrying a 120s bound. My own "success AND refusal" test covered only the second block. | **CLOSED** |
+| REL-3 | LOW | reliability | `completePendingErasures` has no positive "ran, nothing to do" log line, so a silent success and a silent skip look identical. | OPEN |
+| TST-1 | — | test | The store's self-verification pre-check was dead: the catch remapped the database's `..._independent_verifier` violation to the same rejection value, so disabling the pre-check left 124/124 passing including `S-4`, the test that claims two-layer enforcement. Sixth instance of the masking pattern. | **CLOSED** |
+| RT-1 | HIGH | red team | `evidence` was typed `unknown` and validated NOWHERE — `evidence jsonb NOT NULL` accepts the jsonb value `null`. A settlement with no evidence was recorded, digested to `sha256("null")`, counted sound, wrote destruction evidence, and returned `{verified:true, keysDestroyed:1}` for a subject whose key the provider still reported ACTIVE. | **CLOSED** |
+| RT-2 | HIGH | red team | One transaction and one silent catch for a whole obligation batch: with the upsert's `settled_by IS NULL` guard removed, a settled row's refusal rolled back EVERY other key's obligation while the reported counts stayed identical. The ledger is the operator's only route out of `ERASURE_PENDING_SETTLEMENT`. | **CLOSED** |
+| SEC-01 | HIGH | security | `settleKeyDestruction` never asks the provider. A settlement is accepted over a key whose provider is AVAILABLE and reports it ALIVE, and that flips `aaliyah_memory_unerased_merged_records` from refuse to accept. The claim in 055 that "the provider's own answer always wins, and a settlement stands in only where the provider structurally cannot answer" is false in both halves. | OPEN |
+| SEC-02 | HIGH | security | 055 withholds `settled_by` from the mutator's UPDATE grant and says why — but the INSERT grant one line above is TABLE-level, covering every column. The mutation role forges a SETTLED obligation naming a settlement that does not exist; `UNIQUE (tenant, workspace, key_ref)` then means the honest pass can never record the real state, and **058 makes the forgery unrepairable by anyone including the owner**. | OPEN |
+| SEC-03 | HIGH | security | The settlement replay short-circuit compares 7 of 22 columns — not tenant, workspace, subject, authorization or tombstone — and returns `{recorded:true, replay:true}` BEFORE the insert, skipping `scope_unique` and `aaliyah_memory_settlement_binds_real_key()`. The same receipt id under ANOTHER TENANT is reported as a successful replay. | OPEN |
+| SEC-04 | HIGH | security | `evidence` is free text on an append-only table, so plaintext an erasure removed survives permanently in the artifact that completes the erasure. Migration 055 names this exact hazard six lines from the column and then constrains the DIGEST instead. Migration 059 constrains the SHAPE but still permits prose. | OPEN |
+| SEC-05 | MEDIUM | security | 85 of 99 store SQL statements are unqualified; a shadowed `memory_pii_key_erasures` made the boot pass report all-zero counters over a live key, and `server.ts` logs only non-zero counters, so it is silent AND fail-open. `pool.ts`'s stated reason this is safe ("the erasure SQL is public.-qualified") is false. | OPEN |
+| SEC-06 | MEDIUM | security | `pg_db_role_setting` is in no section of the declared privilege map. `ALTER DATABASE … SET session_replication_role='replica'` disables all 44 triggers including 058, leaves `tgenabled` at `'O'`, and produces ZERO map diff — strictly more powerful than the `DISABLE TRIGGER` the map does catch. Superuser precondition. | OPEN |
+| SEC-07 | MEDIUM | security | A SECURITY DEFINER function planted in `pg_catalog` — FIRST on every pinned path — is invisible to all five function sections of the map, and was used to read a table the reader is denied. This is K-16/W3, the finding the map was rewritten to catch. | OPEN |
+| SEC-08 | — | security | The register's M-47/M-55 proof is factually wrong. Corrected above. | **CLOSED** |
+| SEC-09 | LOW | security | `pg_roles.rolconfig` and RLS state also produce zero map diff; harm not demonstrated. | OPEN |
+| RT-M4 | — | red team | The three-column `unnest` JOIN the register names as the G-02 fix can be removed with 240/240 passing: `S-13` proves only the other half (the scoped map key). An asymmetrically masked pair, on the fix for the previous round's HIGH. | OPEN |
+| RT-M11 | — | red team | The evidence digest's key sort matters only for realistic evidence; every fixture is jsonb-order-invariant by accident, so removing the sort makes every REAL settlement unsound and no test notices. | OPEN |
+| RT-M14/15 | — | red team | Two further mutually-masking pairs with 055's CHECK and trigger, where the error mapper returns the same rejection so `S-4`/`S-4b` cannot tell which layer refused. | OPEN |
+| RT-M10, RT-M3 | — | red team | Untested guards. | OPEN |
+| RT-6 | MEDIUM | red team | A sound settlement is IGNORED by the completion pass whenever a provider is configured and answers `unknown` — K-09's own case. Fails closed, but falsifies settlement as "the bounded way out". | OPEN |
+| RT-7 | MEDIUM | red team | A `PROVEN_DESTROYED` settlement is irrevocable: both correction paths are refused and `settlementProven` ignores contradicting decisions. With 058 this is now permanent. | OPEN |
+| RT-8 | MEDIUM | red team | `predecessor_state` is a hardcoded literal and settlement is not gated on the state it claims to resolve — recorded for a key with ZERO obligations. | OPEN |
+| RT-13 | LOW | red team | A detected forgery over a live key is counted in `contradictions` and never in `notProven`, so `deleteRecord` labels it `erasure_incomplete` — "not finished yet" — for a subject that is not erased. | OPEN |
+| RT-14 | LOW | red team | `decided_not_future` bounds only the future; `decidedAt: 1970-01-01` is accepted. | OPEN |
+
+### WHAT THIS MEANS FOR THE W1.3 GREEN LAW
+
+**W1.3 is RED**, and not by one finding. Four independent gates blocked, three
+of them on the settlement subsystem that OPTION B introduced — the part of this
+work with the least review history. Two separate HIGH findings (RT-1, SEC-01)
+each let a subject be represented as ERASED, or flip the database's own erasure
+guard, over a key that was demonstrably alive. That is the precise outcome the
+founder's decision exists to prevent.
+
+The pattern across all four reports is one thing: **this subsystem's invariants
+were enforced in the application layer, and the application layer is where
+masking lives.** Every fix that moved an invariant into the database
+(migrations 055, 058, 059) is falsifiable; nearly every fix that stayed in
+TypeScript turned out to be masked by something else that produced the same
+observable answer.
+
+Production: NOT CERTIFIED. Fortress: NOT CERTIFIED. Nothing pushed, merged or
+deployed. No gate may be re-run against `a9d203d`: remediation creates a new
+descendant, and every verdict above is bound to a tree that no longer exists.

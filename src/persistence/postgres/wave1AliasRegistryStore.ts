@@ -11,7 +11,7 @@ import {
   type MemoryScope,
 } from "@aaliyah/contracts/v1";
 import type { Pool, PoolClient } from "pg";
-import { enterMemoryRole } from "./pool";
+import { enterMemoryRole, releaseClient } from "./pool";
 
 import { appendMutationAttempt } from "./memoryMutationAttempts";
 import {
@@ -473,16 +473,18 @@ export function createPostgresAliasRegistryStore(
   /** Append a terminal receipt on its own connection, under the mutation role. */
   async function appendTerminal(receipt: MemoryMutationReceipt): Promise<void> {
     const client = await pool.connect();
+    let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       await enterRole(client, mutationRole);
       await persistReceipt(client, receipt, "terminal");
       await client.query("COMMIT");
     } catch (error) {
+      ambiguous = error;
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      releaseClient(client, ambiguous);
     }
   }
 
@@ -960,6 +962,8 @@ export function createPostgresAliasRegistryStore(
     ].join(LOCK_KEY_SEPARATOR);
 
     const client = await pool.connect();
+
+    let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       // Bounded: a held participant lock refuses rather than waiting forever.
@@ -1312,6 +1316,7 @@ export function createPostgresAliasRegistryStore(
           }
         }
       } catch (error) {
+        ambiguous = error;
         if (isUniqueViolation(error)) {
           // Translation only. The EXCLUSION happened in the index.
           if (error.constraint === "memory_alias_blind_indexes_skeleton_unique") {
@@ -1346,6 +1351,7 @@ export function createPostgresAliasRegistryStore(
       await client.query("COMMIT");
       committed = true;
     } catch (error) {
+      ambiguous = error;
       if (!commitIssued) {
         await client.query("ROLLBACK").catch(() => undefined);
         if (createdKey !== null) {
@@ -1375,7 +1381,7 @@ export function createPostgresAliasRegistryStore(
       // Released BEFORE any receipt is emitted: emitting one takes a second
       // connection, and holding two at once self-deadlocks a small pool under
       // exactly the concurrency this store exists to survive.
-      client.release();
+      releaseClient(client, ambiguous);
     }
 
     if (failure !== null) {
@@ -1456,6 +1462,8 @@ export function createPostgresAliasRegistryStore(
     ].join(LOCK_KEY_SEPARATOR);
 
     const client = await pool.connect();
+
+    let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       // Bounded: a held participant lock refuses rather than waiting forever.
@@ -1606,6 +1614,7 @@ export function createPostgresAliasRegistryStore(
       await client.query("COMMIT");
       committed = true;
     } catch (error) {
+      ambiguous = error;
       if (!commitIssued) {
         await client.query("ROLLBACK").catch(() => undefined);
       }
@@ -1623,7 +1632,7 @@ export function createPostgresAliasRegistryStore(
         failure = { kind: "unknown" };
       }
     } finally {
-      client.release();
+      releaseClient(client, ambiguous);
     }
 
     if (failure !== null) {
@@ -1697,6 +1706,7 @@ export function createPostgresAliasRegistryStore(
     let readBackDigest: string;
     try {
       const readClient = await readBackPool.connect();
+      let ambiguous: unknown;
       try {
         await readClient.query("BEGIN");
         await enterRole(readClient, readBackRole);
@@ -1735,7 +1745,7 @@ export function createPostgresAliasRegistryStore(
           ? memoryContentDigest(observedHead.content)
           : "";
       } finally {
-        readClient.release();
+        releaseClient(readClient, ambiguous);
       }
     } catch {
       return await finishUnknown(
@@ -1869,6 +1879,7 @@ export function createPostgresAliasRegistryStore(
     params: readonly unknown[],
   ): Promise<BindingRow | null> {
     const client = await readBackPool.connect();
+    let ambiguous: unknown;
     try {
       await client.query("BEGIN");
       await enterRole(client, readBackRole);
@@ -1876,10 +1887,11 @@ export function createPostgresAliasRegistryStore(
       await client.query("COMMIT");
       return (result.rows[0] as BindingRow | undefined) ?? null;
     } catch (error) {
+      ambiguous = error;
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      releaseClient(client, ambiguous);
     }
   }
 

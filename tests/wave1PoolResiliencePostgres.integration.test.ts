@@ -1,6 +1,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
 import { Pool } from "pg";
@@ -14,6 +15,7 @@ import {
 import { createReadinessProbe } from "../src/http/readiness";
 import { runMailMigrations } from "../src/persistence/postgres/migrations";
 import { createPostgresWave1MemoryService } from "../src/persistence/postgres/wave1IdentityGraphStore";
+import { createPostgresMemoryReconciler } from "../src/persistence/postgres/wave1MemoryReconciler";
 import { TEST_PII_KEYS } from "./support/piiKeys";
 import { lockSharedMemoryTables } from "./support/sharedMemoryTables";
 
@@ -278,6 +280,7 @@ test("boot's recovery passes against a reachable but WEDGED database are refused
       "destroyed",
       "notProven",
       "notProvenReasons",
+      "obligationsUnrecorded",
       "pending",
       "repaired",
     ]);
@@ -518,6 +521,118 @@ test("K-05: an AMBIGUOUS connection is DESTROYED, and an ordinary error's connec
     assert.equal((await pool.query("SELECT 1 AS ok")).rows[0].ok, 1);
   } finally {
     await pool.end().catch(() => undefined);
+  }
+});
+
+test("NO pooled client in src/ is released without the ambiguity guard — structural, so the class cannot come back", () => {
+  // ---- WHY THIS IS STRUCTURAL AND NOT BEHAVIOURAL ---------------------
+  //
+  // The reliability review of a9d203d found SIX persistence modules releasing
+  // pooled clients with a bare `client.release()`, across twelve call sites,
+  // none of them reached by any test. Auditing by hand then found MORE than
+  // the review had listed: `wave1TrustedMemoryStore.ts` — the file the review
+  // called correctly guarded — held eleven guarded sites and SIX unguarded
+  // ones, and `idempotencyStore.ts` and `wave1LifecycleStore.ts` had one each
+  // that the review's list did not include. Twenty sites in total.
+  //
+  // The behavioural test above proves the MECHANISM works, on one real store
+  // path. It cannot prove no site was MISSED, and a wedge test per site would
+  // cost seventy seconds each. This is the defence that scales: one assertion
+  // over the whole tree, which fails the moment a new raw release appears.
+  //
+  // It is the same move the register records for trigger enablement — when a
+  // class of defect keeps recurring, the guard belongs in a structural check
+  // that no individual omission can slip past, not in N more behavioural
+  // tests that each cover one instance.
+  const root = path.join(ROOT, "src");
+  const files: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith(".ts")) files.push(full);
+    }
+  };
+  walk(root);
+  assert.ok(files.length > 20, `only ${files.length} source files walked; the walk is wrong`);
+
+  const offenders: string[] = [];
+  for (const file of files) {
+    // `pool.ts` DEFINES the guard, so it is the one place a raw release is
+    // correct — and it is named explicitly rather than skipped by pattern, so
+    // a second "exception" cannot be added quietly.
+    const relative = path.relative(ROOT, file);
+    if (relative === "src/persistence/postgres/pool.ts") continue;
+    const lines = fs.readFileSync(file, "utf8").split("\n");
+    lines.forEach((line, index) => {
+      // A release that is not `releaseClient(...)`. Matches `client.release()`,
+      // `readClient.release()`, `x.release(true)` — anything that hands a
+      // client back without deciding whether it is safe to reuse.
+      if (/\breleaseClient\s*\(/.test(line)) return;
+      if (/\b[A-Za-z_$][\w$]*\.release\s*\(/.test(line)) {
+        offenders.push(`${relative}:${index + 1}: ${line.trim()}`);
+      }
+    });
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `pooled clients released without the ambiguity guard:\n${offenders.join("\n")}`,
+  );
+});
+
+test("a STORE that connects and releases by hand destroys an ambiguous client too, not just pool.query", async () => {
+  // ---- RELIABILITY REVIEW OF a9d203d, CRITICAL, REPRODUCED -----------
+  //
+  // The K-05 test below proves the POOL's own path: `pool.query()` hands the
+  // error to `release()` internally, so pg-pool destroys the client. It proves
+  // NOTHING about the many store functions that call `pool.connect()` and
+  // `client.release()` themselves — and SIX persistence modules did exactly
+  // that with a bare `client.release()`, across twelve call sites:
+  //
+  //   memoryMutationAttempts, wave1IdentityGraphStore, wave1LifecycleStore,
+  //   wave1AliasRegistryStore, wave1MemoryReconciler, wave1LegalHoldStore
+  //
+  // pg-pool evicts a client only when an error is PASSED to release(), or when
+  // the client's own `_queryable` flag has already flipped — and pg sets that
+  // flag only from `_handleErrorEvent`, a real socket error. A client-side
+  // `Query read timeout` does neither: it rejects the query, stubs the
+  // callback, and leaves a connected socket with an abandoned query still on
+  // the wire. A bare `release()` then returns that client to the idle pool,
+  // where the next caller can be answered with the previous caller's result.
+  //
+  // `wave1MemoryReconciler.findUnresolved()` is the one `src/server.ts` calls
+  // at BOOT, which is why it is the subject here.
+  const url = new URL(DB_URL);
+  const proxy = wedgeableProxy({ host: url.hostname, port: Number(url.port || 5432) });
+  const proxyPort = await proxy.port;
+  const proxied = new URL(DB_URL);
+  proxied.port = String(proxyPort);
+  const pool = createMailDbPool({ AALIYAH_DATABASE_URL: proxied.href } as NodeJS.ProcessEnv);
+  try {
+    const reconciler = createPostgresMemoryReconciler(pool);
+    // POSITIVE CONTROL: through the relaying proxy the real store call works,
+    // so the refusal below is the wedge and not the proxy or the role.
+    await reconciler.findUnresolved(1);
+    assert.equal(pool.idleCount, 1, "fixture precondition: the client should be pooled here");
+
+    proxy.wedge();
+    await assert.rejects(
+      reconciler.findUnresolved(1),
+      (error: { message?: string }) => /Query read timeout/i.test(String(error.message)),
+      "the wedge must surface as the client-side read timeout",
+    );
+
+    // THE ASSERTION. The store released by hand; the client must be GONE.
+    assert.equal(
+      pool.idleCount,
+      0,
+      `an ambiguous client was returned to the pool by a hand-written release (idle=${pool.idleCount})`,
+    );
+    assert.ok(isConnectionAmbiguous(new Error("Query read timeout")));
+  } finally {
+    await pool.end().catch(() => undefined);
+    await proxy.close();
   }
 });
 

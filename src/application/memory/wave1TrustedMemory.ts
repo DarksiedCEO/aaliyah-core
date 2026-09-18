@@ -300,6 +300,11 @@ export type TrustedMemoryDeleteResult = TrustedMemoryMutationResult & {
     keysNotProven: number;
     /** The reason for each unprovable key, keyed by reason. No key material. */
     notProvenReasons: Record<string, number>;
+    /**
+     * Obligations this pass could not write. Non-zero means a subject is NOT
+     * ERASED and has NO ledger row to settle against (red team, a9d203d).
+     */
+    obligationsUnrecorded: number;
   } | null;
 };
 
@@ -372,6 +377,11 @@ export interface TrustedMemoryStore {
      */
     notProven: number;
     notProvenReasons: Record<string, number>;
+    /**
+     * Obligations this pass could not write. Non-zero means a subject is NOT
+     * ERASED and has NO ledger row to settle against (red team, a9d203d).
+     */
+    obligationsUnrecorded: number;
   }>;
   /**
    * SETTLE one key's destruction on evidence — the bounded way out of

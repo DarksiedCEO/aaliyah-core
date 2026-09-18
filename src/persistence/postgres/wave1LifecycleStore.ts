@@ -1,6 +1,8 @@
 import { AuditLifecycleEventSchema } from "@aaliyah/contracts/v1";
 import type { Pool } from "pg";
 
+import { releaseClient } from "./pool";
+
 import type { Wave1LifecycleStore } from "../../application/executive/wave1Lifecycle";
 
 type LifecycleRow = {
@@ -65,6 +67,7 @@ export function createPostgresWave1LifecycleStore(
 
     async appendIfCurrent({ event, expectedPreviousEventId }) {
       const client = await pool.connect();
+      let ambiguous: unknown;
       const operationLock = [
         event.tenantId,
         event.workspaceId,
@@ -115,10 +118,11 @@ export function createPostgresWave1LifecycleStore(
         await client.query("COMMIT");
         return event;
       } catch (error) {
+        ambiguous = error;
         await client.query("ROLLBACK");
         throw error;
       } finally {
-        client.release();
+        releaseClient(client, ambiguous);
       }
     },
   };
