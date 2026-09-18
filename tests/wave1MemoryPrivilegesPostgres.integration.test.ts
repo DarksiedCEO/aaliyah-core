@@ -160,6 +160,18 @@ test("the declared map itself keeps the boundaries the register relies on", () =
   // No catalog function has been granted to a memory role (W4:
   // `pg_read_file` reached the reader exactly that way).
   assert.deepEqual(EXPECTED.catalogFunctions, []);
+  // ---- THE FIVE THE RED TEAM FOUND STILL INVISIBLE (B4) ------------
+  // A RULE can swallow a write without firing a single trigger — the class
+  // `tgenabled` was added for and does not cover.
+  assert.deepEqual(EXPECTED.rules, []);
+  assert.deepEqual(EXPECTED.parameterPrivileges, []);
+  assert.deepEqual(EXPECTED.typePrivileges, []);
+  assert.deepEqual(EXPECTED.membershipOptions, []);
+  // Every guard still pins its own path, declared here and not only asserted
+  // by T-1: `ALTER FUNCTION ... RESET search_path` changes no ACL and no body.
+  for (const entry of EXPECTED.functionConfig!) {
+    assert.match(entry, /search_path=pg_catalog, public, pg_temp$/, entry);
+  }
   // Each new helper is executable only by the one role that needs it.
   const executes = (fn: string) =>
     EXPECTED.functions!.filter((entry) => entry.endsWith(` public.${fn}`)).map((entry) => entry.split(" ")[0]).sort();
@@ -298,6 +310,62 @@ test("POSITIVE CONTROL: W2/W3 — an object HIDDEN IN ANOTHER SCHEMA is reported
     await compareDeclaredMap();
   } finally {
     await pool.query(`DROP SCHEMA IF EXISTS w23_probe CASCADE`);
+    await lock.release();
+  }
+});
+
+test("POSITIVE CONTROL: B4 — a RULE, a RESET search_path, and a parameter grant are all reported", async () => {
+  // Red team against 86d33c9, MEDIUM (B4). Each of these produced NO DIFF
+  // while the map had no section for it, and the first one is the dangerous
+  // one: a rule does not disable a trigger, it removes the write the trigger
+  // would have seen. The reviewer watched an insert the guard exists to reject
+  // disappear with the trigger never firing.
+  const lock = await lockSharedMemoryTables(pool);
+  const cases: Array<{ apply: string; revert: string; section: string; match: RegExp }> = [
+    {
+      apply: `CREATE RULE zz_b4_swallow AS ON INSERT TO memory_pii_key_erasures DO INSTEAD NOTHING`,
+      revert: `DROP RULE IF EXISTS zz_b4_swallow ON memory_pii_key_erasures`,
+      section: "rules",
+      match: /^public\.memory_pii_key_erasures zz_b4_swallow$/,
+    },
+    {
+      apply: `ALTER FUNCTION public.aaliyah_memory_unerased_merged_records(text, text, text) RESET search_path`,
+      revert: `ALTER FUNCTION public.aaliyah_memory_unerased_merged_records(text, text, text) SET search_path = pg_catalog, public, pg_temp`,
+      section: "functionConfig",
+      match: /aaliyah_memory_unerased_merged_records\(text,text,text\) <none>$/,
+    },
+    {
+      apply: `GRANT SET ON PARAMETER statement_timeout TO aaliyah_memory_reader`,
+      revert: `REVOKE SET ON PARAMETER statement_timeout FROM aaliyah_memory_reader`,
+      section: "parameterPrivileges",
+      match: /^aaliyah_memory_reader statement_timeout SET$/,
+    },
+    {
+      apply: `GRANT aaliyah_memory_reader TO aaliyah_memory_reconciler WITH ADMIN OPTION`,
+      revert: `REVOKE aaliyah_memory_reader FROM aaliyah_memory_reconciler`,
+      section: "membershipOptions",
+      match: /^aaliyah_memory_reconciler IN aaliyah_memory_reader .*ADMIN/,
+    },
+  ];
+  try {
+    for (const one of cases) {
+      await pool.query(one.apply);
+      try {
+        const actual = await memoryPrivilegeMap(pool);
+        assert.ok(
+          actual[one.section]!.some((entry) => one.match.test(entry)),
+          `${one.apply}: ${JSON.stringify(actual[one.section])}`,
+        );
+        assert.ok(
+          !EXPECTED[one.section]!.some((entry) => one.match.test(entry)),
+          `the declared map already contains it: ${one.apply}`,
+        );
+      } finally {
+        await pool.query(one.revert);
+      }
+    }
+    await compareDeclaredMap();
+  } finally {
     await lock.release();
   }
 });

@@ -1365,7 +1365,7 @@ remediation — including one register claim that was simply false.
 | Security | **BLOCK** — one HIGH tenant crossover, one LOW over-grant, one LOW disclosed residual |
 | Reliability | **RELIABILITY_RED** — one HIGH, reopening K-06 |
 | Integration Marshal | **BLOCK** — one HIGH, plus three lower findings |
-| Red Team | (recorded when it reports) |
+| Red Team | **BLOCK** — 2 HIGH, 6 MEDIUM, 3 LOW, and three real mutation survivors |
 
 | ID | Sev | Reviewer | Finding | Disposition | Proven by |
 | --- | --- | --- | --- | --- | --- |
@@ -1427,3 +1427,49 @@ singleton (`src/persistence/applicationState.ts`) reroutes unrelated unit tests
 to a shared Postgres store and four of them fail deterministically. The
 Postgres-specific files set what they need themselves. Two reviewers have now
 lost runs to this; it is written down so a third does not.
+
+### THE RED TEAM'S VERDICT AT `86d33c9`: BLOCK — 2 HIGH, 6 MEDIUM, 3 LOW
+
+It could not break C1, the invariant its predecessor broke, and said so with
+its limits named. Everything else it attacked, it broke.
+
+| ID | Sev | Finding | Disposition | Proven by |
+| --- | --- | --- | --- | --- |
+| B1 | HIGH | **`erasure_authorization_id` was unverified free text.** `memory_key_destruction_settlements_scope_unique` is UNIQUE (tenant, workspace, key_ref, erasure_authorization_id) and IS the whole of "action-specific". A settlement already refused as `settlement_already_resolved` was accepted by editing that one string to an id nobody ever issued — 0 rows in the nonce table, 0 in the receipts table — and a STILL_UNKNOWN key became ERASED. | **CLOSED.** The trigger now requires the id to be the authorization the TOMBSTONE records as having witnessed that erasure. S-3b's subject is enforced against real state instead of against a string. The authority/verifier identities remain unresolved — see "What settlement still does not prove" below. | S-3 and S-3b, which had to be rebuilt around real authorizations once the string stopped being free; the trigger's own refusal message |
+| B2 | HIGH | **The settler wrote UNLABELLED destruction evidence, so 055's PROVEN_DESTROYED clause never ran.** The clause sat inside `IF NEW.settlement_receipt_id IS NOT NULL`. Same insert as S-12 with the label NULL → ACCEPTED; provider key `active`; `aaliyah_memory_unerased_merged_records()` returned 0 rows — the database believed an unerased subject erased. The clause guarded the labelling CONVENTION, not the evidence. | **CLOSED.** The settler has NO INSERT on the evidence table. The labelled row is written by `aaliyah_memory_record_settled_destruction`, a SECURITY DEFINER function that reads the settlement and supplies every column from it, refusing any decision but PROVEN_DESTROYED. There is no unlabelled row the settler can write because there is no INSERT it can issue. | S-12, rewritten: the settler's insert is refused `permission denied` with the label AND without it, and the one path that can write refuses a STILL_UNKNOWN settlement |
+| B3 | MEDIUM | **`enterMemoryRole` did not strip `$user`.** It compared literal lowercase strings; a search_path carries the casing whoever set it wrote, so `$User`/`$USER` survived and still resolved to the current role's schema, delivered through `PGOPTIONS`. ATK-P1's HARM did not reproduce — the erasure SQL is `public.`-qualified and all 44 guards pin their own path — but the claim was false, and K-07's own assertion was case-SENSITIVE and could not see it. | **CLOSED.** Compared with `lower()`. The K-07 test now starts from `$User` and asserts case-insensitively. | The K-07 path test, which now fails without the `lower()` |
+| B4 | MEDIUM | **Five more widenings, all invisible.** The worst: a `RULE … DO INSTEAD NOTHING` on `memory_pii_key_erasures` silently swallowed an insert the guard must reject — rows 0 to 0, trigger never fired. `tgenabled` was added for that class and does not cover it: a rule does not disable a trigger, it removes the write the trigger would have seen. `pg_rules`/`pg_rewrite` appeared nowhere in the repo. Also PG16 membership options, `ALTER FUNCTION … RESET search_path` (proconfig), `pg_parameter_acl`, and type/domain ACLs. | **CLOSED.** Five new declared sections: `rules`, `functionConfig`, `membershipOptions`, `parameterPrivileges`, `typePrivileges`. The declared map asserts rules/parameters/types/membership-options are EMPTY and that all 45 `aaliyah_*` functions still carry a pinned path. | A positive control applying the rule, the `RESET search_path`, a parameter grant and a `WITH ADMIN` membership, each reported by name and reverted |
+| B5 | MEDIUM | **A FOCUSED run affirmed `boundToCommit: true, ignored: []` for a git-ignored file** — a positive assertion about a binding nobody checked, in the evidence a reviewer reads. FULL_SUITE correctly refused the same file (K-19 works). Also one-directional: `tracked − discovered` was never computed, and the walk goes only two levels deep, so a tracked test in a deeper directory would silently not run. | **CLOSED.** FOCUSED records `boundToCommit: null` — not checked, not claimed. FULL_SUITE now also refuses `DISCOVERY_MISSED_TRACKED_TESTS`: every tracked `tests/**/*.test.ts` must be in the discovered set. 83 tracked, 83 discovered at this SHA — measured, not assumed. | The watchdog's own evidence object, and the discovery guard |
+| B6 | MEDIUM | **Three real survivors against all 1058 tests**, one exploited. **M10**: `throw MutationAborted("merged_keys_changed_during_proof")` → `continue` survived, and that string appeared in NO test — it is the only control closing the unsound direction of the K-02 proof-before-transaction design. **M3**: dropping `settlement.sound` in the COMPLETION PASS survived AND was exploited to `verified:true, keysPending:0` with the key `active` and the pre-erasure copy still decrypting, while S-9 still passed. **M1**: the `$User` case above. | **CLOSED.** RTX-M10 forces a key into scope between the proof phase and the commit and requires the transient refusal. RTX-M3 drives an unsound settlement through the COMPLETION pass, which S-9 reached only via the pre-check. | RTX-M10, RTX-M3, and the K-07 path test |
+| B7 | MEDIUM | **The obligation ledger blamed the PROVIDER for a settlement-resolved key.** `clearHealedObligations` wrote `resolved_by='PROVIDER'` for rows the SETTLEMENT branch pushed, with the provider never asked — falsifying this register's own claim that "the two are never the same value". Also `policy_version` had no constraint, so "versioned" was a column rather than a property. | **CLOSED.** A settlement-proven key is no longer pushed to the provider-healing list; `settleKeyDestruction` already closes its obligation correctly. `policy_version` is constrained to the known set. | S-3 asserts `resolved_by` is null while unresolved; S-2 asserts `SETTLEMENT`; S-10 asserts `PROVIDER`; the `policy_known` CHECK |
+| B8 | MEDIUM | **`key_version` and `decided_at` were unchecked.** `keyVersion: 999999` for a version-1 key and `decidedAt: 2099-01-01` were both accepted, contradicting the trigger's own header claim that the key "really does belong to that provider AND VERSION". | **CLOSED.** The trigger checks the version against the binding; a CHECK bounds `decided_at` to now plus one minute of clock skew. | The trigger's refusal message and the `decided_not_future` CHECK |
+| B9 | LOW | After a verified erasure the full address is gone everywhere, but producer-chosen FIELD NAMES from the subject's own content survive in `memory_tombstones.payload` — outside X-10's pinned two locations, in a table the owner cannot delete from. `MemoryFieldNameSchema` blocks `.` and `@`, so a contiguous address cannot reach it. | **BOUNDED_AND_PROVEN_NONBLOCKING, DISCLOSED** as a K-18-class residual: producer-chosen identifiers that survive in evidence. Same bound, same reason, and now its own entry rather than a gap in K-14's. | The reviewer's own execution; `MemoryFieldNameSchema` |
+| B10 | LOW | K-12's bound is narrower than written: the map's `memberships` section IS an assertion on cluster-wide role state, so a cluster-scoped GRANT issued from another database on the same cluster breaks it. The reviewer fired it accidentally — 3 assertions failed, 243/246, and removing the grant restored 246/246. | **K-12's wording corrected.** The advisory lock covers the per-database class; the map's role-state sections are themselves cluster-scoped assertions, which is the concrete instance K-12 warned a future author about, now named. | The reviewer's accidental reproduction |
+
+### What settlement still does not prove (B1's residual)
+
+The settlement trigger now resolves the binding, the committed erasure, the key
+version and the erasure authorization against real state. It does **not**
+resolve `settlement_authority_id` or `verifier_principal_id` against anything:
+they are caller-supplied strings, and "independently authorized, independently
+verified" therefore rests on a `CHECK` that the two differ, plus a database
+role that only a settler can enter.
+
+That is a real limit and it is stated rather than implied. Making those two
+identities resolvable needs a principal/authorization model for settlement —
+the same class as W1BR-002, which this register already holds open for W1.6 —
+and inventing a narrower one inside W1.3 would be a second authorization path
+with none of the first one's evidence. **Disposition: DISCLOSED, deferred, and
+NOT claimed as enforced.**
+
+### Corrected: K-12's bound (B10)
+
+`lockSharedMemoryTables` covers the per-database class — `TRUNCATE`, table
+`GRANT`s, `LOCK TABLE`. It cannot cover cluster-scoped DDL. The concrete
+instance, which K-12 previously described only in the abstract: the declared
+privilege map's `roleAttributes`, `memberships` and `membershipOptions`
+sections ARE assertions about cluster-wide role state, so a `GRANT` of a memory
+role issued from ANY database on the same cluster breaks the privileges suite
+wherever it runs. A reviewer fired exactly that by accident. The existing
+mitigation is unchanged — every reviewer gets its own container — and the
+boundary is now written down concretely instead of as a warning.

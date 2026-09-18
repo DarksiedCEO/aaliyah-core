@@ -91,7 +91,7 @@
     "aaliyah_memory_revoker public.memory_tombstones SELECT",
     "aaliyah_memory_settler public.memory_key_destruction_obligations SELECT",
     "aaliyah_memory_settler public.memory_key_destruction_settlements INSERT,SELECT",
-    "aaliyah_memory_settler public.memory_pii_key_erasures INSERT,SELECT"
+    "aaliyah_memory_settler public.memory_pii_key_erasures SELECT"
   ],
   "columns": [
     "aaliyah_memory_hold_officer public.memory_legal_holds.payload UPDATE",
@@ -148,8 +148,7 @@
     "aaliyah_memory_mutator public.memory_record_versions_id_seq SELECT,USAGE",
     "aaliyah_memory_mutator public.memory_tombstones_id_seq SELECT,USAGE",
     "aaliyah_memory_reconciler public.memory_reconciliations_id_seq SELECT,USAGE",
-    "aaliyah_memory_settler public.memory_key_destruction_settlements_id_seq SELECT,USAGE",
-    "aaliyah_memory_settler public.memory_pii_key_erasures_id_seq SELECT,USAGE"
+    "aaliyah_memory_settler public.memory_key_destruction_settlements_id_seq SELECT,USAGE"
   ],
   "schemas": [
     "PUBLIC public USAGE"
@@ -199,7 +198,8 @@
     "aaliyah_memory_mutator public.aaliyah_memory_restricting_hold(text,text,text,text,text)",
     "aaliyah_memory_mutator public.aaliyah_memory_unerased_merged_records(text,text,text)",
     "aaliyah_memory_reader public.aaliyah_memory_restricting_hold(text,text,text,text,text)",
-    "aaliyah_memory_reconciler public.aaliyah_memory_alias_effect_present(text,text,text,text,text,text)"
+    "aaliyah_memory_reconciler public.aaliyah_memory_alias_effect_present(text,text,text,text,text,text)",
+    "aaliyah_memory_settler public.aaliyah_memory_record_settled_destruction(text)"
   ],
   "catalogFunctions": [],
   "securityDefiner": [
@@ -227,6 +227,7 @@
     "public.aaliyah_memory_outcome_guard() OWNER postgres",
     "public.aaliyah_memory_receipt_id_discipline() OWNER postgres",
     "public.aaliyah_memory_reconciliation_derivable() OWNER postgres",
+    "public.aaliyah_memory_record_settled_destruction(text) OWNER postgres",
     "public.aaliyah_memory_record_version_guard() OWNER postgres",
     "public.aaliyah_memory_record_version_hold_guard() OWNER postgres",
     "public.aaliyah_memory_record_version_rewrite_guard() OWNER postgres",
@@ -272,6 +273,7 @@
     "postgres OWNS public.aaliyah_memory_receipt_id_discipline()",
     "postgres OWNS public.aaliyah_memory_reconciliation_derivable()",
     "postgres OWNS public.aaliyah_memory_record_lock(text,text,text)",
+    "postgres OWNS public.aaliyah_memory_record_settled_destruction(text)",
     "postgres OWNS public.aaliyah_memory_record_version_guard()",
     "postgres OWNS public.aaliyah_memory_record_version_hold_guard()",
     "postgres OWNS public.aaliyah_memory_record_version_rewrite_guard()",
@@ -342,6 +344,57 @@
     "public.memory_tombstones memory_tombstones_zy_erasure_reaches_merged O",
     "public.memory_tombstones memory_tombstones_zz_authorization_scope O"
   ],
+  "rules": [],
+  "functionConfig": [
+    "public.aaliyah_alias_binding_action_bound() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_alias_binding_guard() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_alias_binding_hold_guard() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_alias_binding_indexed() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_alias_binding_insert_guard() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_alias_index_insert_guard() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_alias_index_update_guard() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_alias_removal_in_authorization_scope() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_alias_retirement_deactivates_indexes() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_action_state_guard() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_alias_effect_present(text,text,text,text,text,text) search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_consumption_monotonic() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_consumption_stamped() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_deletion_is_erasure() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_deletion_order_guard() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_erasure_reaches_merged() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_first_free_text(jsonb) search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_forbid_row_rewrite() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_identity_edge_from_owner() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_identity_edge_guard() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_jsonb_member_names(jsonb) search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_jsonb_numbers(jsonb) search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_jsonb_strings(jsonb) search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_legal_hold_guard() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_merge_chain_guard() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_merge_chain_hops(text,text,text,text) search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_merged_record_frozen() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_mirror_consumption() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_outcome_guard() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_receipt_id_discipline() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_reconciliation_derivable() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_record_lock(text,text,text) search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_record_settled_destruction(text) search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_record_version_guard() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_record_version_hold_guard() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_record_version_rewrite_guard() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_reject_inexact_numbers() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_restricting_hold(text,text,text,text,text) search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_row_in_authorization_scope() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_settlement_binds_real_key() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_spent_nonce(text,text,text) search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_tombstone_erases_aliases() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_tombstone_guard() search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_memory_unerased_merged_records(text,text,text) search_path=pg_catalog, public, pg_temp",
+    "public.aaliyah_pii_key_erasure_guard() search_path=pg_catalog, public, pg_temp"
+  ],
+  "membershipOptions": [],
+  "parameterPrivileges": [],
+  "typePrivileges": [],
   "roleAttributes": [
     "aaliyah_memory_hold_officer INHERIT",
     "aaliyah_memory_issuer INHERIT",

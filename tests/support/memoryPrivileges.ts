@@ -188,6 +188,80 @@ export async function memoryPrivilegeMap(pool: Pool): Promise<Record<string, str
         JOIN pg_namespace AS n ON n.oid = c.relnamespace AND ${userSchema}
        WHERE NOT t.tgisinternal AND c.relname LIKE 'memory\\_%'
        ORDER BY 1`),
+    /**
+     * A RULE CAN SWALLOW A WRITE WITHOUT FIRING A SINGLE TRIGGER.
+     *
+     * Red team against 86d33c9, MEDIUM (B4), executed: a
+     * `CREATE RULE … AS ON INSERT TO memory_pii_key_erasures DO INSTEAD
+     * NOTHING` silently discarded an insert the guard exists to REJECT — rows
+     * went 0 to 0 and the trigger never ran. `tgenabled` was added to this map
+     * for exactly that class of failure and does not cover it: a rule does not
+     * disable a trigger, it removes the write the trigger would have seen.
+     * `pg_rules` and `pg_rewrite` appeared nowhere in this repository.
+     *
+     * The only rules PostgreSQL creates for itself are the `_RETURN` rules
+     * that define views, so those are excluded and everything else must be
+     * empty.
+     */
+    rules: await q(`
+      SELECT n.nspname || '.' || c.relname || ' ' || r.rulename AS entry
+        FROM pg_rewrite AS r
+        JOIN pg_class AS c ON c.oid = r.ev_class
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace AND ${userSchema}
+       WHERE r.rulename <> '_RETURN' AND c.relname LIKE 'memory\\_%'
+       ORDER BY 1`),
+    /**
+     * B4: `ALTER FUNCTION … RESET search_path` removes a guard's pinned path
+     * without touching its body or its ACL. T-1 asserts the pin elsewhere, but
+     * `proconfig` was not part of the declared surface, so a reset was not a
+     * DIFF here.
+     */
+    functionConfig: await q(`
+      SELECT n.nspname || '.' || p.oid::regprocedure::text || ' ' ||
+             COALESCE(array_to_string(p.proconfig, ' '), '<none>') AS entry
+        FROM pg_proc AS p
+        JOIN pg_namespace AS n ON n.oid = p.pronamespace AND ${userSchema}
+       WHERE p.proname LIKE 'aaliyah\\_%'
+       ORDER BY 1`),
+    /**
+     * B4: a memory role granted to another role used to render identically
+     * whatever the PG16 membership OPTIONS were, so `WITH ADMIN`, `INHERIT` or
+     * `SET` changes were invisible. Options are part of the entry now.
+     */
+    membershipOptions: await q(`
+      SELECT m.rolname || ' IN ' || r.rolname || ' ' ||
+             concat_ws(',',
+               CASE WHEN am.admin_option THEN 'ADMIN' END,
+               CASE WHEN am.inherit_option THEN 'INHERIT' END,
+               CASE WHEN am.set_option THEN 'SET' END) AS entry
+        FROM pg_auth_members AS am
+        JOIN pg_roles AS r ON r.oid = am.roleid
+        JOIN pg_roles AS m ON m.oid = am.member
+       WHERE r.rolname LIKE 'aaliyah\\_%' OR m.rolname LIKE 'aaliyah\\_%'
+       ORDER BY 1`),
+    /**
+     * B4: `pg_parameter_acl` — a GRANT on a configuration PARAMETER, which is
+     * how a role acquires the ability to change settings it should not.
+     */
+    parameterPrivileges: await q(`
+      SELECT ${grantee} || ' ' || pa.parname || ' ' || acl.privilege_type AS entry
+        FROM pg_parameter_acl AS pa
+        CROSS JOIN LATERAL aclexplode(pa.paracl) AS acl
+       WHERE ${reaches}
+       ORDER BY 1`),
+    /**
+     * B4: type and domain ACLs. A memory role that can USE a type it should
+     * not is a smaller thing than a table grant, and it is still a grant the
+     * declared surface did not mention.
+     */
+    typePrivileges: await q(`
+      SELECT ${grantee} || ' ' || n.nspname || '.' || t.typname || ' ' ||
+             acl.privilege_type AS entry
+        FROM pg_type AS t
+        JOIN pg_namespace AS n ON n.oid = t.typnamespace AND ${userSchema}
+        CROSS JOIN LATERAL aclexplode(t.typacl) AS acl
+       WHERE t.typacl IS NOT NULL AND ${reaches}
+       ORDER BY 1`),
     roleAttributes: await q(`
       SELECT rolname || ' ' || concat_ws(',',
                CASE WHEN rolsuper THEN 'SUPERUSER' END, CASE WHEN rolcreaterole THEN 'CREATEROLE' END,

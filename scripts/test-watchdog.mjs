@@ -162,10 +162,11 @@ function fullSuiteFiles() {
 function discoveryBinding(files) {
   const relative = files.filter((file) => !path.isAbsolute(file));
   if (relative.length === 0) {
-    return { verified: true, ignored: [], untracked: [], reason: null };
+    return { verified: true, ignored: [], untracked: [], missing: [], reason: null };
   }
   let ignored = [];
   let untracked = [];
+  let tracked = new Set();
   try {
     // `check-ignore --stdin` exits 1 when nothing matches, which is the
     // ordinary, healthy case — so the exit code is not the answer, stdout is.
@@ -183,12 +184,13 @@ function discoveryBinding(files) {
         verified: false,
         ignored: [],
         untracked: [],
+        missing: [],
         reason: `DISCOVERY_UNVERIFIABLE: git could not be asked which discovered files the commit contains: ${String(error?.message ?? error).slice(0, 200)}`,
       };
     }
   }
   try {
-    const tracked = new Set(
+    tracked = new Set(
       execFileSync("git", ["ls-files", "-z", "--", "tests"], {
         cwd: ROOT,
         encoding: "utf8",
@@ -202,17 +204,38 @@ function discoveryBinding(files) {
       verified: false,
       ignored,
       untracked: [],
+      missing: [],
       reason: `DISCOVERY_UNVERIFIABLE: git could not list the commit's test files: ${String(error?.message ?? error).slice(0, 200)}`,
     };
+  }
+  // ---- AND THE OTHER DIRECTION -----------------------------------------
+  // Red team B5: this only asked whether everything DISCOVERED is in the
+  // commit. A tracked test file the walk MISSES is the same defect pointing
+  // the other way — a test in the commit that silently did not run — and the
+  // walk goes only two levels deep, so `tests/a/b/c.test.ts` is invisible to
+  // it. No such file exists at this SHA (83 tracked, 83 discovered, measured),
+  // which is exactly why it needs checking rather than assuming.
+  const discovered = new Set(relative);
+  const missing = [...tracked]
+    .filter((file) => file.endsWith(".test.ts") && !discovered.has(file))
+    .sort();
+  const reasons = [];
+  if (ignored.length > 0) {
+    reasons.push(
+      `DISCOVERY_NOT_BOUND_TO_COMMIT: ${ignored.length} discovered test file(s) are git-ignored, so they executed without ever appearing in git status: ${ignored.join(", ")}`,
+    );
+  }
+  if (missing.length > 0) {
+    reasons.push(
+      `DISCOVERY_MISSED_TRACKED_TESTS: ${missing.length} test file(s) are in the commit and were NOT discovered, so they did not run: ${missing.join(", ")}`,
+    );
   }
   return {
     verified: true,
     ignored,
     untracked,
-    reason:
-      ignored.length > 0
-        ? `DISCOVERY_NOT_BOUND_TO_COMMIT: ${ignored.length} discovered test file(s) are git-ignored, so they executed without ever appearing in git status: ${ignored.join(", ")}`
-        : null,
+    missing,
+    reason: reasons.length > 0 ? reasons.join(" | ") : null,
   };
 }
 
@@ -353,7 +376,14 @@ async function main() {
   const discovery =
     scope === "FULL_SUITE"
       ? discoveryBinding(files)
-      : { verified: true, ignored: [], untracked: [], reason: null };
+      : // NOT `verified: true`. Red team against 86d33c9, MEDIUM (B5): a
+        // FOCUSED run on a git-ignored file recorded
+        // `{ boundToCommit: true, ignored: [] }` — a positive assertion about
+        // a binding that was never checked, in the evidence file a reviewer
+        // reads. A FOCUSED run's files are named on argv and routinely live
+        // outside the repository, so there is nothing to bind them to; the
+        // honest record is that nobody looked.
+        { verified: null, ignored: [], untracked: [], reason: null };
 
   const startedAt = new Date();
   const runDir = fs.mkdtempSync(path.join(ROOT, ".test-evidence-run-"));
@@ -387,9 +417,14 @@ async function main() {
     files: files.length,
     discovery: {
       scope,
-      boundToCommit: discovery.verified && discovery.ignored.length === 0,
+      // `null` for FOCUSED: not checked, and not claimed either way.
+      boundToCommit:
+        discovery.verified === null
+          ? null
+          : discovery.verified && discovery.ignored.length === 0,
       ignored: discovery.ignored,
       untracked: discovery.untracked,
+      missing: discovery.missing ?? [],
     },
     verdict: null,
     reasons: [],

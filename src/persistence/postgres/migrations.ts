@@ -5414,6 +5414,16 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       -- address to survive a settlement.
       CONSTRAINT memory_key_destruction_settlements_digest_shape
         CHECK (evidence_digest ~ '^sha256:[0-9a-f]{64}$'),
+      -- Red team B8: a settlement decided in the year 2099 was accepted. The
+      -- tolerance is for clock skew between the application and the database,
+      -- not for the future.
+      CONSTRAINT memory_key_destruction_settlements_decided_not_future
+        CHECK (decided_at <= now() + interval '1 minute'),
+      -- Red team B7: policy_version had no constraint at all, so "versioned"
+      -- was a column rather than a property. A new policy version is added
+      -- here deliberately, which is the point of naming one.
+      CONSTRAINT memory_key_destruction_settlements_policy_known
+        CHECK (policy_version IN ('aaliyah.key-destruction-settlement/v1')),
       -- IDEMPOTENT: replaying the same settlement receipt is the same row.
       CONSTRAINT memory_key_destruction_settlements_receipt_unique
         UNIQUE (settlement_receipt_id),
@@ -5473,6 +5483,47 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
         IF NOT FOUND THEN
           RAISE EXCEPTION
             'aaliyah memory: a settlement must name a key whose erasure actually committed under that tombstone'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        -- ---- THE ERASURE REQUEST MUST BE A REAL ONE -------------------
+        --
+        -- Red team against 86d33c9, HIGH (B1): erasure_authorization_id was
+        -- unverified free text. memory_key_destruction_settlements_scope_unique
+        -- is UNIQUE (tenant, workspace, key_ref, erasure_authorization_id) and
+        -- is the whole of "action-specific" — so a settlement already refused
+        -- as settlement_already_resolved was accepted by editing that one
+        -- string to an id nobody ever issued, and a STILL_UNKNOWN key became
+        -- ERASED. Observed: 0 rows in the nonce table, 0 in the receipts
+        -- table, {recorded:true}, survivor erasure verified:true.
+        --
+        -- The tombstone already records the authorization that witnessed the
+        -- erasure, so the settlement is bound to THAT rather than to whatever
+        -- the caller typed.
+        PERFORM 1
+           FROM public.memory_tombstones AS t
+          WHERE t.tenant_id = NEW.tenant_id
+            AND t.workspace_id = NEW.workspace_id
+            AND t.tombstone_id = NEW.erasure_tombstone_id
+            AND t.authorization_id = NEW.erasure_authorization_id;
+        IF NOT FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a settlement must name the authorization that actually witnessed that erasure'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        -- ---- AND THE VERSION, WHICH THE COMMENT ALREADY CLAIMED -------
+        -- Red team B8: key_version was accepted as anything (999999 for a
+        -- version-1 key), while this function's own header claimed the key
+        -- "really does belong to that provider and version".
+        PERFORM 1
+           FROM public.memory_alias_bindings AS b
+          WHERE b.tenant_id = NEW.tenant_id
+            AND b.workspace_id = NEW.workspace_id
+            AND b.mutation_receipt_id = NEW.binding_mutation_receipt_id
+            AND b.pii_key_ref = NEW.key_ref
+            AND b.pii_key_version = NEW.key_version;
+        IF NOT FOUND THEN
+          RAISE EXCEPTION
+            'aaliyah memory: a settlement must name the key VERSION the binding actually carries'
             USING ERRCODE = 'check_violation';
         END IF;
         RETURN NULL;
@@ -5644,10 +5695,62 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       TO aaliyah_memory_settler;
     GRANT USAGE, SELECT ON SEQUENCE memory_key_destruction_settlements_id_seq
       TO aaliyah_memory_settler;
-    -- The destruction evidence a PROVEN_DESTROYED settlement produces. The
-    -- settler needs SELECT alongside INSERT for the ON CONFLICT path.
-    GRANT SELECT, INSERT ON memory_pii_key_erasures TO aaliyah_memory_settler;
-    GRANT USAGE, SELECT ON SEQUENCE memory_pii_key_erasures_id_seq
+    -- ---- THE SETTLER CANNOT WRITE EVIDENCE DIRECTLY -------------------
+    --
+    -- Red team against 86d33c9, HIGH (B2): 055 put the PROVEN_DESTROYED check
+    -- inside IF NEW.settlement_receipt_id IS NOT NULL, so the settler simply
+    -- left the label NULL and the row was ACCEPTED — after which
+    -- aaliyah_memory_unerased_merged_records() returned 0 rows for a subject
+    -- whose key was still active. The clause guarded the labelling
+    -- CONVENTION, not the evidence.
+    --
+    -- So the settler gets SELECT only, and the labelled row is written by a
+    -- SECURITY DEFINER function that always supplies the label. There is no
+    -- unlabelled row the settler can write, because there is no INSERT it can
+    -- issue. (An unlabelled forged row from the MUTATION role remains the
+    -- disclosed W1BR-036 condition, whose answer is the store asking the
+    -- provider — that is unchanged and is not what B2 was about.)
+    GRANT SELECT ON memory_pii_key_erasures TO aaliyah_memory_settler;
+
+    CREATE OR REPLACE FUNCTION public.aaliyah_memory_record_settled_destruction(
+      p_settlement_receipt_id text)
+      RETURNS integer
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public, pg_temp
+      AS $fn$
+      DECLARE
+        v_settlement public.memory_key_destruction_settlements;
+        v_written integer;
+      BEGIN
+        SELECT * INTO v_settlement
+          FROM public.memory_key_destruction_settlements
+         WHERE settlement_receipt_id = p_settlement_receipt_id;
+        IF NOT FOUND THEN
+          RAISE EXCEPTION 'aaliyah memory: no such settlement'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF v_settlement.decision <> 'PROVEN_DESTROYED' THEN
+          RAISE EXCEPTION
+            'aaliyah memory: only a PROVEN_DESTROYED settlement records destruction'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        INSERT INTO public.memory_pii_key_erasures
+          (tenant_id, workspace_id, tombstone_id, alias_id,
+           binding_mutation_receipt_id, key_ref, provider_id, event,
+           settlement_receipt_id)
+        VALUES (v_settlement.tenant_id, v_settlement.workspace_id,
+                v_settlement.erasure_tombstone_id, v_settlement.alias_id,
+                v_settlement.binding_mutation_receipt_id, v_settlement.key_ref,
+                v_settlement.provider_id, 'key_destroyed',
+                v_settlement.settlement_receipt_id)
+        ON CONFLICT ON CONSTRAINT memory_pii_key_erasures_once DO NOTHING;
+        GET DIAGNOSTICS v_written = ROW_COUNT;
+        RETURN v_written;
+      END;
+      $fn$;
+    REVOKE ALL ON FUNCTION public.aaliyah_memory_record_settled_destruction(text) FROM PUBLIC;
+    GRANT EXECUTE ON FUNCTION public.aaliyah_memory_record_settled_destruction(text)
       TO aaliyah_memory_settler;
     -- The obligation ledger: the store records what it could not prove, the
     -- settler closes rows out, and the SELECT-only read-back role lists them

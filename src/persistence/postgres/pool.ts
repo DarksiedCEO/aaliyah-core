@@ -149,6 +149,17 @@ export function boundedQuery(
  * round trip on the hot path and no window where the path is the default one.
  * `SET LOCAL` / `set_config(..., true)` throughout, so neither the role nor
  * the path leaks onto a pooled connection when the transaction ends.
+ *
+ * ---- AND THE COMPARISON IS CASE-INSENSITIVE ---------------------------
+ *
+ * Red team against 86d33c9, MEDIUM (B3): this compared literal lowercase
+ * strings, and a search_path carries the casing whoever set it wrote — so
+ * `$User` or `$USER` survived the strip and still resolved to the current
+ * role's schema. Delivered through `PGOPTIONS`, the effective path became
+ * `pg_catalog, aaliyah_memory_mutator, public`. ATK-P1's HARM did not
+ * reproduce, because the erasure SQL is `public.`-qualified and all 44 guards
+ * pin their own path — but "`$user` is stripped" has to be TRUE, and the test
+ * asserting it was itself case-sensitive and could not see the difference.
  */
 const PINNED_SEARCH_PATH_SQL = `
   SELECT set_config('search_path',
@@ -159,7 +170,8 @@ const PINNED_SEARCH_PATH_SQL = `
       SELECT string_agg(btrim(part), ', ' ORDER BY ord)
         FROM unnest(string_to_array(current_setting('search_path'), ','))
                WITH ORDINALITY AS t(part, ord)
-       WHERE btrim(part) NOT IN ('"$user"', '$user', 'pg_catalog', 'pg_temp')
+       -- CASE-INSENSITIVELY: see the note above this statement (B3).
+       WHERE lower(btrim(part)) NOT IN ('"$user"', '$user', 'pg_catalog', 'pg_temp')
          AND btrim(part) <> ''
     ), ''), 'public') || ', pg_temp', true)`;
 

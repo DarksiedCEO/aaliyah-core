@@ -3039,7 +3039,12 @@ export function createPostgresTrustedMemoryStore(
         );
         if (settlement !== undefined && settlement.sound) {
           settled += 1;
-          provenDestroyed.push(row);
+          // NOT pushed to `provenDestroyed`. Red team B7: that list feeds
+          // `clearHealedObligations`, which writes `resolved_by = 'PROVIDER'`
+          // — so a key proven by a SETTLEMENT was recorded as resolved by a
+          // provider that was never asked, falsifying this file's own claim
+          // that "the two are never the same value". A settlement-resolved
+          // obligation is already closed, correctly, by `settleKeyDestruction`.
           continue;
         }
         countNotProven(
@@ -3484,28 +3489,22 @@ export function createPostgresTrustedMemoryStore(
         ],
       );
       if (satisfies) {
-        // The destruction evidence a PROVEN_DESTROYED settlement produces,
-        // LABELLED as settled. The trigger on this table refuses the row
-        // unless the settlement above exists with this exact decision — which
-        // is the clause that makes STILL_UNKNOWN structurally unable to become
-        // erased.
+        // ---- WRITTEN BY THE DATABASE, FROM THE SETTLEMENT ITSELF ------
+        //
+        // Red team against 86d33c9, HIGH (B2): when the store issued this
+        // INSERT directly, the settler role held INSERT on the table — and
+        // could therefore write an UNLABELLED `key_destroyed` row, which 055's
+        // PROVEN_DESTROYED clause skips entirely because that clause only
+        // applies to labelled rows. The database then reported an unerased
+        // subject as erased.
+        //
+        // The row now comes from a SECURITY DEFINER function that reads the
+        // settlement and supplies every column from it, including the label.
+        // The settler has no INSERT to issue, so there is no unlabelled row it
+        // can write, and no column it can disagree with the settlement about.
         await client.query(
-          `INSERT INTO public.memory_pii_key_erasures
-             (tenant_id, workspace_id, tombstone_id, alias_id,
-              binding_mutation_receipt_id, key_ref, provider_id, event,
-              settlement_receipt_id)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,'key_destroyed',$8)
-           ON CONFLICT ON CONSTRAINT memory_pii_key_erasures_once DO NOTHING`,
-          [
-            request.tenantId,
-            request.workspaceId,
-            request.erasureTombstoneId,
-            request.aliasId,
-            request.bindingMutationReceiptId,
-            request.keyRef,
-            request.providerId,
-            request.settlementReceiptId,
-          ],
+          `SELECT public.aaliyah_memory_record_settled_destruction($1)`,
+          [request.settlementReceiptId],
         );
       }
       // The obligation is CLOSED only by a decision that actually resolves the
