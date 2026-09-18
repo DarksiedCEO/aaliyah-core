@@ -2031,39 +2031,102 @@ test("D-1 a chain of exactly the resolver's depth resolves; a merge that would l
   assert.equal(await resolver().canonicalIdentity(SCOPE, "record-chain-branch"), ids[16]);
 });
 
-test("D-2 the DATABASE refuses the 17th hop even when the store's own check is blinded", async () => {
+test("D-2 the DATABASE refuses the 17th hop with NO application involved at all", async () => {
+  // ---- WHY THIS NO LONGER BLINDS THE STORE BY SHADOWING --------------
+  //
+  // This test used to prove the database half by DECEIVING the application:
+  // it created `d2_shadow.aaliyah_memory_merge_chain_hops(...)` returning 1,
+  // ran `GRANT USAGE ON SCHEMA d2_shadow TO aaliyah_memory_mutator` and
+  // `GRANT EXECUTE` on the planted function, and pointed a pool's
+  // `search_path` at it so the store's own cap check read a false hop count.
+  //
+  // That is precisely the function-shadowing attack this round closed — the
+  // same shape that redirected `aaliyah_memory_unerased_merged_records`, the
+  // erasure guard's helper — and the fixture was issuing the enabling grants
+  // itself. The store's pinned path is now the constant
+  // `pg_catalog, public, pg_temp`, so a planted function cannot be reached.
+  //
+  // It was also never necessary. `aaliyah_memory_merge_chain_guard()` calls
+  // `public.aaliyah_memory_merge_chain_hops(...)` SCHEMA-QUALIFIED and is
+  // SECURITY DEFINER with its own pinned path, so the DATABASE's check was
+  // never blindable in the first place. Removing the application entirely is a
+  // stronger statement than lying to it: the INSERT the store would issue is
+  // issued directly, as the mutation role, and the trigger must still refuse.
   const ids = chainIds(18);
   for (const id of ids) await createRecord(id, { id });
   for (let i = 0; i < 16; i += 1) {
     const { result } = await mergeAtHead(ids[i]!, ids[i + 1]!, `mutation.d2.${i}`);
     assert.equal(result.verified, true, `merge ${i}: ${result.rejection}`);
   }
-  await adminPool.query(`DROP SCHEMA IF EXISTS d2_shadow CASCADE`);
-  await adminPool.query(`CREATE SCHEMA d2_shadow`);
-  await adminPool.query(
-    `CREATE FUNCTION d2_shadow.aaliyah_memory_merge_chain_hops(text, text, text, text)
-       RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$`,
+
+  // The PROSPECTIVE edge would be the 17th hop. The function's third and
+  // fourth arguments are the edge's `from` and `to`, and it returns
+  // incoming(from) + 1 + outgoing(to) — so 16 behind ids[16], plus this edge,
+  // plus 0 ahead of ids[17]. Asserted, because a cap test that has not reached
+  // the cap proves nothing.
+  const hops = await adminPool.query(
+    `SELECT public.aaliyah_memory_merge_chain_hops($1,$2,$3,$4) AS n`,
+    [SCOPE.tenantId, SCOPE.workspaceId, ids[16]!, ids[17]!],
   );
-  await adminPool.query(`GRANT USAGE ON SCHEMA d2_shadow TO aaliyah_memory_mutator`);
-  await adminPool.query(`GRANT EXECUTE ON FUNCTION d2_shadow.aaliyah_memory_merge_chain_hops(text, text, text, text) TO aaliyah_memory_mutator`);
-  const blind = new Pool({
-    connectionString: DB_URL,
-    max: 2,
-    options: `${process.env.PGOPTIONS ?? ""} -c search_path=d2_shadow,public`,
+  assert.equal(
+    Number(hops.rows[0].n),
+    17,
+    "fixture precondition: the next edge must be the 17th hop",
+  );
+
+  // A REAL, CONSUMED authorization for this exact merge, so the
+  // authorization-witness trigger and the scope trigger are genuinely
+  // satisfied. Without it the row is refused for reasons that have nothing to
+  // do with the cap — which is how this test first failed twice, on the
+  // payload-binding CHECKs and then on the witness trigger.
+  const head16 = await store().readHead(SCOPE, ids[16]!);
+  assert.ok(head16);
+  const authId = await spendAuthorization({
+    action: "merge_identity",
+    targetRecordId: ids[16]!,
+    expectedHead: {
+      kind: "version",
+      version: head16.version,
+      contentDigest: head16.contentDigest,
+    },
+    proposedContent: mergeOrder(ids[17]!),
+    mutationReceiptId: "mutation.d2.direct",
   });
-  try {
-    const { receipt, result } = await mergeAtHead(
-      ids[16]!,
-      ids[17]!,
-      "mutation.d2.tail",
-      createPostgresTrustedMemoryStore(blind, readPool),
-    );
-    assert.equal(result.verified, false);
-    assert.equal(result.rejection, "storage_rejected");
-    assert.equal(await nonceConsumedAt(receipt.nonce.bindingDigest), null);
-    assert.equal((await edgesFor(ids[16]!)).length, 0);
-  } finally {
-    await blind.end();
-    await adminPool.query(`DROP SCHEMA IF EXISTS d2_shadow CASCADE`);
-  }
+
+  await assert.rejects(
+    () =>
+      runAs(
+        "aaliyah_memory_mutator",
+        `INSERT INTO memory_identity_edges
+           (tenant_id, workspace_id, principal_id, user_id, kind,
+            from_record_id, to_record_id, from_version,
+            authorization_id, mutation_receipt_id, reason,
+            reason_evidence_ref, effective_at, payload)
+         VALUES ($1,$2,$3,$4,'merged_into',$5,$6,1,
+                 $8,'mutation.d2.direct',
+                 'duplicate_participant','identity:verification/participant-record',
+                 now(), $7::jsonb)`,
+        [
+          SCOPE.tenantId, SCOPE.workspaceId, SCOPE.principalId, SCOPE.userId,
+          ids[16]!, ids[17]!,
+          // The jsonb-to-column binding CHECKs fire BEFORE the AFTER trigger,
+          // so the payload has to satisfy all four of them or the row is
+          // refused for a reason that has nothing to do with the cap:
+          //   ..._authorization_binding, ..._from_binding,
+          //   ..._to_binding, ..._kind_binding
+          JSON.stringify({
+            authorizationId: authId,
+            fromRecordId: ids[16]!,
+            toRecordId: ids[17]!,
+            kind: "merged_into",
+          }),
+          authId,
+        ],
+      ),
+    /merge chain|chain length|hops/i,
+    "the database accepted a 17th hop",
+  );
+
+  // And nothing landed.
+  assert.equal((await edgesFor(ids[16]!)).length, 0);
 });

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test, { after, before } from "node:test";
 import { Pool } from "pg";
+import type { PoolClient } from "pg";
 
 import {
   MEMORY_ALIAS_NORMALIZATION_VERSION,
@@ -82,13 +83,57 @@ const SCOPE: MemoryScope = {
 };
 const VICTIM = "participant-victim";
 const SECOND = "participant-upgrade-second";
-const SHADOW_RECORD_SCHEMA = "upgrade_readback_shadow_record";
 
 let serverPool: Pool;
 let adminPool: Pool;
 let writePool: Pool;
 let readPool: Pool;
-let shadowRecordPool: Pool;
+/**
+ * A read-back pool whose rows disagree with what was committed.
+ *
+ * This file's one divergence fixture used to point a pool's `search_path` at a
+ * shadow schema holding an empty `memory_record_versions`, with
+ * `GRANT USAGE ON SCHEMA ... TO aaliyah_memory_reader` — the exact grant the
+ * search_path attack needed. The store's pin is now the constant
+ * `pg_catalog, public, pg_temp`, so that no longer works and the grant is gone.
+ * The fault is injected at the read-back result boundary instead; the patch is
+ * removed on `release()` so it cannot ride back into the shared pool.
+ */
+function divergingReadPool(
+  base: Pool,
+  rewrite: (rows: Array<Record<string, unknown>>) => Array<Record<string, unknown>>,
+): Pool {
+  const patchClient = (client: PoolClient): PoolClient => {
+    const query = client.query.bind(client);
+    const release = client.release.bind(client);
+    (client as { release: unknown }).release = ((...args: unknown[]) => {
+      (client as { query: unknown }).query = query;
+      (client as { release: unknown }).release = release;
+      return (release as (...a: unknown[]) => unknown)(...args);
+    }) as unknown as PoolClient["release"];
+    (client as { query: unknown }).query = (async (...args: unknown[]) => {
+      const result = (await (query as (...a: unknown[]) => Promise<unknown>)(...args)) as {
+        rows?: Array<Record<string, unknown>>;
+        rowCount?: number;
+      };
+      const sql = typeof args[0] === "string" ? args[0] : "";
+      if (/FROM memory_record_versions/.test(sql) && Array.isArray(result.rows)) {
+        const rows = rewrite(result.rows);
+        return { ...result, rows, rowCount: rows.length };
+      }
+      return result;
+    }) as unknown as PoolClient["query"];
+    return client;
+  };
+  return new Proxy(base, {
+    get(target, prop, receiver) {
+      if (prop === "connect") return async () => patchClient(await target.connect());
+      const value = Reflect.get(target, prop, receiver) as unknown;
+      return typeof value === "function" ? (value as () => unknown).bind(target) : value;
+    },
+  }) as Pool;
+}
+
 
 function store(options?: { readBack?: Pool }) {
   return createPostgresAliasRegistryStore(writePool, options?.readBack ?? readPool, {
@@ -104,22 +149,10 @@ before(async () => {
   await runMailMigrations(adminPool, { through: "049_memory_reconciliation_bindings_not_vacuous" });
   writePool = createMailDbPool({ AALIYAH_DATABASE_URL: DB_URL } as NodeJS.ProcessEnv);
   readPool = createMailDbPool({ AALIYAH_DATABASE_URL: DB_URL } as NodeJS.ProcessEnv);
-  await adminPool.query(`CREATE SCHEMA ${SHADOW_RECORD_SCHEMA}`);
-  await adminPool.query(
-    `CREATE TABLE ${SHADOW_RECORD_SCHEMA}.memory_record_versions (LIKE public.memory_record_versions INCLUDING ALL)`,
-  );
-  await adminPool.query(`GRANT USAGE ON SCHEMA ${SHADOW_RECORD_SCHEMA} TO aaliyah_memory_reader`);
-  await adminPool.query(`GRANT SELECT ON ${SHADOW_RECORD_SCHEMA}.memory_record_versions TO aaliyah_memory_reader`);
-  shadowRecordPool = new Pool({
-    connectionString: DB_URL,
-    max: 2,
-    options: `${process.env.PGOPTIONS ?? ""} -c search_path=${SHADOW_RECORD_SCHEMA},public`,
-  });
   await setPolicy(TENANT, "workspace_isolated");
 });
 
 after(async () => {
-  await shadowRecordPool.end();
   await readPool.end();
   await writePool.end();
   await adminPool.end();
@@ -693,7 +726,12 @@ test("U-0 at 049: a binding commits and an alias mutation is left UNKNOWN, by th
   boundBefore = { headDigest: await headDigestOf(VICTIM, SCOPE) };
 
   const second = await prepareAssign({ aliasId: "alias-upgrade-2", observedAlias: "cfo@example.com", participantId: SECOND });
-  const unknown = await store({ readBack: shadowRecordPool }).assignAlias({
+  // The read-back finds NO record, so the mutation commits and is honestly
+  // left UNKNOWN — which is the state the rest of this upgrade sequence
+  // reconciles against.
+  const unknown = await store({
+    readBack: divergingReadPool(readPool, () => []),
+  }).assignAlias({
     actor: SCOPE,
     authorizationId: second.receipt.authorizationId,
     participantRecordId: SECOND,
