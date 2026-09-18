@@ -1762,6 +1762,48 @@ was verified to FAIL against `a9d203d` and pass after the fix.
 | SEC-02 | HIGH | security | 055 withholds `settled_by` from the mutator's UPDATE grant and says why — but the INSERT grant one line above is TABLE-level, covering every column. The mutation role forges a SETTLED obligation naming a settlement that does not exist; `UNIQUE (tenant, workspace, key_ref)` then means the honest pass can never record the real state, and **058 makes the forgery unrepairable by anyone including the owner**. | OPEN |
 | SEC-03 | HIGH | security | The settlement replay short-circuit compares 7 of 22 columns — not tenant, workspace, subject, authorization or tombstone — and returns `{recorded:true, replay:true}` BEFORE the insert, skipping `scope_unique` and `aaliyah_memory_settlement_binds_real_key()`. The same receipt id under ANOTHER TENANT is reported as a successful replay. | OPEN |
 | SEC-04 | HIGH | security | `evidence` is free text on an append-only table, so plaintext an erasure removed survives permanently in the artifact that completes the erasure. Migration 055 names this exact hazard six lines from the column and then constrains the DIGEST instead. Migration 059 constrains the SHAPE but still permits prose. | OPEN |
+
+#### SEC-05, ATTEMPTED AND WITHDRAWN — WHY THE OBVIOUS FIX DOES NOT WORK YET
+
+Schema-qualifying the store's SQL was attempted on 2026-09-18 and **reverted**.
+The mechanical change is small — 73 references across seven persistence
+modules, plus 27 more in `applicationStore` and `idempotencyStore` — and it
+typechecks. It then fails **22 tests**, all of them the read-back divergence
+cases in `wave1AliasRegistryPostgres` and `wave1TrustedMemoryPostgres`.
+
+The reason is worth writing down, because it is the finding underneath the
+finding. Those tests prove that a read-back whose content diverges from what
+was committed is reported UNKNOWN rather than success — and the way they
+CREATE that divergence is a dedicated pool whose `search_path` puts a shadow
+schema ahead of `public`. Their own comment defends the choice: it "leaves the
+production read path completely untouched — no injected failure hook, no
+stubbed client". That instinct is right, but the capability it relies on is
+**exactly the capability SEC-05 says must not exist**. The fixtures depend on
+the vulnerability.
+
+So the fix is not one change but two, and they must land together:
+
+1. Qualify the store's SQL (and, separately, decide whether
+   `enterMemoryRole` should stop preserving operator-configured schemas at
+   all — that closes the class rather than the instances, and breaks the same
+   22 tests for the same reason).
+2. Re-found the divergence fixtures on a seam that does not require schema
+   resolution to be subvertible. `readBackPool` is already an injection point
+   (`wave1AliasRegistryStore.ts:376`), so the honest replacement is to perturb
+   the REAL row in `public` on the read-back connection — which is what a
+   divergence actually is — rather than to redirect the read elsewhere.
+
+Attempting (1) alone leaves the tree red, and attempting it by weakening the
+tests would be the same defect this register keeps recording. Recorded here
+rather than half-applied.
+
+**Two migration edits were also reverted as part of this**: the mechanical pass
+qualified role names inside `REVOKE … FROM <role>` statements in
+`migrations.ts`, which is a syntax error, and would in any case have changed
+the content of already-applied migrations and tripped 057's digest guard on
+every existing database. A reminder that a regex over SQL does not know what a
+noun is.
+
 | SEC-05 | MEDIUM | security | 85 of 99 store SQL statements are unqualified; a shadowed `memory_pii_key_erasures` made the boot pass report all-zero counters over a live key, and `server.ts` logs only non-zero counters, so it is silent AND fail-open. `pool.ts`'s stated reason this is safe ("the erasure SQL is public.-qualified") is false. | OPEN |
 | SEC-06 | MEDIUM | security | `pg_db_role_setting` is in no section of the declared privilege map. `ALTER DATABASE … SET session_replication_role='replica'` disables all 44 triggers including 058, leaves `tgenabled` at `'O'`, and produces ZERO map diff — strictly more powerful than the `DISABLE TRIGGER` the map does catch. Superuser precondition. | OPEN |
 | SEC-07 | MEDIUM | security | A SECURITY DEFINER function planted in `pg_catalog` — FIRST on every pinned path — is invisible to all five function sections of the map, and was used to read a table the reader is denied. This is K-16/W3, the finding the map was rewritten to catch. | OPEN |
