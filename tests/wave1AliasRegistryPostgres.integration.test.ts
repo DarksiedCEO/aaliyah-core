@@ -90,11 +90,8 @@ const CORPUS_REF = "corpus:alias-protected-domains/v1";
  * the record agreement and the binding agreement are separable: whatever the
  * shadow does not define resolves from `public` and is therefore correct.
  */
-const SHADOW_RECORD_SCHEMA = "alias_readback_shadow_record";
-const SHADOW_BINDING_SCHEMA = "alias_readback_shadow_binding";
 
 /** Same shape as the binding table, WITHOUT its CHECK constraints. */
-const UNCHECKED_SCHEMA = "alias_binding_unchecked";
 
 const TENANT = "tenant-alias";
 const TENANT_EXCLUSIVE = "tenant-alias-exclusive";
@@ -203,9 +200,6 @@ function divergingReadPool(
   }) as Pool;
 }
 
-let shadowRecordPool: Pool;
-let shadowBindingPool: Pool;
-let uncheckedPool: Pool;
 let adminPool: Pool;
 // See tests/support/sharedMemoryTables.ts: this file TRUNCATEs tables the
 // trusted-memory suite also TRUNCATEs, and `node --test` runs files in
@@ -233,69 +227,17 @@ before(async () => {
     AALIYAH_DATABASE_URL: DB_URL,
   } as NodeJS.ProcessEnv);
 
-  for (const [schema, table] of [
-    [SHADOW_RECORD_SCHEMA, "memory_record_versions"],
-    [SHADOW_BINDING_SCHEMA, "memory_alias_bindings"],
-  ] as const) {
-    await adminPool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
-    await adminPool.query(`CREATE SCHEMA ${schema}`);
-    await adminPool.query(
-      `CREATE TABLE ${schema}.${table} (LIKE public.${table} INCLUDING ALL)`,
-    );
-    await adminPool.query(
-      `GRANT USAGE ON SCHEMA ${schema} TO aaliyah_memory_reader`,
-    );
-    await adminPool.query(
-      `GRANT SELECT ON ${schema}.${table} TO aaliyah_memory_reader`,
-    );
-  }
-  shadowRecordPool = new Pool({
-    connectionString: DB_URL,
-    max: 4,
-    options: `${process.env.PGOPTIONS ?? ""} -c search_path=${SHADOW_RECORD_SCHEMA},public`,
-  });
-  shadowBindingPool = new Pool({
-    connectionString: DB_URL,
-    max: 4,
-    options: `${process.env.PGOPTIONS ?? ""} -c search_path=${SHADOW_BINDING_SCHEMA},public`,
-  });
-
-  // A relation shaped like the binding table but WITHOUT its CHECK
-  // constraints. In `public`, migration 031 makes a row whose columns disagree
-  // with its jsonb payload physically unrepresentable — which would leave the
-  // application-level binding check with no reachable input and therefore no
-  // killing test. A replica, a restored backup, or a table created by
-  // something other than these migrations has no such guarantee, so the check
-  // is exercised against a relation that has no guarantee either.
-  await adminPool.query(`DROP SCHEMA IF EXISTS ${UNCHECKED_SCHEMA} CASCADE`);
-  await adminPool.query(`CREATE SCHEMA ${UNCHECKED_SCHEMA}`);
-  await adminPool.query(
-    `CREATE TABLE ${UNCHECKED_SCHEMA}.memory_alias_bindings
-       (LIKE public.memory_alias_bindings INCLUDING DEFAULTS)`,
-  );
-  await adminPool.query(
-    `GRANT USAGE ON SCHEMA ${UNCHECKED_SCHEMA} TO aaliyah_memory_reader`,
-  );
-  await adminPool.query(
-    `GRANT SELECT ON ${UNCHECKED_SCHEMA}.memory_alias_bindings
-       TO aaliyah_memory_reader`,
-  );
-  uncheckedPool = new Pool({
-    connectionString: DB_URL,
-    max: 2,
-    options: `${process.env.PGOPTIONS ?? ""} -c search_path=${UNCHECKED_SCHEMA},public`,
-  });
+  // NO SHADOW SCHEMAS. The divergence and binding-mismatch fixtures used to
+  // create real relations here and point a pool's `search_path` at them, with
+  // `GRANT USAGE ON SCHEMA ... TO aaliyah_memory_reader` — the exact grant
+  // that completes the search_path attack this round closed. The fault is now
+  // injected at the read-back result boundary by `divergingReadPool`, so
+  // neither the schemas nor the grants exist.
 });
 
 after(async () => {
-  await uncheckedPool.end();
-  await shadowBindingPool.end();
-  await shadowRecordPool.end();
   await readPool.end();
   await writePool.end();
-  await adminPool.query(`DROP SCHEMA IF EXISTS ${SHADOW_RECORD_SCHEMA} CASCADE`);
-  await adminPool.query(`DROP SCHEMA IF EXISTS ${SHADOW_BINDING_SCHEMA} CASCADE`);
-  await adminPool.query(`DROP SCHEMA IF EXISTS ${UNCHECKED_SCHEMA} CASCADE`);
   await sharedTableLock.release();
   await adminPool.end();
 });
@@ -335,19 +277,6 @@ beforeEach(async () => {
   }
   genesisCounter = 0;
   // TENANT_UNGOVERNED deliberately gets NO policy row.
-  await adminPool.query(
-    `TRUNCATE ${SHADOW_RECORD_SCHEMA}.memory_record_versions RESTART IDENTITY`,
-  );
-  await adminPool.query(
-    `TRUNCATE ${SHADOW_BINDING_SCHEMA}.memory_alias_bindings,
-              memory_alias_blind_indexes,
-              memory_pii_key_erasures RESTART IDENTITY`,
-  );
-  await adminPool.query(
-    `TRUNCATE ${UNCHECKED_SCHEMA}.memory_alias_bindings,
-              memory_alias_blind_indexes,
-              memory_pii_key_erasures RESTART IDENTITY`,
-  );
 });
 
 /**
@@ -3250,44 +3179,45 @@ test("a read-back whose CONTENT diverges from what was committed is not success"
     observedAlias: "ceo@example.com",
     participantId: VICTIM,
   });
-  // The shadow holds a record whose content is NOT the content that was
-  // committed, so the digest recomputed from the bytes that came BACK differs
-  // from the digest of the bytes that went out.
+  // The head handed back holds content that is NOT what was committed, so the
+  // digest recomputed from the bytes that came BACK differs from the digest of
+  // the bytes that went out. That recomputation is the store's own, and it runs
+  // unmodified here.
   const otherContent = { participant: VICTIM, generation: 41 };
   const otherDigest = memoryContentDigest(otherContent);
   assert.notEqual(otherDigest, memoryContentDigest(prepared.content));
-  await adminPool.query(
-    `INSERT INTO ${SHADOW_RECORD_SCHEMA}.memory_record_versions
-       (tenant_id, workspace_id, principal_id, user_id, record_id, version,
-        state, content_digest, predecessor_digest, authorization_id,
-        mutation_receipt_id, payload)
-     VALUES ($1,$2,$3,$4,$5,2,'active',$6,$10,$7,$8,$9)`,
-    [
-      SCOPE.tenantId,
-      SCOPE.workspaceId,
-      SCOPE.principalId,
-      SCOPE.userId,
-      VICTIM,
-      otherDigest,
-      "genesis-000000000000000000000",
-      "mutation.genesis",
-      JSON.stringify({
-        schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
-        recordId: VICTIM,
+  const diverged = divergingReadPool(readPool, {
+    record: () => [
+      {
+        id: 999_999,
+        tenant_id: SCOPE.tenantId,
+        workspace_id: SCOPE.workspaceId,
+        principal_id: SCOPE.principalId,
+        user_id: SCOPE.userId,
+        record_id: VICTIM,
         version: 2,
         state: "active",
-        scope: SCOPE,
-        content: otherContent,
-        contentDigest: otherDigest,
-        predecessorDigest: prepared.genesis,
-        authorizationId: "genesis-000000000000000000000",
-        mutationReceiptId: "mutation.genesis",
-        createdAt: isoOffset(-120_000),
-      }),
-      prepared.genesis,
+        content_digest: otherDigest,
+        predecessor_digest: prepared.genesis,
+        authorization_id: "genesis-000000000000000000000",
+        mutation_receipt_id: "mutation.genesis",
+        payload: {
+          schemaVersion: MEMORY_RECORD_VERSION_SCHEMA_VERSION,
+          recordId: VICTIM,
+          version: 2,
+          state: "active",
+          scope: SCOPE,
+          content: otherContent,
+          contentDigest: otherDigest,
+          predecessorDigest: prepared.genesis,
+          authorizationId: "genesis-000000000000000000000",
+          mutationReceiptId: "mutation.genesis",
+          createdAt: isoOffset(-120_000),
+        },
+      },
     ],
-  );
-  const result = await store({ readBack: shadowRecordPool }).assignAlias({
+  });
+  const result = await store({ readBack: diverged }).assignAlias({
     actor: SCOPE,
     authorizationId: prepared.receipt.authorizationId,
     participantRecordId: VICTIM,
@@ -3311,12 +3241,15 @@ test("a record head that advanced while the REGISTRY did not is UNKNOWN, not suc
     observedAlias: "ceo@example.com",
     participantId: VICTIM,
   });
-  // The shadow's binding table is EMPTY and resolves first, so the read-back
-  // sees a correctly advanced record and NO binding. Reporting that as a
-  // successful alias assignment is precisely the defect this file exists to
-  // prevent.
+  // The BINDING read comes back empty while the RECORD read is untouched, so
+  // the read-back sees a correctly advanced record and NO binding. Reporting
+  // that as a successful alias assignment is precisely the defect this file
+  // exists to prevent. Rewriting one relation and not the other is why the
+  // seam is per-relation: the old fixture used a shadow schema holding exactly
+  // one of the two tables for the same reason.
+  const noBinding = divergingReadPool(readPool, { binding: () => [] });
   const result = await store({
-    readBack: shadowBindingPool,
+    readBack: noBinding,
   }).assignAlias({
     actor: SCOPE,
     authorizationId: prepared.receipt.authorizationId,
@@ -3332,67 +3265,64 @@ test("a record head that advanced while the REGISTRY did not is UNKNOWN, not suc
 });
 
 test("a binding row whose columns disagree with its payload is refused, not reconciled", async () => {
-  // Only possible on a relation without migration 031's CHECK constraints.
-  await adminPool.query(
-    `INSERT INTO ${UNCHECKED_SCHEMA}.memory_alias_bindings
-       (tenant_id, workspace_id, principal_id, user_id,
-        cross_workspace_policy, scope_key, alias_id,
-        skeleton_algorithm, normalization_profile,
-        canonical_participant_id, script_code,
-        restriction_level, subject_participant_id, source_evidence_ref,
-        source_evidence_digest, observed_at, fresh_until,
-        authorization_id, mutation_receipt_id, bound_at, payload,
-              pii_envelope, pii_key_ref, pii_key_version)
-     VALUES ($1,$2,$3,$4,'workspace_isolated',$2,'alias-unchecked',
-             'aaliyah.alias-skeleton/core-subset-v1',
-             'aaliyah.alias-normalization/core-v1',
-             $5,'Latn','ascii_only',$5,
-             'identity:verification/participant-record',$6,
-             now(), now() + interval '1 hour',
-             'auth-alias-00000000000000000000','mutation.unchecked',
-             now(), $7::jsonb, '{"keyRef":"pii-key:raw","keyVersion":1}'::jsonb,'pii-key:raw',1)`,
-    [
-      SCOPE.tenantId,
-      SCOPE.workspaceId,
-      SCOPE.principalId,
-      SCOPE.userId,
-      VICTIM,
-      EVIDENCE_DIGEST,
-      JSON.stringify({
-        schemaVersion: `${WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION}#alias-binding-stored/v2`,
-        aliasId: "alias-unchecked",
-        scope: SCOPE,
-        crossWorkspacePolicy: "workspace_isolated",
-        scopeKey: SCOPE.workspaceId,
-        // THE LIE: the payload names a different participant than the column.
-        canonicalParticipantId: ATTACKER,
-        normalizationProfile: "aaliyah.alias-normalization/core-v1",
-        skeletonAlgorithm: "aaliyah.alias-skeleton/core-subset-v1",
-        scriptCode: "Latn",
-        restrictionLevel: "ascii_only",
-        subjectParticipantId: VICTIM,
-        sourceEvidenceRef: "identity:verification/participant-record",
-        sourceEvidenceDigest: EVIDENCE_DIGEST,
-        observedAt: isoOffset(-60_000),
-        freshUntil: isoOffset(3_600_000),
-        authorizationId: "auth-alias-00000000000000000000",
-        mutationReceiptId: "mutation.unchecked",
-        boundAt: isoOffset(-1000),
-        pii: {
-          algorithm: "AES-256-GCM/aaliyah-pii-envelope-v1",
-          providerId: "local-test/v1",
-          keyRef: "pii-key:raw",
-          keyVersion: 1,
+  // Migration 031's CHECK constraints make this UNREPRESENTABLE in `public`,
+  // which is why the fixture cannot build it in the database at all — the very
+  // next test proves each of those CHECKs refuses the row it exists for. It
+  // used to be built in a constraint-free shadow schema reached by
+  // `search_path`; that mechanism was the vulnerability, so the row is
+  // substituted at the read-back instead. Same fault, same boundary: the
+  // database handed back a binding whose columns and payload disagree, and the
+  // application-level binding check is what must catch it.
+  const lying = divergingReadPool(readPool, {
+    binding: () => [
+      {
+        tenant_id: SCOPE.tenantId,
+        workspace_id: SCOPE.workspaceId,
+        alias_id: "alias-unchecked",
+        canonical_participant_id: VICTIM,
+        scope_key: SCOPE.workspaceId,
+        cross_workspace_policy: "workspace_isolated",
+        mutation_receipt_id: "mutation.unchecked",
+        removed_at: null,
+        removed_by_mutation_receipt_id: null,
+        pii_envelope: { keyRef: "pii-key:raw", keyVersion: 1 },
+        pii_key_ref: "pii-key:raw",
+        pii_key_version: 1,
+        pii_erased_at: null,
+        pii_erasure_tombstone_id: null,
+        payload: {
+          schemaVersion: `${WAVE1_TRUSTED_MEMORY_CONTRACT_VERSION}#alias-binding-stored/v2`,
+          aliasId: "alias-unchecked",
+          scope: SCOPE,
+          crossWorkspacePolicy: "workspace_isolated",
+          scopeKey: SCOPE.workspaceId,
+          // THE LIE: the payload names a different participant than the column.
+          canonicalParticipantId: ATTACKER,
+          normalizationProfile: "aaliyah.alias-normalization/core-v1",
+          skeletonAlgorithm: "aaliyah.alias-skeleton/core-subset-v1",
+          scriptCode: "Latn",
+          restrictionLevel: "ascii_only",
+          subjectParticipantId: VICTIM,
+          sourceEvidenceRef: "identity:verification/participant-record",
+          sourceEvidenceDigest: EVIDENCE_DIGEST,
+          observedAt: isoOffset(-60_000),
+          freshUntil: isoOffset(3_600_000),
+          authorizationId: "auth-alias-00000000000000000000",
+          mutationReceiptId: "mutation.unchecked",
+          boundAt: isoOffset(-1000),
+          pii: {
+            algorithm: "AES-256-GCM/aaliyah-pii-envelope-v1",
+            providerId: "local-test/v1",
+            keyRef: "pii-key:raw",
+            keyVersion: 1,
+          },
         },
-      }),
+      },
     ],
-  );
+  });
+
   await assert.rejects(
-    () =>
-      store({ readBack: uncheckedPool }).readAliasBinding(
-        SCOPE,
-        "alias-unchecked",
-      ),
+    () => store({ readBack: lying }).readAliasBinding(SCOPE, "alias-unchecked"),
     /binding row and payload mismatch/,
   );
 });
@@ -4165,7 +4095,13 @@ async function fileAliasVerdictAsReconciler(input: {
 
 test("Q-1 RT2-R1: a CORRECT assign_alias whose read-back failed reconciles to COMMITTED_CONFIRMED, and the database refuses DIVERGED", async () => {
   const prepared = await prepareAssign({ aliasId: "alias-q1", observedAlias: "ceo@example.com", participantId: VICTIM });
-  const result = await store({ readBack: shadowRecordPool }).assignAlias({
+  // The read-back finds NO record, so the mutation commits and honestly reports
+  // unknown. What this test is about is what happens NEXT: reconciliation must
+  // derive COMMITTED_CONFIRMED from stored state, and the database must refuse
+  // a DIVERGED verdict that contradicts it.
+  const result = await store({
+    readBack: divergingReadPool(readPool, { record: () => [] }),
+  }).assignAlias({
     actor: SCOPE,
     authorizationId: prepared.receipt.authorizationId,
     participantRecordId: VICTIM,
@@ -4198,7 +4134,9 @@ test("Q-2 a CORRECT remove_alias whose read-back failed reconciles to COMMITTED_
       proposedContentDigest: aliasRemovalDigest({ record: removalContent, aliasId: "alias-q2" }),
     }),
   );
-  const result = await store({ readBack: shadowRecordPool }).removeAlias({
+  const result = await store({
+    readBack: divergingReadPool(readPool, { record: () => [] }),
+  }).removeAlias({
     actor: SCOPE,
     authorizationId: removal.authorizationId,
     participantRecordId: VICTIM,
