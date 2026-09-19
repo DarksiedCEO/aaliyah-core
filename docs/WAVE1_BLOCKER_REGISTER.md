@@ -1934,3 +1934,53 @@ resulting failures an environment mistake rather than a candidate defect. That
 disclosure stops one level short: the environment mistake is what makes the
 Postgres store run in those unit tests, and the double count underneath it is a
 real defect reachable in production without any environment mistake at all.
+
+---
+
+## STANDING RULES (founder, effective 2026-09-19)
+
+Three respins in 24 hours, all test-only, all the same defect class in the same
+test: an assertion that reads like a proof and cannot fail. The production
+search_path fix has been unchanged since `8958d09`. These rules tighten the
+loop that kept finding them one at a time.
+
+### RULE 1 — TEST-ONLY RESPINS DO NOT STOP FOR A DECISION
+
+A fix that changes **no production code** and **no scope**: respin
+automatically. Tag the new candidate, record the reason here, continue. Do not
+stop for approval.
+
+STOP, and ask, only for:
+  - a change to production code,
+  - a change of scope,
+  - a finding that needs founder judgement.
+
+Verification that a respin qualifies is mechanical and must be shown:
+`git diff <prev-tag> <new-tag> -- src/` must be EMPTY.
+
+### RULE 2 — ONE ASSERTION-REACHABILITY SWEEP, NOT ONE PER ROUND
+
+Before the seven reviewers: for EVERY assertion in the W1.3 hardening tests,
+prove it can fail by mutating exactly what it checks. Fix every unreachable one
+in a SINGLE commit.
+
+This is what a fourth round would have found anyway. Three rounds each found
+one: the specific assertions unreachable behind an equality; their ordering
+hiding which protection broke; and `assert.equal(leaked, before)` sitting under
+a comment claiming "nothing leaked onto the pooled connection" while every path
+ended in ROLLBACK, which PostgreSQL treats identically for `SET` and
+`SET LOCAL`.
+
+### RULE 3 — RE-RUN SCOPE FOLLOWS WHAT CHANGED
+
+  test-only change      -> suite + destroyer step + mutation/fuzz SCOPED to
+                           what the changed test covers
+  production-code change -> full gates 1-3
+
+Record which case applied and WHY, here, every time. Nothing is skipped
+silently.
+
+**This is a scoping rule, not a shortcut.** If it cannot be said CONFIDENTLY
+what a changed test covers, the answer is the full re-run. Uncertainty resolves
+toward more verification, never less — which is the whole reason the doctrine
+says a changed subject invalidates certification for the changed code.
