@@ -1875,3 +1875,62 @@ behind the dead self-verification pre-check, and migration 023's CHECKs that
 make a column/payload mismatch unrepresentable. A CHECK with no drop-test is an
 invariant nobody has confirmed is load-bearing — and this register has now been
 wrong in both directions about exactly that.
+
+---
+
+## DEFERRED, SCHEDULED — APPROVAL-REVIEW DOUBLE COUNT (OUT OF W1.3 SCOPE)
+
+**MEDIUM · production-reachable · NOT a Trusted Memory defect · founder-scheduled
+as the FIRST change after W1.3 certification and BEFORE any repo
+consolidation.**
+
+Found by the independent mutation/fuzz gate against `w13-candidate-2`, outside
+its mutation sweep, by ordinary execution of the unmutated candidate. Verified
+here independently.
+
+### The defect
+
+`createPostgresApplicationStore`'s `approvals.insert`
+(`src/persistence/postgres/applicationStore.ts`) omits `reviewed_at` from its
+INSERT column list entirely. `approvalFromRow` then synthesises `reviewedAt`
+from the database's own `created_at`:
+
+    reviewedAt: new Date(row.created_at as string).toISOString(),
+
+So a caller-supplied `reviewedAt` is silently discarded and replaced.
+
+`listApprovalReviews` (`src/services/followup/recordApprovalReview.ts`)
+de-duplicates the in-process bucket against the durable read-back on
+
+    taskId + threadId + reviewedAt
+
+Because the persisted `reviewedAt` is a different instant from the one the
+caller supplied, the cached record and the stored record never compare equal
+and **every review is counted twice**. The Postgres-backed application store is
+what production always uses.
+
+Effect: corrupted approval-review audit trails. Tenant scoping holds; no PII or
+erasure boundary is crossed.
+
+### Why it is NOT being fixed in the W1.3 candidate
+
+Follow-up approvals are a different subsystem. Folding the fix into the frozen
+candidate would put an approvals change into a diff that seven Trusted Memory
+gates were designed to attack — none of them would be attacking it. Scope
+discipline is the point of the freeze.
+
+### Why it is NOT merely "logged"
+
+The fix is scheduled as the FIRST change after W1.3 certifies and before the
+monorepo consolidation, with its own small gate. A known audit-trail defect
+must not become the base the monorepo is built on, which is how "known, logged,
+deferred" becomes "carried over". Persisting `reviewedAt` is a one-line change;
+the gate around it is what takes the time.
+
+### Relationship to G-11
+
+G-11 records "do not export AALIYAH_DATABASE_URL globally" and calls the
+resulting failures an environment mistake rather than a candidate defect. That
+disclosure stops one level short: the environment mistake is what makes the
+Postgres store run in those unit tests, and the double count underneath it is a
+real defect reachable in production without any environment mistake at all.

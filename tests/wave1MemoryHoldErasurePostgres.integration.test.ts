@@ -5254,9 +5254,39 @@ test("K-07: the pinned path is a CONSTANT — nothing from the session can influ
       );
 
       await client.query("ROLLBACK");
-      // SET LOCAL: nothing leaked onto the pooled connection.
+      // Nothing leaked onto the pooled connection — but ROLLBACK alone CANNOT
+      // prove that, which is what the COMMIT case below is for.
       const leaked = (await client.query(`SELECT current_setting('search_path') AS p`)).rows[0].p as string;
       assert.equal(leaked, before);
+
+      // ---- THE LOCALITY FLAG, WHICH ROLLBACK CANNOT SEE ---------------
+      //
+      // Independent mutation/fuzz against w13-candidate-2 (MUT-A3) changed
+      // `set_config(..., true)` to `(..., false)` in the pin and SURVIVED. The
+      // assertion above reads like it guards exactly that and cannot, because
+      // PostgreSQL rolls back a SESSION-level `SET` on ROLLBACK just as it
+      // does a `SET LOCAL`. Measured against the engine:
+      //
+      //            ROLLBACK            COMMIT
+      //   true     reverts             reverts
+      //   false    reverts             PERSISTS on the pooled connection
+      //
+      // So the two are indistinguishable on every path this test took, and the
+      // comment above claimed a property nothing verified. Third time in this
+      // one test that an assertion has read like a proof and been unable to
+      // fail — after the three specific assertions that were unreachable
+      // behind an equality, and the ordering that hid which protection broke.
+      //
+      // A COMMIT is the only path that separates them.
+      await client.query("BEGIN");
+      await enterMemoryRole(client, "aaliyah_memory_reader");
+      await client.query("COMMIT");
+      const afterCommit = (await client.query(`SELECT current_setting('search_path') AS p`)).rows[0].p as string;
+      assert.equal(
+        afterCommit,
+        before,
+        `the pin is not transaction-local: it survived COMMIT onto the pooled connection as ${afterCommit}`,
+      );
     } finally {
       client.release();
     }
