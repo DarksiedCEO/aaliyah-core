@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import test, { after, before } from "node:test";
 import { Pool } from "pg";
+import type { PoolClient } from "pg";
 
-import { runMailMigrations } from "../src/persistence/postgres/migrations";
+import {
+  createLedgerToleratingARace,
+  runMailMigrations,
+} from "../src/persistence/postgres/migrations";
 import { MIGRATION_BOUNDS } from "../src/persistence/postgres/pool";
 
 /**
@@ -184,6 +188,166 @@ test("the migrator leaves NO session state on the connection it returns — succ
       assert.equal(held.rows[0].n, 0);
     } finally {
       await pool.end().catch(() => undefined);
+    }
+  });
+});
+
+test("K-06b: each SQLSTATE a lost ledger race can raise is tolerated, and only when the ledger really appeared", async () => {
+  // ---- TESTED AT ITS OWN SEAM, AND WHY ------------------------------
+  //
+  // Candidate-3 crashed intermittently in full-suite runs, ~1 in 5 and never
+  // in isolation, with `type "aaliyah_mail_migrations" already exists` —
+  // SQLSTATE 42710, which the tolerated set did not list. `CREATE TABLE` also
+  // creates a type of the same name, so a losing racer can die on `pg_type`
+  // rather than on the table.
+  //
+  // Two ways of staging that race were tried and BOTH failed to reproduce it:
+  //   - six concurrent migrators over eight fresh databases: 0 crashes in 48,
+  //     because the window only opens under load;
+  //   - a barrier, with a winner holding an uncommitted CREATE TABLE: the
+  //     loser blocks, then RE-CHECKS after the wait and skips cleanly, which
+  //     is the benign path and never 42710. A destroyer run proved that
+  //     version did not discriminate: removing 42710 left it passing.
+  //
+  // 42710 needs the loser past its existence check BEFORE the winner commits,
+  // too narrow to stage on demand. So the tolerance is exercised where it
+  // lives: a `bounded` that raises each SQLSTATE and then answers the presence
+  // re-check.
+  for (const code of ["42P07", "23505", "42710"]) {
+    let asked = 0;
+    const bounded = (async (sql: string) => {
+      if (/CREATE TABLE/i.test(sql)) {
+        const error = new Error(`already exists (${code})`) as Error & { code: string };
+        error.code = code;
+        throw error;
+      }
+      asked += 1;
+      return { rows: [{ present: true }], rowCount: 1 };
+    }) as unknown as Parameters<typeof createLedgerToleratingARace>[0];
+
+    await createLedgerToleratingARace(bounded);
+    assert.equal(asked, 1, `${code}: the tolerance did not re-check that the ledger exists`);
+  }
+
+  // ---- TOLERANCE, NOT BLANKET SUPPRESSION ---------------------------
+  const other = (async (sql: string) => {
+    if (/CREATE TABLE/i.test(sql)) {
+      const error = new Error("permission denied for schema public") as Error & { code: string };
+      error.code = "42501";
+      throw error;
+    }
+    return { rows: [{ present: true }], rowCount: 1 };
+  }) as unknown as Parameters<typeof createLedgerToleratingARace>[0];
+  await assert.rejects(() => createLedgerToleratingARace(other), /permission denied/);
+
+  // A lost-race code whose ledger did NOT appear is a duplicate object from
+  // something that is not this table, and must still propagate.
+  const absent = (async (sql: string) => {
+    if (/CREATE TABLE/i.test(sql)) {
+      const error = new Error("type already exists") as Error & { code: string };
+      error.code = "42710";
+      throw error;
+    }
+    return { rows: [{ present: false }], rowCount: 1 };
+  }) as unknown as Parameters<typeof createLedgerToleratingARace>[0];
+  await assert.rejects(() => createLedgerToleratingARace(absent), /type already exists/);
+});
+
+test("K-06c: migrators SERIALIZE on the advisory lock before the ledger exists", async () => {
+  // ---- THE LOCK'S OWN FALSIFIER, WHICH IT DID NOT HAVE --------------
+  //
+  // The seventh pass deleted this lock because no test failed when it was
+  // removed, and recorded: "a mechanism nothing can falsify is a claim, not a
+  // control". The premise was right; the conclusion was not. Nothing caught
+  // the removal because nothing COVERED it — and the race it prevents came
+  // back as an intermittent crash.
+  //
+  // A property that only shows up under load is not testable by waiting for
+  // load. So the test TAKES the lock itself and requires a migrator to wait
+  // for it: deterministic, and red the moment the lock is removed from the
+  // runner.
+  await withFreshDatabase("lock_serializes", async (url) => {
+    const holder = new Pool({ connectionString: url, max: 1 });
+    holder.on("error", () => undefined);
+    const pool = new Pool({ connectionString: url, max: 2 });
+    pool.on("error", () => undefined);
+    let migratorPromise: Promise<unknown> | undefined;
+    // Hoisted so the `finally` can hand it back. Released ONLY on the happy
+    // path, a failed assertion left this client checked out and `holder.end()`
+    // waited on it for ever — which is why removing the lock produced
+    // HUNG_WORKER with no named failure instead of the assertion's own
+    // message. The control worked; its cleanup buried the diagnosis.
+    let held: PoolClient | undefined;
+    try {
+      held = await holder.connect();
+      await held.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [
+        "aaliyah_mail_migrations",
+      ]);
+
+      let finished = false;
+      // CAUGHT, not floating. When the assertion below fails, this promise is
+      // still in flight and its pool is about to close underneath it; an
+      // unhandled rejection then hangs the worker instead of reporting, which
+      // is how the first version of this test "detected" the lock's removal —
+      // as a HUNG_WORKER with no named failure. A destroyer that can only say
+      // "something hung" is a poor control even when it is a control.
+      let migratorFailure: unknown;
+      const migrator = (migratorPromise = runMailMigrations(pool)
+        .then(() => {
+          finished = true;
+        })
+        .catch((error: unknown) => {
+          migratorFailure = error;
+        }));
+
+      // ---- ASSERT THE BLOCK, NOT THE CLOCK ---------------------------
+      //
+      // This first asserted `finished === false` after 1500ms. That passes
+      // whether or not the lock exists, because applying sixty migrations
+      // takes longer than that anyway — it could not tell "waiting for the
+      // lock" from "busy working". A destroyer run proved it: removing the
+      // lock did not turn this red, it made the test HANG.
+      //
+      // An UNGRANTED advisory request in `pg_locks` is unambiguous. Only a
+      // migrator that actually takes this lock can produce one.
+      let waiting = 0;
+      for (let attempt = 0; attempt < 60 && waiting === 0; attempt += 1) {
+        const locks = await adminPool.query(
+          `SELECT count(*)::int AS n FROM pg_locks
+            WHERE locktype = 'advisory' AND NOT granted
+              AND database = (SELECT oid FROM pg_database WHERE datname = $1)`,
+          [new URL(url).pathname.slice(1)],
+        );
+        waiting = locks.rows[0].n as number;
+        if (waiting === 0) await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert.ok(
+        waiting > 0,
+        "no migrator ever waited on the ledger advisory lock — the runner is not taking it",
+      );
+      assert.equal(finished, false, "the migrator finished while the lock was held");
+
+      await held.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [
+        "aaliyah_mail_migrations",
+      ]);
+
+      await migrator;
+      assert.equal(migratorFailure, undefined, `the migrator failed: ${String(migratorFailure)}`);
+      assert.equal(finished, true);
+    } finally {
+      // Order matters: release the lock so a waiting migrator can finish,
+      // hand the client back so the pool can close, and only then drain —
+      // otherwise a failed assertion strands one of the three and the test
+      // hangs instead of reporting.
+      if (held !== undefined) {
+        await held
+          .query("SELECT pg_advisory_unlock_all()")
+          .catch(() => undefined);
+        held.release();
+      }
+      await migratorPromise?.catch(() => undefined);
+      await pool.end().catch(() => undefined);
+      await holder.end().catch(() => undefined);
     }
   });
 });

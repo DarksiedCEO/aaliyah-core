@@ -6106,7 +6106,34 @@ function migrationOrdinal(id: string): number {
  *           index. The observed one is `pg_type_typname_nsp_index`: a
  *           duplicate row for the table's implicit ROW TYPE.
  */
-const LEDGER_RACE_LOST = new Set(["42P07", "23505"]);
+/**
+ * The SQLSTATEs a migrator can lose the ledger-creation race with.
+ *
+ *   42P07  duplicate_table   — the losing CREATE saw the table appear
+ *   23505  unique_violation  — it lost on a catalog index
+ *   42710  duplicate_object  — it lost on the implicit ROW TYPE
+ *
+ * 42710 was MISSING, and its absence was a live defect. `CREATE TABLE` also
+ * creates a type of the same name, so a losing racer can fail on `pg_type`
+ * rather than on the table, and the message is `type "aaliyah_mail_migrations"
+ * already exists`. Observed intermittently — roughly 1 run in 5 — in the
+ * full-suite run of candidate-3, and never in isolation, because the window
+ * only opens under load.
+ *
+ * This set is DEFENCE IN DEPTH, not the fix. Forgiving a lost race after the
+ * fact requires enumerating every way it can be lost, and this enumeration was
+ * already wrong once. The fix is the advisory lock below, which stops the race
+ * from being run at all.
+ */
+const LEDGER_RACE_LOST = new Set(["42P07", "23505", "42710"]);
+
+/**
+ * The advisory-lock key concurrent migrators serialize on, taken BEFORE the
+ * ledger table they would otherwise race to create exists. Its text is the
+ * ledger's own name so the key is obvious in a `pg_locks` dump during an
+ * incident.
+ */
+const LEDGER_LOCK_KEY = "aaliyah_mail_migrations";
 
 /**
  * CREATE THE LEDGER, AND DO NOT MIND LOSING THE RACE TO CREATE IT.
@@ -6129,7 +6156,20 @@ const LEDGER_RACE_LOST = new Set(["42P07", "23505"]);
  * aborts the transaction that was about to apply the migrations, which is how
  * a tolerable race becomes a failed deployment.
  */
-async function createLedgerToleratingARace(bounded: BoundedQuery): Promise<void> {
+/**
+ * EXPORTED FOR ITS OWN TEST.
+ *
+ * The tolerated-error set cannot be exercised by staging a real race: a losing
+ * `CREATE TABLE IF NOT EXISTS` that blocks on the winner's uncommitted
+ * transaction re-checks after the wait and skips cleanly, so the barrier
+ * produces the BENIGN path, not 42710. The 42710 path needs the loser to get
+ * past its existence check before the winner commits — a window too narrow to
+ * stage, which is exactly why the defect only ever appeared under load.
+ *
+ * So the tolerance is tested at its own seam instead, with a `bounded` that
+ * raises the SQLSTATE and then reports the ledger present. See `K-06b`.
+ */
+export async function createLedgerToleratingARace(bounded: BoundedQuery): Promise<void> {
   try {
     await bounded(
       `CREATE TABLE IF NOT EXISTS aaliyah_mail_migrations (
@@ -6203,19 +6243,39 @@ export async function runMailMigrations(
     // nothing; inside one, the same error would abort the transaction that
     // was about to apply the migrations.
     //
-    // ---- AND THE ADVISORY LOCK IS GONE, BECAUSE IT IS REDUNDANT ------
+    // ---- SERIALIZE BEFORE THE LEDGER EXISTS --------------------------
     //
-    // It was added to cover the ledger's creation. Now that the creation
-    // TOLERATES a lost race, the lock covers nothing that `LOCK TABLE` does
-    // not: once the table exists — which it does by the time the transaction
-    // below opens — `LOCK TABLE ... ACCESS EXCLUSIVE` serializes every
-    // migrator that reaches it, old build or new.
+    // A session advisory lock needs no table, so it is taken FIRST and covers
+    // the creation against every migrator that TAKES IT. `LOCK TABLE` cannot:
+    // it needs a table to lock, and the table is what is being raced for.
     //
-    // Removed rather than kept, because this round's own mutation sweep found
-    // it UNFALSIFIABLE after the tolerance fix: deleting the lock broke no
+    // ---- THIS LOCK WAS DELETED ONCE, AND THE DELETION WAS A DEFECT ----
+    //
+    // The seventh pass removed it, reasoning: "deleting the lock broke no
     // test, and there is no property left for a test to hold it to. A
-    // mechanism nothing can falsify is a claim, not a control, and this
-    // register's standard is the other way round.
+    // mechanism nothing can falsify is a claim, not a control."
+    //
+    // The premise was true and the conclusion was wrong. No test caught the
+    // removal because no test COVERED it, not because the lock protected
+    // nothing. What it protects reappeared as an intermittent crash in
+    // candidate-3's full-suite runs — roughly 1 in 5, never in isolation:
+    //
+    //     error: type "aaliyah_mail_migrations" already exists
+    //
+    // which is 42710, a code the tolerance did not list. The earlier K-06
+    // incident had already hit the same catalog through
+    // `pg_type_typname_nsp_index`, so the type was a known distinct failure
+    // mode and the enumeration was simply incomplete.
+    //
+    // Tolerance forgives a lost race and must enumerate every way to lose one.
+    // The lock stops the race being run. Both are kept, in that order of
+    // reliance, and `K-06c` below holds this one by taking the lock itself and
+    // requiring a migrator to WAIT for it.
+    //
+    // It still does NOT bind an OLDER build that does not take it — that was
+    // the 86d33c9 review's correct finding, and the tolerance is what covers
+    // that case.
+    await bounded("SELECT pg_advisory_lock(hashtextextended($1, 0))", [LEDGER_LOCK_KEY]);
     await createLedgerToleratingARace(bounded);
 
     // ---- ONE CLEANUP PATH, NOT TWO -----------------------------------
@@ -6377,8 +6437,18 @@ export async function runMailMigrations(
     // "did anything throw" and returned a healthy connection to the pool with
     // state still set on it. A BROKEN connection is destroyed instead, which
     // drops the session and everything on it, and must not be spoken to first.
+    // The advisory lock is SESSION-scoped, so it outlives the transaction and
+    // rides back into the pool on this connection unless it is released here.
+    // Gated on the CONNECTION's health, not on whether the migration failed:
+    // an ordinary refusal leaves a perfectly healthy session that must be
+    // cleaned up before reuse, while a BROKEN connection is destroyed instead,
+    // which drops the session and every lock with it, and must not be spoken
+    // to first.
     const broken = ambiguous !== undefined && isConnectionAmbiguous(ambiguous);
     if (!broken) {
+      await bounded("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [
+        LEDGER_LOCK_KEY,
+      ]).catch(() => undefined);
       await bounded("RESET lock_timeout").catch(() => undefined);
     }
     releaseClient(client, ambiguous);
