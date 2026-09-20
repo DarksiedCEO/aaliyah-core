@@ -2114,3 +2114,77 @@ deletions and redundancy claims.
 
 The common thread across all three is closing a finding by argument where
 execution was available.
+
+---
+
+## GATES 1–3 AGAINST `e71b51e` (w13-candidate-4) — ALL PASS
+
+Run in the builder's session. The seven reviewers and AEGIS deliberately are
+NOT, for the reason in the handoff.
+
+### Gate 1 — exploit replay: DEAD
+
+The durable reproducer on a fresh cluster, then the store's real
+`enterMemoryRole` as the poisoned role, with the shadow schema, the planted
+`aaliyah_memory_unerased_merged_records` and the mutator's EXECUTE on the fake
+all still present:
+
+    inherits:     opsched, public
+    STORE PIN:    pg_catalog, public, pg_temp
+    table ->      public
+    guard helper -> public
+    fabricated rows visible: 0
+    path after COMMIT: opsched, public   (the pin is transaction-local)
+
+### Gate 2 — 8 destroyers, 8 DETECTED, each by its own named assertion
+
+    D1 pin removed entirely            the pin never ran...
+    D2 pg_temp-last removed            pg_temp is not last
+    D3 $user restored                  $user survived in some casing
+    D4 old inheriting pin              a session-chosen schema survived
+    D5 pin not transaction-local       the pin is not transaction-local...
+    D6 migrator advisory lock removed  no migrator ever waited on the ledger...
+    D7 42710 dropped from tolerance    already exists (42710)
+    D8 lock removed, UNDER CONTENTION  no migrator ever waited on the ledger...
+
+`pool.ts` and `migrations.ts` restored byte-for-byte. **D8 closes the gap that
+let the M-30 defect through three candidates**: every prior gate ran the
+migrator quiescent, and the race needs load — 0 crashes in 48 idle, ~1 run in 5
+under full-suite pressure.
+
+### Gate 3 — independent mutation/fuzz: MUTATION_GREEN, 10 killed, 0 survivors
+
+`aaliyah-w13-evidence/e71b51e/reviews/06-mutation-fuzz.md`. Its own hygiene
+claims verified from outside: worktree clean at the SHA, no stray databases,
+guards 8/8 after all mutation activity.
+
+Most load-bearing results:
+
+- **MUT-1, the exact M-30 deletion, KILLED by K-06c.** The defect that survived
+  three candidates is now caught by a single-point mutation.
+- **MUT-4** (inverting the tolerance's presence re-check) was killed twice —
+  by K-06b, and by a REAL load crash in `K-06 REOPENED` on
+  `pg_type_typname_nsp_index`. That is the original K-06 signature reproducing
+  under contention, which corroborates the root-cause analysis independently.
+- **M-47/M-55 re-executed at THIS SHA, two ways** rather than carried forward:
+  isolated SQL with every trigger on the obligations table disabled, proving
+  055's bare CHECK alone still refuses (23514); and full-stack with both
+  mutants applied to the real source, 132/132 still passing. The register's
+  earlier proof of this was falsified once, so it is never inherited.
+- SEC-01's provider-contradiction gate re-inverted → KILLED, 17/132 red
+  including `S-4f`.
+- 537-input fuzz of the tolerated-SQLSTATE boundary: 0 mismatches. Load fuzz at
+  8 new-build + 3 old-build concurrent migrators × 5 trials: clean.
+
+**Disclosed by the reviewer rather than hidden:** its first baseline run used
+the mutant-judging bound (`--test-timeout-ms 60000`) on the BASELINE and got a
+false FAIL on a legitimately slow pool-resilience test; re-run with defaults,
+clean. Correct handling — a harness setting that changes what a measurement
+means is exactly what this round keeps tripping over.
+
+**Explicitly NOT covered by gate 3**, carried forward: `pool.ts`'s K-05 guard
+was observed passing but not itself mutated; no traversal / tenant-escape /
+replay attacks outside the migrator and settlement surfaces; concurrency fuzz
+was 5 trials at one concentration, not a sweep; `S-2e` and `S-6b` were observed
+passing but NOT independently mutated, so they are an observation and not a
+control this gate verified.
