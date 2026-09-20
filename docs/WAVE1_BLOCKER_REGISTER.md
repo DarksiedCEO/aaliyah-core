@@ -1984,3 +1984,43 @@ silently.
 what a changed test covers, the answer is the full re-run. Uncertainty resolves
 toward more verification, never less — which is the whole reason the doctrine
 says a changed subject invalidates certification for the changed code.
+
+---
+
+## OPEN — SUITE TEST-COUNT DISCREPANCY (1086 vs 1087)
+
+**Unattributed. Named here rather than dropped, per the founder's rule that a
+nondeterministic test in a security suite is a defect until its cause is
+named.**
+
+During candidate-3 flake characterisation, one full-suite run reported **1087**
+tests with 1 failure where every other run at the same SHA reported **1086**.
+The count, not just the outcome, differed.
+
+    run A   tests=1087  pass=1086  fail=1
+    run B   tests=1086  pass=1086  fail=0
+    run C   tests=1086  pass=1086  fail=0
+    run D   tests=1086  pass=1085  fail=1   <- the 42710 migrator race (now fixed)
+    run E   tests=1086  pass=1086  fail=0
+
+Runs D and E are explained: that is the intermittent
+`type "aaliyah_mail_migrations" already exists` crash, fixed by restoring the
+advisory lock. **Run A is not explained.** A differing DENOMINATOR is a
+different defect from a differing outcome: it means a test was discovered or
+emitted that usually is not.
+
+**Leading hypothesis, unproven.** The assertion-reachability tool spawns a
+nested `node --test`, and one of its own negative controls deliberately runs a
+FAILING fixture. If that inner run's result ever reaches the outer runner, the
+arithmetic is exactly +1 test and +1 failure. The tool now strips
+`NODE_TEST_CONTEXT`, which is the mechanism that would allow such leakage, and
+the count has been stable at 1088 across three consecutive runs since. That is
+consistent with the hypothesis and does not prove it: run A predates the strip,
+so the fix may have removed the cause or merely stopped reproducing it.
+
+**Why it stays open.** The watchdog's whole premise is that the executed set is
+the commit's set — `DISCOVERY_MISSED_TRACKED_TESTS`, `boundToCommit`, the
+discovery binding. A run that can silently report one more test than the commit
+contains is a hole in that premise, whatever produced it.
+
+**Handed to the seven reviewers as a named input**, alongside the migrator.
