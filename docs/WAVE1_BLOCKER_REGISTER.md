@@ -2024,3 +2024,93 @@ discovery binding. A run that can silently report one more test than the commit
 contains is a hole in that premise, whatever produced it.
 
 **Handed to the seven reviewers as a named input**, alongside the migrator.
+
+---
+
+## ROOT CAUSE — THE MIGRATOR LOCK WAS DELETED AS A MUTATION CLOSURE
+
+**Verified from git, not from memory.**
+
+    git log -S 'pg_advisory_lock(hashtextextended' -- src/persistence/postgres/migrations.ts
+
+    c2e5747  restore the migrator's advisory lock — I removed a real control
+    97bb476  close the 54-mutant sweep's six survivors, retire one mechanism
+    99aa656  a client-side ceiling, and migrators that serialize before the ledger exists
+
+The lock was added in `99aa656` to fix K-06, deleted in **`97bb476`** on
+2026-09-17, and restored in `c2e5747` tonight.
+
+`97bb476`'s own commit body states the reasoning:
+
+> "M-30 is retired rather than covered. It deleted the migrator's session
+> advisory lock and nothing failed, because G-01's tolerant ledger creation
+> left the lock covering nothing LOCK TABLE does not. An unfalsifiable
+> mechanism is a claim, not a control, so it is removed."
+
+**Two errors, compounding.**
+
+1. **The inference was backwards.** A surviving mutant is evidence about the
+   TESTS before it is evidence about the code. "Nothing failed when I deleted
+   this" meant the suite did not cover the lock, not that the lock covered
+   nothing. The correct response was to write the missing detector — which is
+   now `K-06c`, and which takes about forty lines.
+
+2. **The redundancy claim was false.** `LOCK TABLE` was assumed to make the
+   advisory lock redundant. It cannot: `LOCK TABLE` needs a table, and the
+   table is precisely what the migrators are racing to create. The advisory
+   lock needs no table, which is the entire reason it was taken first. The
+   race it prevents reappeared as an intermittent
+   `type "aaliyah_mail_migrations" already exists` — SQLSTATE 42710, a code the
+   tolerance did not even list.
+
+### EVERY CANDIDATE CARRIED IT, AND EVERY GATE PASSED
+
+`97bb476` is an ancestor of **all four** candidates, confirmed by
+`git merge-base --is-ancestor`:
+
+    w13-candidate-1  YES        w13-candidate-3  YES
+    w13-candidate-2  YES        w13-candidate-4  YES (fixed at e71b51e)
+
+So the exploit replay, the destroyer step and independent mutation/fuzz all ran
+against candidates 1, 2 and 3 — a migrator carrying a live production race —
+and **none of them found it**. It was found by a flake in a full-suite run.
+
+**That is a finding about the gates, not only about the migrator.** Two gaps,
+both now named:
+
+- **No gate attacks the migrator under contention.** The race needs load: six
+  concurrent migrators across eight fresh databases produced 0 crashes in 48 on
+  an idle machine, while the full suite reproduced it roughly 1 run in 5. Every
+  gate ran the migrator quiescent. **Remedied**: the destroyer step now
+  includes the migrator under contention.
+- **No gate treats "mechanism removed because nothing detected its removal" as
+  a red flag in the history.** The commit said so in plain words and three
+  rounds of review read past it.
+
+## STANDING RULE — A SURVIVING MUTANT IS NEVER CLOSED BY DELETION
+
+A mutant that survives is closed in exactly one of two ways:
+
+1. **Add a detector.** Write the test that fails when the mechanism is removed.
+2. **Prove the mechanism redundant, IN WRITING, and review that proof as a
+   PRODUCTION CHANGE** — because deleting a mechanism is one. The proof must be
+   EXECUTED, not argued: this register has already published one
+   unreachability proof that two reviewers falsified by running the
+   combination it merely reasoned about.
+
+**Never by deleting the mechanism because nothing objected.** Silence from a
+test suite is a statement about the suite.
+
+### AUDIT OF EVERY PRIOR CLOSURE OF THIS SHAPE ON THIS BRANCH
+
+Listed for the reviewers. `8a0bf05..e71b51e` searched for retirements,
+deletions and redundancy claims.
+
+| closure | what was deleted | how it was justified | status |
+|---|---|---|---|
+| **M-30** (`97bb476`) | the migrator's session advisory lock | "nothing failed" + a FALSE `LOCK TABLE` redundancy claim | **DEFECT. Restored `c2e5747`; detector `K-06c`; falsifier verified.** |
+| **TST-1** (`cb392e8`) | the store's self-verification pre-check in `settleKeyDestruction` | redundancy proven by EXECUTION — an independent reviewer disabled it alone and 124/124 still passed, because the catch remapped the database's own `..._independent_verifier` violation to the identical rejection value | **Meets the rule.** Both surviving layers are independently falsifiable: `S-4`'s raw insert holds the DB CHECK, `S-4`'s store call holds the translation. The independent mutation/fuzz gate re-confirmed it by dropping the CHECK live. **Re-verify under the new rule.** |
+| **M-47 / M-55** (eighth pass) | nothing deleted — classified `STRUCTURALLY_UNREACHABLE_WITH_PROOF` | proof by REASONING about masking | **Proof was FALSE.** Falsified independently by the red team (RT-3) and security (SEC-08): migration 055's `..._resolution_named` CHECK refuses the write on its own. Corrected; classification survived, reasoning did not. Same root error as M-30, without the deletion. |
+
+The common thread across all three is closing a finding by argument where
+execution was available.
