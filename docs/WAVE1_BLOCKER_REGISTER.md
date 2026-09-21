@@ -2188,3 +2188,111 @@ replay attacks outside the migrator and settlement surfaces; concurrency fuzz
 was 5 trials at one concentration, not a sweep; `S-2e` and `S-6b` were observed
 passing but NOT independently mutated, so they are an observation and not a
 control this gate verified.
+
+---
+
+## ADJUDICATED — W1.3 candidate-4 (`e71b51e`) IS **RED. NOT CERTIFIED.**
+
+Full document: `aaliyah-w13-evidence/e71b51e/AEGIS-ADJUDICATION.md`, committed
+verbatim. Rendered by an independent adjudicator seat — cloud clone of origin,
+not the builder, not the coordinator, not any gate, saw no work being produced.
+Subject `e71b51e`, contracts `7d57668`, evidence `reviews/` at `1b0499f`.
+
+**Five of seven gates block.** The Test Falsifiability gate carries a Critical
+(F5) sufficient on its own under the weakest-mandatory-domain rule. Production:
+NOT CERTIFIED. Fortress: NOT CERTIFIED.
+
+### WHAT STANDS
+
+**The migrator fix of this round is SOUND.** Gate 3 reproduced the race at will
+without the lock — 15,965 lost races in 21,600 — and eliminated it with the lock,
+0 in 9,600. Crash recovery clean. Both restored controls have named detectors.
+The work recorded two sections above in `ROOT CAUSE — THE MIGRATOR LOCK WAS
+DELETED AS A MUTATION CLOSURE` survives adjudication intact.
+
+### WHAT BLOCKS — FIVE ROOT CAUSES, NOT TWENTY FINDINGS
+
+- **RC-1 the measuring instrument is unreliable.** Three gates, three
+  denominators, one SHA: gate 1 saw 1088/1088 zero times in five runs, gate 3
+  once in five, gate 5 took 118 failures then 471/471 on a recreated database.
+  Until this is repaired, EVERY pass claim of this round is unproven — including
+  this register's own `GATES 1–3 AGAINST e71b51e — ALL PASS` section and the
+  coordinator's three clean serial runs. That section is not withdrawn; it is
+  **suspended pending a working instrument.**
+- **RC-2 the ledger is trusted where effects should be verified.** It certifies
+  schemas never applied; the pre-057 upgrade path launders an edited migration
+  permanently. Nothing reads back what the migrator claims it did.
+- **RC-3 controls without detectors are STILL shipping** — two days after this
+  branch adopted the standing rule against exactly that. 17 CHECK constraints,
+  3 pool bounds, the G-02 tenant-crossover JOIN, and the migrator lock's
+  ORDERING (the lock is held, but no destroyer reorders, so K-06c cannot see a
+  reorder).
+- **RC-4 builder-produced gate evidence is forgeable** by one git command.
+  `assume-unchanged` is invisible to `git status`, on which the hygiene claims
+  rest. Confirmed by reading: no such check exists in `scripts/` or CI.
+- **RC-5 tenant isolation has no database backstop.** Disclosed at
+  `migrations.ts:25-27`, outside W1.3's claim. Founder decision, below.
+
+### THE PENDING CHECK-CONSTRAINT AUDIT IS ANSWERED
+
+The `PENDING DELIVERABLE — CHECK-CONSTRAINT DROP-TEST AUDIT` section above
+recorded that an independent reader could not reproduce the **67 untested**
+figure. Gate 7 (Data & Persistence) settles it:
+
+    population   162 CHECK constraints
+    untested     17
+    triggers     0 of 56
+
+**The "67" figure is WITHDRAWN.** It appears above at three places in this
+register and is superseded wherever it appears. Of the 17, the **8** that are
+the sole enforcement on the key-destruction settlement path get drop-tests
+first; the other 9 take a detector or an executed redundancy proof.
+
+### DISPUTES RESOLVED, SEVERITIES MOVED
+
+- RT-M4 / the G-02 three-column unnest JOIN: **Important and blocking.** Gate 4
+  stands over gate 2. The axes differed — exploitability today vs detectability,
+  and the standing rule governs detectability.
+- The migrator: gate 3 (SOUND) and gate 4 (lock defeated by reordering) **both
+  stand.** The code is correct; the detector cannot see a reorder.
+- The 1086/1087 denominator: **OPEN as a root cause, closed as a risk** once a
+  committed test-name manifest makes a delta a refusal instead of a mystery.
+- D-05 (no RLS): **down** to non-blocking for W1.3 — a disclosed limitation
+  outside the claimed boundary is not a defect in the candidate. It is a defect
+  in the product plan if Aaliyah ships multi-tenant. Founder decision B.
+- SEC-E (privilege map blind to SECURITY DEFINER bodies): Medium, scheduled.
+
+### PROCESS FINDINGS
+
+1. **Reviewer independence found what builder-run gates missed, for the second
+   candidate running.** Gates 1–3 passed on candidates 1, 2, 3 AND 4. The seven
+   independent gates blocked candidate-4 five ways. The separation is not a
+   formality, and R4.2 makes it permanent: gates 1–3 are never again run by the
+   builder's session.
+2. **Concurrent dispatch corrupted timing evidence** — load 76 on 14 CPUs, by
+   the coordinator's own account. Next round: at most two gates concurrent,
+   timing-sensitive gates (1, 3) alone on a quiet host.
+3. **The same defect shape, SIXTH time.** A control whose removal nothing
+   detects, or an assertion that cannot fail. It has now appeared in tests, in
+   verification tooling, in a published proof, and in the hygiene evidence
+   itself. R3 and R4 are the standing rule's enforcement.
+
+### THE WORK ORDER
+
+`docs/W13_R1_WORK_ORDER.md`. **R1 — repair the instrument — gates everything
+else.** Nothing but R1 until its acceptance is met: five consecutive full-suite
+runs, serial, quiet host, pristine database, executed set equal to a committed
+manifest, all PASS; then five more on a used database; both cells reported.
+
+R2 (ledger integrity), R3 (controls without detectors), R4 (provenance) follow.
+Candidate-5 returns to the adjudicator seat, with gates 1–3 run by the review
+side.
+
+### FOUNDER DECISIONS OUTSTANDING
+
+- **A.** Merge/split identity semantics. Unchanged from the handoff. Blocks W1.4.
+- **B.** Database-enforced tenant isolation. Adjudicator recommends RLS on all
+  21 `memory_%` tables as a scheduled W1.4 item, NOT folded into W1.3.
+- **C.** Confirm Data & Persistence as the permanent seventh gate. The
+  coordinator inferred it because only six gate files existed, and it produced
+  the D-09 headline.
