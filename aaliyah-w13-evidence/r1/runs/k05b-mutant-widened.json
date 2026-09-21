@@ -1,0 +1,91 @@
+{
+  "watchdog": "aaliyah-core/scripts/test-watchdog.mjs",
+  "scope": "FOCUSED",
+  "git": {
+    "head": "fd7432a766114ddc937334852f2d883674d49391",
+    "dirty": true
+  },
+  "node": "v24.9.0",
+  "startedAt": "2026-09-21T10:32:08.022Z",
+  "finishedAt": "2026-09-21T10:34:37.092Z",
+  "durationMs": 149070,
+  "environment": {
+    "nodeOptionsIgnored": null,
+    "tsNodeIgnored": {}
+  },
+  "bounds": {
+    "testTimeoutMs": 240000,
+    "deadlineMs": 900000,
+    "exitGraceMs": 15000,
+    "pgOptions": "-c statement_timeout=60000 -c lock_timeout=60000 -c idle_in_transaction_session_timeout=120000"
+  },
+  "files": 1,
+  "discovery": {
+    "scope": "FOCUSED",
+    "boundToCommit": null,
+    "vacuous": null,
+    "ignored": [],
+    "untracked": [],
+    "missing": []
+  },
+  "manifest": null,
+  "discoveryOnly": false,
+  "verdict": "FAIL",
+  "reasons": [
+    "NONZERO_EXIT: code=1 signal=null",
+    "FAILED_TESTS: 2",
+    "PASSED_NOT_EQUAL_TESTS: 16 of 18",
+    "RUNNER_REPORTED_UNSUCCESSFUL"
+  ],
+  "counts": {
+    "tests": 18,
+    "failed": 2,
+    "passed": 16,
+    "cancelled": 0,
+    "skipped": 0,
+    "todo": 0,
+    "topLevel": 18,
+    "suites": 0
+  },
+  "exit": {
+    "code": 1,
+    "signal": null
+  },
+  "timedOut": [],
+  "failures": [
+    {
+      "name": "K-05: an AMBIGUOUS connection is DESTROYED, and an ordinary error's connection is not",
+      "file": "tests/wave1PoolResiliencePostgres.integration.test.ts",
+      "failureType": "testCodeFailure",
+      "message": "aaliyah memory: a subject erasure may not complete\n\ntrue !== false\n",
+      "code": "ERR_ASSERTION"
+    },
+    {
+      "name": "K-05b: pg's un-coded 'not queryable' rejection is AMBIGUOUS — that exact shape only, never code-less errors in general",
+      "file": "tests/wave1PoolResiliencePostgres.integration.test.ts",
+      "failureType": "testCodeFailure",
+      "message": "a code-less error was widened into ambiguity: Cannot read properties of undefined (reading 'rows')\n\ntrue !== false\n",
+      "code": "ERR_ASSERTION"
+    }
+  ],
+  "filesWithoutResult": [],
+  "filesWithoutTests": [],
+  "filesWithoutSummary": [],
+  "testsNeverFinished": [],
+  "processGroup": {
+    "pgid": 2142,
+    "killedSurvivors": false,
+    "survivedSigkill": false
+  },
+  "database": {
+    "required": true,
+    "before": {
+      "reachable": true,
+      "reason": null
+    },
+    "after": {
+      "reachable": true,
+      "reason": null
+    }
+  }
+}

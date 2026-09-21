@@ -12,3 +12,6 @@ k02-real	pristine	7eadfa1	0	WATCHDOG VERDICT: PASS scope=FOCUSED tests=132 pass=
 k02-destroyer-labelled	pristine	7eadfa1	1	WATCHDOG VERDICT: FAIL scope=FOCUSED tests=132 pass=131 fail=1 cancelled=0 skipped=0 todo=0
 k02-contamination-unlabelled	pristine	7eadfa1	0	WATCHDOG VERDICT: PASS scope=FOCUSED tests=132 pass=132 fail=0 cancelled=0 skipped=0 todo=0
 k02-contamination-OLD-unscoped	pristine	d65cb05	1	WATCHDOG VERDICT: FAIL scope=FOCUSED tests=132 pass=131 fail=1 cancelled=0 skipped=0 todo=0
+k05b-real	pristine	fd7432a	0	WATCHDOG VERDICT: PASS scope=FOCUSED tests=18 pass=18 fail=0 cancelled=0 skipped=0 todo=0
+k05b-mutant-unrecognised	pristine	fd7432a	1	WATCHDOG VERDICT: FAIL scope=FOCUSED tests=18 pass=17 fail=1 cancelled=0 skipped=0 todo=0
+k05b-mutant-widened	pristine	fd7432a	1	WATCHDOG VERDICT: FAIL scope=FOCUSED tests=18 pass=16 fail=2 cancelled=0 skipped=0 todo=0
