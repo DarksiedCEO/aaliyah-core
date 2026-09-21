@@ -1,0 +1,12 @@
+label       i9-killed-45s
+killed at   45s with SIGTERM; watchdog exit 1
+verdict     WATCHDOG VERDICT: FAIL scope=FULL_SUITE
+survivors   0 test processes
+databases   aaliyah_test,postgres,template0,template1
+backends    0
+ledger      60
+memory rows:
+  memory_alias_bindings=0 memory_alias_blind_indexes=0 memory_alias_protected_domains=0 memory_alias_tenant_policy=5 memory_authorization_nonces=43 memory_authori
+  zation_receipts=42 memory_identity_edges=0 memory_key_destruction_obligations=0 memory_key_destruction_settlements=0 memory_legal_hold_carve_outs=0 memory_legal
+  _hold_records=0 memory_legal_hold_subjects=0 memory_legal_holds=0 memory_mutation_attempts=0 memory_mutation_receipts=1 memory_pii_key_audits=0 memory_pii_key_e
+  rasures=0 memory_reconciliations=0 memory_record_versions=99 memory_retention_obligations=0 memory_tombstones=1 memory_tombstones=0
