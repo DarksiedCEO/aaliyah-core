@@ -1,0 +1,14 @@
+b7bd18c6df49a9ee713a1876537b3574896fc631e5b0612a8d1d01a7aa985e42  ./00-COORDINATOR-NOTE.md
+27c9019b68864e7c943e03fbc69b7e2c525bbf331f52e8a1bb8d68a16d86c575  ./01-test-falsifiability.md
+0096b3030771eec32aead186ca6e7b074af9825526d7412b32445ff51b3232e0  ./02-security.md
+011477c1616e8e36d0b5858a8d6e2bc364998a3b86d6fcacaf9a41a37209b5d7  ./03-reliability.md
+36a01abbebad6e34c3d27b7aebd1c85481dbd2c898a54ed059887b863615a5b8  ./04-red-team.md
+eb0a22fbfb493a800ade0dba3887872c11dbe23cbaa23de33fd958aafb27ed33  ./05-integration.md
+89643053aa6d400f92cc95a7fed2454fb464620169eae116ee2b4fc6798441d6  ./06-mutation-fuzz.md
+c62825d0472ac7af5184db540526a3df1e8d0001ff80baee33923b9434dfcd48  ./07-data-persistence-evidence/census-218-objects.json
+5f86277cd95ed07f2acacdc9452d9a2b8701ef6da1cf0b0cc5f67c45c2ad4c01  ./07-data-persistence-evidence/sweep-driver.sh
+00c201a46fe16106a9c3be0e2158b12392cd64854a7bb613859d2b55d1500199  ./07-data-persistence-evidence/tier1-all-218-objects.tsv
+18bc79f64ab26f3b67367d10fab9c36148f601d45d5a85249609c9554cd9c664  ./07-data-persistence-evidence/tier2-115-survivors.tsv
+65834f9f77877df672f4eb58d22e42b95c0483812e3a938c6b6787318d5f1964  ./07-data-persistence-evidence/tier3-drop-the-17.sql
+2440ca6cf72577c565f7f86c014b3c350fac9e4747357053431b0e267a8feefa  ./07-data-persistence-evidence/tier3-restore-the-17.sql
+b5079b69acb23ac548d3235f154009b57939ee005cdc16ffb51dd207678445b2  ./07-data-persistence.md
