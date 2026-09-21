@@ -6125,7 +6125,7 @@ function migrationOrdinal(id: string): number {
  * already wrong once. The fix is the advisory lock below, which stops the race
  * from being run at all.
  */
-const LEDGER_RACE_LOST = new Set(["42P07", "23505", "42710"]);
+export const LEDGER_RACE_LOST: ReadonlySet<string> = new Set(["42P07", "23505", "42710"]);
 
 /**
  * The advisory-lock key concurrent migrators serialize on, taken BEFORE the

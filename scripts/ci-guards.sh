@@ -84,12 +84,20 @@ fi
 #    recorded `git.dirty: false`. Asked here as well as inside `npm test`,
 #    because a guard that answers in under a second is worth having before
 #    anyone pays for a suite.
-if node scripts/test-watchdog.mjs --verify-discovery >/tmp/discovery.out 2>&1; then
-  ok "the full suite's executed set is bound to the commit"
+#    It now also FAILS on an empty discovered set (R1.6: a binding over the
+#    empty set is undefined, not satisfied) and on a file set the committed
+#    manifest does not name (R1.3). It still runs no tests: it cannot say the
+#    suite PASSED, only that what would run is what the commit pins.
+#    Its own output file is private to this run (I-4: a fixed /tmp path let
+#    concurrent guard runs read each other's answers).
+discovery_out="$(mktemp "${TMPDIR:-/tmp}/ci-guards-discovery.XXXXXX")"
+if node scripts/test-watchdog.mjs --verify-discovery >"$discovery_out" 2>&1; then
+  ok "the full suite's discovered files are bound to the commit and to its manifest (no tests run)"
 else
   bad "test discovery is not bound to the commit:"
-  sed 's/^/    /' /tmp/discovery.out
+  sed 's/^/    /' "$discovery_out"
 fi
+rm -f "$discovery_out"
 
 echo
 if [ "$fail" -ne 0 ]; then

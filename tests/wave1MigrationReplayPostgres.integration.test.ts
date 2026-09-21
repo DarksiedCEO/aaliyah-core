@@ -5,6 +5,7 @@ import type { PoolClient } from "pg";
 
 import {
   createLedgerToleratingARace,
+  LEDGER_RACE_LOST,
   runMailMigrations,
 } from "../src/persistence/postgres/migrations";
 import { MIGRATION_BOUNDS } from "../src/persistence/postgres/pool";
@@ -762,7 +763,7 @@ test("K-06: a STEADY-STATE database is raced cleanly by an older build too", asy
   });
 });
 
-test("POSITIVE CONTROL: bare concurrent CREATE TABLE IF NOT EXISTS really does crash N-1 with 23505", async () => {
+test("POSITIVE CONTROL: bare concurrent CREATE TABLE IF NOT EXISTS really does crash N-1, with a lost-race code the migrator tolerates", async () => {
   // Proves the hazard is real on THIS server, so the refusal below is about
   // the runner's ordering and not about `IF NOT EXISTS` being safe anyway.
   await withFreshDatabase("control", async (url) => {
@@ -781,9 +782,19 @@ test("POSITIVE CONTROL: bare concurrent CREATE TABLE IF NOT EXISTS really does c
         codes.length >= 1,
         `expected at least one concurrent creator to lose; all ${results.length} succeeded`,
       );
-      assert.ok(
-        codes.every((code) => code === "23505"),
-        `expected 23505 unique-violation losses; got ${JSON.stringify(codes)}`,
+      // THE LOSS IS ONE PRODUCTION FORGIVES (R1.4, candidate-4 gate 3 R-11).
+      // This read `code === "23505"` while `createLedgerToleratingARace`
+      // tolerates `LEDGER_RACE_LOST` — 42P07, 23505 and 42710 — so a
+      // legitimate 42710 loss (the ROW TYPE's name, about 1 run in 360 here)
+      // failed the control, and 42P07/42710 had never been exercised by it.
+      // Asserted against the PRODUCTION constant, not a re-typed list: if a
+      // code the server really raises is ever dropped from the tolerance, this
+      // is the test that says so.
+      const unforgiven = codes.filter((code) => typeof code !== "string" || !LEDGER_RACE_LOST.has(code));
+      assert.deepEqual(
+        unforgiven,
+        [],
+        `a concurrent creator lost with a code the migrator does NOT tolerate; got ${JSON.stringify(codes)}, tolerated ${JSON.stringify([...LEDGER_RACE_LOST])}`,
       );
     } finally {
       await Promise.all(pools.map((p) => p.end()));

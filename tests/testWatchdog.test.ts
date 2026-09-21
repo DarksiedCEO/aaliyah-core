@@ -36,6 +36,7 @@ type Evidence = {
   database: { before: { reachable: boolean } | null };
   discovery?: {
     boundToCommit: boolean | null;
+    vacuous?: boolean | null;
     ignored: string[];
     untracked: string[];
     missing: string[];
@@ -524,6 +525,187 @@ test("a git-ignored test file in tests/ is FAIL: it would execute while git stat
     // Refused BEFORE the suite was spawned: no counts, no exit, and fast.
     assert.equal(run.evidence.counts, null);
     assert.ok(run.elapsedMs < 10_000, `refusal took ${run.elapsedMs}ms — it did not short-circuit`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * R1.3 / R1.6 — THE DENOMINATOR IS PINNED, AND AN EMPTY BINDING IS REFUSED.
+ *
+ * These drive the REAL watchdog at FULL_SUITE scope, which walks `tests/`
+ * beside the script and binds it to git. Doing that in this repository would
+ * mean rewriting its own manifest or emptying its own tests directory mid-run,
+ * so each case builds a throwaway git repository holding a copy of the
+ * watchdog, its reporter and the hook sentinel — the same files, byte for
+ * byte — plus exactly the tests and manifest the case needs.
+ */
+const MANIFEST_HEADER = "# test manifest fixture\n";
+
+function manifestLine(file: string, name: string, nesting = 0): string {
+  return `${file}\t${nesting}\t${name}`;
+}
+
+function miniRepo(
+  tests: Record<string, string>,
+  manifest: string[] | null,
+  untracked: Record<string, string> = {},
+): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "watchdog-minirepo-"));
+  fs.mkdirSync(path.join(dir, "scripts"));
+  fs.mkdirSync(path.join(dir, "tests/support"), { recursive: true });
+  for (const rel of ["scripts/test-watchdog.mjs", "scripts/test-watchdog-reporter.mjs", "tests/support/hookSentinel.cjs", "tsconfig.json"]) {
+    fs.copyFileSync(path.join(ROOT, rel), path.join(dir, rel));
+  }
+  fs.symlinkSync(path.join(ROOT, "node_modules"), path.join(dir, "node_modules"));
+  fs.writeFileSync(path.join(dir, ".gitignore"), "node_modules\n.test-evidence-run-*/\n");
+  for (const [rel, body] of Object.entries(tests)) fs.writeFileSync(path.join(dir, rel), body);
+  if (manifest !== null) {
+    fs.writeFileSync(path.join(dir, "scripts/test-manifest.tsv"), MANIFEST_HEADER + manifest.map((l) => `${l}\n`).join(""));
+  }
+  const git = (args: string[]) => {
+    const r = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+    assert.equal(r.status, 0, `fixture precondition: git ${args.join(" ")}: ${r.stderr}`);
+  };
+  git(["init", "-q"]);
+  git(["add", "-A"]);
+  git(["-c", "user.name=fixture", "-c", "user.email=fixture@invalid", "commit", "-q", "-m", "fixture"]);
+  for (const [rel, body] of Object.entries(untracked)) fs.writeFileSync(path.join(dir, rel), body);
+  return dir;
+}
+
+function runMiniRepo(dir: string, flags: string[]): { status: number | null; evidence: Evidence & Record<string, any>; elapsedMs: number; stdout: string } {
+  const evidencePath = path.join(dir, "evidence.json");
+  const started = Date.now();
+  const result = spawnSync(process.execPath, [path.join(dir, "scripts/test-watchdog.mjs"), "--evidence", evidencePath, ...flags], {
+    cwd: dir,
+    encoding: "utf8",
+    timeout: 120_000,
+    killSignal: "SIGKILL",
+    env: { ...process.env, AALIYAH_TEST_DATABASE_URL: DB_URL },
+  });
+  const elapsedMs = Date.now() - started;
+  assert.equal(result.error, undefined, `watchdog did not complete: ${result.error}`);
+  const evidence = JSON.parse(fs.readFileSync(evidencePath, "utf8"));
+  return { status: result.status, evidence, elapsedMs, stdout: `${result.stdout}${result.stderr}` };
+}
+
+const TWO_TESTS = 'import { test } from "node:test";\ntest("alpha", () => {});\ntest("beta", () => {});\n';
+const PINNED_TWO = [manifestLine("tests/two.test.ts", "alpha"), manifestLine("tests/two.test.ts", "beta")];
+const MINI_FLAGS = ["--no-db", "--test-timeout-ms", "60000", "--deadline-ms", "110000", "--exit-grace-ms", "15000"];
+
+test("R1.3 POSITIVE CONTROL: an executed set EQUAL to the manifest is PASS, so the refusals below are specific", () => {
+  const dir = miniRepo({ "tests/two.test.ts": TWO_TESTS }, PINNED_TWO);
+  try {
+    const run = runMiniRepo(dir, MINI_FLAGS);
+    assert.equal(run.evidence.verdict, "PASS", JSON.stringify(run.evidence.reasons));
+    assert.equal(run.status, 0);
+    assert.equal(run.evidence.manifest.executed, 2);
+    assert.equal(run.evidence.manifest.expected, 2);
+    assert.deepEqual([run.evidence.manifest.added, run.evidence.manifest.lost], [[], []]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("R1.3: a test the manifest does NOT pin is FAIL, named — the denominator cannot grow silently", () => {
+  const dir = miniRepo({ "tests/two.test.ts": TWO_TESTS }, [PINNED_TWO[0]!]);
+  try {
+    const run = runMiniRepo(dir, MINI_FLAGS);
+    assertFail(run, /^MANIFEST_DELTA: executed 2, pinned 1; 1 not pinned, 0 pinned and not executed — NOT PINNED: tests\/two\.test\.ts :: 0 :: beta$/);
+    assert.ok(run.evidence.reasons.some((r: string) => /^DENOMINATOR_NOT_PINNED: the runner counted tests=2, the manifest pins 1$/.test(r)));
+    assert.deepEqual(run.evidence.manifest.added, [PINNED_TWO[1]]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("R1.3: a pinned test that did NOT execute is FAIL, named — the denominator cannot shrink silently", () => {
+  const dir = miniRepo(
+    { "tests/two.test.ts": TWO_TESTS },
+    [...PINNED_TWO, manifestLine("tests/two.test.ts", "gamma, which was deleted")],
+  );
+  try {
+    const run = runMiniRepo(dir, MINI_FLAGS);
+    assertFail(run, /NOT EXECUTED: tests\/two\.test\.ts :: 0 :: gamma, which was deleted$/);
+    assert.deepEqual(run.evidence.manifest.lost, [manifestLine("tests/two.test.ts", "gamma, which was deleted")]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("R1.3 / F2: a worker that exits non-zero after its tests passed adds a SYNTHETIC entry, and it is named, not counted", () => {
+  // Gate 1's F2 mechanism, reproduced under the pinned denominator: the
+  // hook sentinel's own `process.exitCode = 70` shape. Every REAL test is
+  // pinned and passes, so the only thing that can refuse this run is the
+  // synthetic file-level entry node:test adds to `tests`.
+  const exits = 'import { test } from "node:test";\ntest("passes", () => {});\nprocess.on("exit", () => { process.exitCode = 70; });\n';
+  const dir = miniRepo(
+    { "tests/two.test.ts": TWO_TESTS, "tests/exits.test.ts": exits },
+    [...PINNED_TWO, manifestLine("tests/exits.test.ts", "passes")],
+  );
+  try {
+    const run = runMiniRepo(dir, MINI_FLAGS);
+    assertFail(run, /^SYNTHETIC_FILE_ENTRIES: 1 file-level entry was counted as tests — .*: tests\/exits\.test\.ts$/);
+    assert.ok(run.evidence.reasons.some((r: string) => /^DENOMINATOR_NOT_PINNED: the runner counted tests=4, the manifest pins 3$/.test(r)));
+    // The executed set itself matched: the +1 is the synthetic entry alone.
+    assert.deepEqual([run.evidence.manifest.added, run.evidence.manifest.lost], [[], []]);
+    assert.deepEqual(run.evidence.manifest.syntheticFileEntries, ["tests/exits.test.ts"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("R1.3: with NO committed manifest a full-suite run is refused before anything runs", () => {
+  const dir = miniRepo({ "tests/two.test.ts": TWO_TESTS }, null);
+  try {
+    const run = runMiniRepo(dir, MINI_FLAGS);
+    assertFail(run, /^MANIFEST_MISSING: scripts\/test-manifest\.tsv does not exist/);
+    assert.equal(run.evidence.counts, null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("R1.3 / RT4-5: an UNTRACKED extra test file is refused before it runs — it is in no manifest", () => {
+  // The red team's exact attack against e71b51e: a not-ignored, untracked
+  // test file ran, the suite reported PASS at 1090 against a commit of 1088,
+  // `boundToCommit: true`, and guard 8 was green. Now it cannot run at all.
+  const dir = miniRepo({ "tests/two.test.ts": TWO_TESTS }, PINNED_TWO, {
+    "tests/zzRedTeamExtra.test.ts": 'import { test } from "node:test";\ntest("extra", () => {});\n',
+  });
+  try {
+    const run = runMiniRepo(dir, MINI_FLAGS);
+    assertFail(run, /^MANIFEST_FILE_DELTA: 1 discovered test file\(s\) have no pinned tests: tests\/zzRedTeamExtra\.test\.ts$/);
+    assert.equal(run.evidence.counts, null);
+    const discovery = runMiniRepo(dir, ["--verify-discovery"]);
+    assertFail(discovery, /^MANIFEST_FILE_DELTA:/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("R1.6: --verify-discovery over an EMPTY discovered set is FAIL, not a vacuous PASS", () => {
+  const dir = miniRepo({ "tests/README.md": "no tests here\n" }, PINNED_TWO);
+  try {
+    const run = runMiniRepo(dir, ["--verify-discovery"]);
+    assertFail(run, /^DISCOVERY_VACUOUS: no test files were discovered/);
+    assert.equal(run.evidence.discovery!.boundToCommit, false);
+    assert.equal(run.evidence.discovery!.vacuous, true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("R1.6 POSITIVE CONTROL: --verify-discovery on a bound, pinned set is PASS — and says it ran nothing", () => {
+  const dir = miniRepo({ "tests/two.test.ts": TWO_TESTS }, PINNED_TWO);
+  try {
+    const run = runMiniRepo(dir, ["--verify-discovery"]);
+    assert.equal(run.evidence.verdict, "PASS", JSON.stringify(run.evidence.reasons));
+    assert.equal(run.evidence.discovery!.vacuous, false);
+    assert.equal(run.evidence.discoveryOnly, true);
+    assert.equal(run.evidence.counts, null);
+    assert.match(run.stdout, /WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=NOT_RUN\(discovery-only\)/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

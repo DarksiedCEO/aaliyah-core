@@ -74,6 +74,7 @@ function parseArgs(argv) {
     requireDb: true,
     evidence: null,
     verifyDiscoveryOnly: false,
+    writeManifest: false,
     files: [],
   };
   const numeric = {
@@ -97,6 +98,11 @@ function parseArgs(argv) {
       // Answers ONE question — is the full suite the commit's suite? — and
       // runs nothing. A release guard can ask it without paying for a suite.
       options.verifyDiscoveryOnly = true;
+    } else if (arg === "--write-manifest") {
+      // Records this FULL_SUITE run's executed set as scripts/test-manifest.tsv.
+      // Only from an otherwise-clean run, and the run is then NOT a verdict:
+      // a run that defines its own denominator cannot also be measured by it.
+      options.writeManifest = true;
     } else if (arg === "--evidence") {
       options.evidence = argv[++i] ?? usage("--evidence needs a path");
     } else if (arg in numeric) {
@@ -162,7 +168,20 @@ function fullSuiteFiles() {
 function discoveryBinding(files) {
   const relative = files.filter((file) => !path.isAbsolute(file));
   if (relative.length === 0) {
-    return { verified: true, ignored: [], untracked: [], missing: [], reason: null };
+    // A BINDING OVER THE EMPTY SET IS UNDEFINED, NOT SATISFIED (R1.6, red team
+    // RT4-5 against e71b51e). This returned `verified: true`, so zero
+    // discovered files affirmed "the executed set is bound to the commit" —
+    // every property holds of the empty set. `vacuous` is recorded as its own
+    // answer and refused, never folded into `verified`.
+    return {
+      verified: false,
+      vacuous: true,
+      ignored: [],
+      untracked: [],
+      missing: [],
+      reason:
+        "DISCOVERY_VACUOUS: no test files were discovered, so there is no executed set to bind to the commit — an empty binding is undefined, not satisfied",
+    };
   }
   let ignored = [];
   let untracked = [];
@@ -232,11 +251,90 @@ function discoveryBinding(files) {
   }
   return {
     verified: true,
+    vacuous: false,
     ignored,
     untracked,
     missing,
     reason: reasons.length > 0 ? reasons.join(" | ") : null,
   };
+}
+
+/**
+ * THE DENOMINATOR IS PINNED TO THE COMMIT (R1.3).
+ *
+ * Candidate-4's review saw 1086, 1087, 1088, 1091 and 1093 tests at ONE SHA,
+ * and nothing in the repository said which was right: a moving count could be
+ * noticed, never refused. `scripts/test-manifest.tsv` is the commit's executed
+ * set, one line per test — file, nesting, name — and a FULL_SUITE run whose
+ * executed set differs from it in EITHER direction is FAIL, naming each
+ * test added or lost.
+ *
+ * The executed set is every `test:pass` / `test:fail` that is not a FILE-level
+ * entry. File-level entries are counted separately: node:test synthesizes one,
+ * and counts it in `tests`, whenever a worker exits non-zero after its tests
+ * passed (gate 1 F2, the repository's own hookSentinel does exactly that) or
+ * dies at file level (gate 5 I-10). So the summary's `tests` must ALSO equal
+ * the manifest's length — a synthetic entry is then a named delta, not a
+ * silent +1.
+ *
+ * Lines beginning with `#` are comments. Duplicate lines are meaningful: two
+ * tests may share a name, and the comparison is of multisets.
+ */
+const MANIFEST = path.join(ROOT, "scripts", "test-manifest.tsv");
+
+function manifestKey(file, nesting, name) {
+  return `${file}\t${nesting}\t${String(name).replace(/[\t\n\r]/g, " ")}`;
+}
+
+function readManifest() {
+  if (!fs.existsSync(MANIFEST)) return null;
+  return fs
+    .readFileSync(MANIFEST, "utf8")
+    .split("\n")
+    .filter((line) => line !== "" && !line.startsWith("#"));
+}
+
+/** Multiset difference, both ways: what ran and is not pinned, what is pinned and did not run. */
+function multisetDelta(executed, expected) {
+  const remaining = new Map();
+  for (const key of expected) remaining.set(key, (remaining.get(key) ?? 0) + 1);
+  const added = [];
+  for (const key of executed) {
+    const left = remaining.get(key) ?? 0;
+    if (left > 0) remaining.set(key, left - 1);
+    else added.push(key);
+  }
+  const lost = [];
+  for (const [key, left] of remaining) for (let i = 0; i < left; i += 1) lost.push(key);
+  return { added: added.sort(), lost: lost.sort() };
+}
+
+/**
+ * `--verify-discovery` answers from the manifest too: it must exist, be
+ * non-empty, and name exactly the discovered FILE set. It still runs nothing,
+ * so it cannot vouch for the test NAMES — only a run can, and a FULL_SUITE run
+ * does.
+ */
+function manifestFileBinding(files) {
+  const lines = readManifest();
+  if (lines === null) {
+    return `MANIFEST_MISSING: ${path.relative(ROOT, MANIFEST)} does not exist, so nothing pins what the full suite executes`;
+  }
+  if (lines.length === 0) {
+    return `MANIFEST_EMPTY: ${path.relative(ROOT, MANIFEST)} pins no tests — a denominator of zero is not a pin`;
+  }
+  const pinned = new Set(lines.map((line) => line.split("\t")[0]));
+  const discovered = new Set(files);
+  const unpinned = [...discovered].filter((file) => !pinned.has(file)).sort();
+  const vanished = [...pinned].filter((file) => !discovered.has(file)).sort();
+  const reasons = [];
+  if (unpinned.length > 0) {
+    reasons.push(`MANIFEST_FILE_DELTA: ${unpinned.length} discovered test file(s) have no pinned tests: ${unpinned.join(", ")}`);
+  }
+  if (vanished.length > 0) {
+    reasons.push(`MANIFEST_FILE_DELTA: ${vanished.length} pinned test file(s) were not discovered: ${vanished.join(", ")}`);
+  }
+  return reasons.length > 0 ? reasons.join(" | ") : null;
 }
 
 function pgOptions(options) {
@@ -365,7 +463,11 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   const scope = options.files.length === 0 ? "FULL_SUITE" : "FOCUSED";
   const files = scope === "FULL_SUITE" ? fullSuiteFiles() : options.files;
-  if (files.length === 0) usage("no test files");
+  // FULL_SUITE with nothing discovered is not a usage error: it is refused
+  // below as DISCOVERY_VACUOUS, so guard 8 FAILS on it rather than erroring.
+  if (scope === "FOCUSED" && files.length === 0) usage("no test files");
+  if (options.writeManifest && scope !== "FULL_SUITE") usage("--write-manifest records the FULL suite only");
+  if (options.writeManifest && options.verifyDiscoveryOnly) usage("--write-manifest needs a run; --verify-discovery runs nothing");
   for (const file of files) {
     if (!fs.existsSync(path.resolve(ROOT, file))) usage(`no such test file: ${file}`);
   }
@@ -383,7 +485,7 @@ async function main() {
         // reads. A FOCUSED run's files are named on argv and routinely live
         // outside the repository, so there is nothing to bind them to; the
         // honest record is that nobody looked.
-        { verified: null, ignored: [], untracked: [], reason: null };
+        { verified: null, vacuous: null, ignored: [], untracked: [], reason: null };
 
   const startedAt = new Date();
   const runDir = fs.mkdtempSync(path.join(ROOT, ".test-evidence-run-"));
@@ -431,10 +533,26 @@ async function main() {
           : discovery.verified &&
             discovery.ignored.length === 0 &&
             (discovery.missing ?? []).length === 0,
+      vacuous: discovery.vacuous,
       ignored: discovery.ignored,
       untracked: discovery.untracked,
       missing: discovery.missing ?? [],
     },
+    // FULL_SUITE only (R1.3). `null` for FOCUSED: nothing is pinned for an
+    // arbitrary file list, and nothing is claimed.
+    manifest:
+      scope === "FULL_SUITE"
+        ? {
+            path: path.relative(ROOT, MANIFEST),
+            mode: options.writeManifest ? "write" : "enforce",
+            expected: null,
+            executed: null,
+            syntheticFileEntries: [],
+            added: [],
+            lost: [],
+          }
+        : null,
+    discoveryOnly: options.verifyDiscoveryOnly,
     verdict: null,
     reasons: [],
     counts: null,
@@ -459,6 +577,7 @@ async function main() {
     const counts = evidence.counts;
     process.stdout.write(
       `\nWATCHDOG VERDICT: ${verdict} scope=${scope}` +
+        (evidence.discoveryOnly ? " tests=NOT_RUN(discovery-only)" : "") +
         (counts
           ? ` tests=${counts.tests} pass=${counts.passed} fail=${counts.failed} cancelled=${counts.cancelled} skipped=${counts.skipped} todo=${counts.todo}`
           : "") +
@@ -476,6 +595,16 @@ async function main() {
     evidence.reasons.push(discovery.reason);
     finish("FAIL");
     return;
+  }
+  // The pinned FILE set is checked before anything runs, like discovery: a
+  // suite whose files the manifest does not name cannot match it by running.
+  if (scope === "FULL_SUITE" && !options.writeManifest) {
+    const manifestRefusal = manifestFileBinding(files);
+    if (manifestRefusal !== null) {
+      evidence.reasons.push(manifestRefusal);
+      finish("FAIL");
+      return;
+    }
   }
   if (options.verifyDiscoveryOnly) {
     finish("PASS");
@@ -693,6 +822,63 @@ async function main() {
   }
   if (evidence.filesWithoutTests.length > 0) {
     reasons.push(`FILES_WITHOUT_TESTS: ${evidence.filesWithoutTests.join(", ")}`);
+  }
+
+  // ---- THE EXECUTED SET AGAINST THE PINNED ONE (R1.3) -------------------
+  if (evidence.manifest !== null) {
+    const executed = [];
+    const synthetic = [];
+    for (const event of events) {
+      if (event.type !== "test:pass" && event.type !== "test:fail") continue;
+      const isFileLevel = event.nesting === 0 && absoluteFiles.has(path.resolve(ROOT, event.name ?? ""));
+      if (isFileLevel) {
+        synthetic.push(path.relative(ROOT, path.resolve(ROOT, event.name)));
+        continue;
+      }
+      const file = event.file ? path.relative(ROOT, path.resolve(ROOT, event.file)) : "?";
+      executed.push(manifestKey(file, event.nesting, event.name));
+    }
+    evidence.manifest.executed = executed.length;
+    evidence.manifest.syntheticFileEntries = synthetic.sort();
+    if (synthetic.length > 0) {
+      reasons.push(
+        `SYNTHETIC_FILE_ENTRIES: ${synthetic.length} file-level entr${synthetic.length === 1 ? "y was" : "ies were"} counted as tests — a worker exited non-zero or died at file level: ${synthetic.join(", ")}`,
+      );
+    }
+    if (options.writeManifest) {
+      if (reasons.length > 0) {
+        reasons.push("MANIFEST_NOT_WRITTEN: only an otherwise-clean run may define the denominator");
+      } else {
+        const header = [
+          "# THE COMMIT'S EXECUTED TEST SET — scripts/test-watchdog.mjs fails a FULL_SUITE run on any delta.",
+          "# One line per test: file<TAB>nesting<TAB>name. Duplicates are meaningful (multiset).",
+          "# Regenerate ONLY by `node scripts/test-watchdog.mjs --write-manifest` from a clean run,",
+          "# and review the diff: every added or removed line is a test the commit gained or lost.",
+        ];
+        fs.writeFileSync(MANIFEST, `${[...header, ...executed.sort()].join("\n")}\n`);
+        evidence.manifest.expected = executed.length;
+        reasons.push(
+          `MANIFEST_WRITTEN: ${executed.length} tests recorded to ${path.relative(ROOT, MANIFEST)}; a run that defines its own denominator is not a verdict`,
+        );
+      }
+    } else {
+      const expected = readManifest() ?? [];
+      evidence.manifest.expected = expected.length;
+      const { added, lost } = multisetDelta(executed, expected);
+      evidence.manifest.added = added;
+      evidence.manifest.lost = lost;
+      if (added.length > 0 || lost.length > 0) {
+        const show = (list) => list.slice(0, 20).map((key) => key.replace(/\t/g, " :: ")).join(" | ") + (list.length > 20 ? ` | … ${list.length - 20} more (evidence manifest.*)` : "");
+        reasons.push(
+          `MANIFEST_DELTA: executed ${executed.length}, pinned ${expected.length}; ${added.length} not pinned, ${lost.length} pinned and not executed` +
+            (added.length > 0 ? ` — NOT PINNED: ${show(added)}` : "") +
+            (lost.length > 0 ? ` — NOT EXECUTED: ${show(lost)}` : ""),
+        );
+      }
+      if (summary && summary.counts.tests !== expected.length) {
+        reasons.push(`DENOMINATOR_NOT_PINNED: the runner counted tests=${summary.counts.tests}, the manifest pins ${expected.length}`);
+      }
+    }
   }
 
   if (reasons.length === 0) {
