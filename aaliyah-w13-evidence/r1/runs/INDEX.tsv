@@ -8,3 +8,7 @@ r1.2-premise-U2	used	7cbc691	0	WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=108
 r1.5-diag-k02-culprit-D1	used	7cbc691	0	WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1088 pass=1088 fail=0 cancelled=0 skipped=0 todo=0
 r1.5-diag-k02-culprit-D2	used	7cbc691	0	WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1088 pass=1088 fail=0 cancelled=0 skipped=0 todo=0
 r1.5-diag-k02-culprit-D3	used	7cbc691	1	WATCHDOG VERDICT: FAIL scope=FULL_SUITE tests=1088 pass=1087 fail=1 cancelled=0 skipped=0 todo=0
+k02-real	pristine	7eadfa1	0	WATCHDOG VERDICT: PASS scope=FOCUSED tests=132 pass=132 fail=0 cancelled=0 skipped=0 todo=0
+k02-destroyer-labelled	pristine	7eadfa1	1	WATCHDOG VERDICT: FAIL scope=FOCUSED tests=132 pass=131 fail=1 cancelled=0 skipped=0 todo=0
+k02-contamination-unlabelled	pristine	7eadfa1	0	WATCHDOG VERDICT: PASS scope=FOCUSED tests=132 pass=132 fail=0 cancelled=0 skipped=0 todo=0
+k02-contamination-OLD-unscoped	pristine	d65cb05	1	WATCHDOG VERDICT: FAIL scope=FOCUSED tests=132 pass=131 fail=1 cancelled=0 skipped=0 todo=0
