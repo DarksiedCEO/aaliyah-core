@@ -5823,6 +5823,27 @@ test("R-1 K-02 (probe1): no transaction and no record lock is held ACROSS a slow
   // open FOR THE PROVIDER'S WHOLE LATENCY, so the measurement is the oldest
   // open transaction's age, and the bound is a fraction of the hang.
   const HANG_MS = 1_500;
+  // R1 — MEASURE ONLY THE SESSIONS UNDER TEST. Both measurements below read
+  // `pg_stat_activity` for the WHOLE database, and `node --test` runs other
+  // files against that database in parallel. Caught in R1's premise runs: when
+  // this failed (3 of 6 full runs), the oldest idle transaction was
+  // `UPDATE watchdog_fixture_78003 SET id = 1 WHERE id = 1` — a row-lock
+  // fixture of tests/testWatchdog.test.ts, not this store. The store under
+  // test now gets its own pools, labelled by `application_name`, and only
+  // those sessions are measured. The destroyer that proves the scoped probe
+  // still sees a held transaction is recorded with R1's evidence.
+  const PROBE_APP = "r1-k02-probe1";
+  const labelled = new URL(DB_URL);
+  labelled.searchParams.set("application_name", PROBE_APP);
+  const probeWrite = createMailDbPool({ AALIYAH_DATABASE_URL: labelled.href } as NodeJS.ProcessEnv);
+  const probeRead = createMailDbPool({ AALIYAH_DATABASE_URL: labelled.href } as NodeJS.ProcessEnv);
+  // Fixture precondition: the label really reaches the server, or the scoped
+  // queries below would match nothing and pass vacuously.
+  assert.equal(
+    (await probeWrite.query("SELECT current_setting('application_name') AS v")).rows[0].v,
+    PROBE_APP,
+    "fixture precondition: the probe pools' sessions must carry the probe's application_name",
+  );
   const observed = { maxIdleTxMs: 0, maxAdvisoryMs: 0, samples: 0 };
   const poll = setInterval(() => {
     void adminPool
@@ -5831,6 +5852,7 @@ test("R-1 K-02 (probe1): no transaction and no record lock is held ACROSS a slow
            COALESCE((SELECT max(EXTRACT(EPOCH FROM (clock_timestamp() - xact_start)) * 1000)
                        FROM pg_stat_activity
                       WHERE datname = current_database() AND state = 'idle in transaction'
+                        AND application_name = $1
                         AND pid <> pg_backend_pid()), 0)::float8 AS idle_tx_ms,
            -- ALSO A DURATION, for the same reason. A record's advisory lock
            -- is legitimately held for the few statements of an ordinary
@@ -5854,8 +5876,10 @@ test("R-1 K-02 (probe1): no transaction and no record lock is held ACROSS a slow
                         AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
                         AND l.pid <> pg_backend_pid()
                         AND a.state = 'idle in transaction'
+                        AND a.application_name = $1
                         AND a.xact_start IS NOT NULL
                         AND NOT (l.classid = 0 AND l.objid = 728133001)), 0)::float8 AS advisory_ms`,
+        [PROBE_APP],
       )
       .then((r) => {
         observed.samples += 1;
@@ -5871,10 +5895,12 @@ test("R-1 K-02 (probe1): no transaction and no record lock is held ACROSS a slow
   try {
     result = await eraseRecordAtHead(
       SURVIVOR, "mutation.r1.survivor", "tombstone-r1-survivor", "subject_erasure_request",
-      createPostgresTrustedMemoryStore(writePool, readPool, { piiKeys: slow }),
+      createPostgresTrustedMemoryStore(probeWrite, probeRead, { piiKeys: slow }),
     );
   } finally {
     clearInterval(poll);
+    await probeWrite.end();
+    await probeRead.end();
   }
   assert.equal(result.result.verified, true, result.result.rejection ?? "");
   assert.ok(asked, "fixture precondition: the slow provider must actually have been consulted");
