@@ -2331,3 +2331,122 @@ which is where it belongs — it is not carried forward in a context window.
 Note this is distinct from, and narrower than, **R4.2**: R4.2 bars the BUILDER
 from running gates 1–3 at all, permanently. This entry only fixes who may write
 to the branch during R1.
+
+---
+
+## R1 — OVERNIGHT BUILDER RUN 2026-09-20/21: R1.1 DONE, R1.2 PREMISE DID NOT REPRODUCE, STOPPED
+
+Builder session, sole writer. Every measurement below was produced by
+`aaliyah-w13-evidence/r1/tools/run-suite.sh` against the builder's own
+PostgreSQL 16.14 container `aaliyah-w13-r1` on `127.0.0.1:54610`, serial, one
+suite at a time, no reviewer environment running. Server logging set to
+`log_statement=ddl` and `log_line_prefix='%m [%p] db=%d app=%a '` for every
+run, so each administrator termination carries a pid and a database. Every
+run's evidence JSON, spec output, cluster fingerprint and server log is in
+`aaliyah-w13-evidence/r1/runs/`; the index is `runs/INDEX.tsv`.
+
+### R1.1 — DONE (`fe78fd0`, proof `7cbc691`)
+
+K-05 now releases before it asserts; the hand-release store test (F6) and the
+wedged-transport test close the wedging proxy before draining; every
+`pool.end()` in those three tests is bounded (`endWithin`, 15 s).
+
+    BEFORE (98321de), K-05 inverted:  FAIL scope=FOCUSED — HUNG_WORKER, NO_SUMMARY,
+                                      K-05 timed out 240002ms, failures[] EMPTY
+    AFTER (fe78fd0), K-05 assert.fail: FAIL tests=17 pass=16 fail=1 — reported in 8.68ms, named
+    AFTER (fe78fd0), gate 1's D3 mutant: FAIL tests=17 pass=15 fail=2 — F6's own message at 70s
+
+**NEW FINDING, not fixed (production code outside R1).** The reason K-05's
+assertion can fail at all is NOT the terminate racing the next query (0 of 800
+here). pg rejects the next query on a terminated client in one of TWO real
+shapes: `57P01` (787/800) or the UN-CODED `Client has encountered a connection
+error and is not queryable` (13/800; 100/100 once the backend is already gone).
+`isConnectionAmbiguous` (`src/persistence/postgres/pool.ts`) does not classify
+the second. pg-pool evicts that client anyway (`pg-pool/index.js:392`,
+`!client._queryable`), so production still destroys it — the classifier is
+incomplete and K-05 is timing-dependent on it. Observed live: the plain
+inversion of K-05 PASSED on one run (`r1.1-after-k05-inverted`), i.e. the
+un-inverted test would have failed. **Closing it needs a change to `pool.ts`,
+which R1 does not name. Handed to the founder.**
+
+### R1.2 — PREMISE RE-EXECUTED, DID NOT REPRODUCE → STOP (work order R1.2.1)
+
+At `7cbc691` (R1.1 only), full suite, serial, quiet host (load 1.8-7.1):
+
+    P1 pristine  WATCHDOG VERDICT: FAIL scope=FULL_SUITE tests=1088 pass=1087 fail=1 cancelled=0 skipped=0 todo=0
+    U1 used      WATCHDOG VERDICT: FAIL scope=FULL_SUITE tests=1088 pass=1087 fail=1 cancelled=0 skipped=0 todo=0
+    U2 used      WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1088 pass=1088 fail=0 cancelled=0 skipped=0 todo=0
+
+The one failure in P1 and U1 is the SAME test, in both states:
+`R-1 K-02 (probe1)` — "a transaction stayed open 1003ms / 929ms across a
+1500ms provider call". A used database produced a PASS; a pristine one
+produced the failure. **A used database does not change the verdict here.**
+Per the work order: stop and report; the root cause is elsewhere.
+
+**What the premise run DID find — the cause of the one failure, EXECUTED.**
+probe1 measures the oldest `idle in transaction` session in the WHOLE
+database, not its own. Instrumented in a disposable worktree only
+(`r1/probes/k02-probe1-culprit-diagnostic.DIAGNOSTIC-ONLY.patch`, never
+committed to tests), three more used runs: PASS, PASS, FAIL. On the FAIL:
+
+    R1-DIAG probe1 maxIdleTxMs=995 culprit={"pid":4002,"state":"idle in transaction",
+      "q":"UPDATE watchdog_fixture_78003 SET id = 1 WHERE id = 1","age":995}
+
+That session belongs to `tests/testWatchdog.test.ts`'s DB-blocking fixtures,
+running in parallel against the same `aaliyah_test`. **K-02 probe1 fails on
+another FILE's transaction.** That is shared-database contamination — but
+structural and per-run, not residual state, which is why pristine vs used
+made no difference. Neither file is named in R1; not fixed.
+
+Sample-size disclosure: two used runs plus three diagnostic used runs, one
+pristine. Gate 5's I-9 "used" was a database left by a SIGTERMed run, a
+different state from "the database left by the previous run", which is the
+definition this run was given. The I-9 shape was NOT tested under that other
+definition.
+
+### R1.5 — ISSUER NAMED, EXECUTED
+
+Every termination in P1/U1/U2 attributed from the server log:
+
+    P1  7 on aaliyah_test   3 on aaliyah_concurrent_n5
+    U1  7 on aaliyah_test
+    U2  7 on aaliyah_test
+
+The 7 on `aaliyah_test` are the pool-resilience file's own deliberate
+`pg_terminate_backend` calls (6 probes + K-05). The 3 on
+`aaliyah_concurrent_n5` land in the SAME millisecond as the replay file's own
+`DROP DATABASE aaliyah_concurrent_n5 WITH (FORCE)` (pid 1711): sockets of that
+test's pools still open after `pool.end()` resolved. The n5 pools carry an
+`'error'` listener, so nothing failed. **The POSITIVE CONTROL runs the same
+teardown with NO listener.** Isolated repro of its exact teardown
+(`r1/probes/positive-control-teardown.cjs`): 200 iterations, **2 uncaught
+57P01 after `end()` resolved, matching 2 server-side terminations on that
+database 1:1**. The issuer of gate 3's R-14 is the positive control's OWN
+`withFreshDatabase` cleanup, not another file. Not fixed (stopped).
+
+### R1.3 / R1.4 / R1.6 — DRAFTED, NOT EXECUTED, NOT COMMITTED TO THE TREE
+
+`aaliyah-w13-evidence/r1/wip/R1.3-R1.4-R1.6-UNEXECUTED.patch` applies cleanly
+to `7cbc691`. It has NEVER been run. Contents: a committed-manifest
+denominator with SYNTHETIC_FILE_ENTRIES / DENOMINATOR_NOT_PINNED /
+MANIFEST_DELTA refusals, `DISCOVERY_VACUOUS`, a manifest file-set check in
+`--verify-discovery`, the `ci-guards.sh` private temp file, R1.4's subset
+assertion against an exported `LEDGER_RACE_LOST`, and eight watchdog tests.
+It contains no manifest yet: generating one needs a clean full run.
+
+### ASSUMPTIONS TAKEN WITHOUT AN ANSWER (conservative reading, recorded)
+
+1. **The 2×2's "concurrent" column was not run.** The run rules forbid a suite
+   concurrent with another suite. Only the serial column was measured.
+2. "Used" = the database the previous run left (the run's definition), not a
+   database left by a killed run.
+3. R1.4 requires referencing the production constant, so the draft exports
+   `LEDGER_RACE_LOST` from `migrations.ts` (named in R1.4; no runtime change).
+   Unexecuted.
+4. The adjudication says guard 8 must FAIL "when zero tests executed"; taken
+   literally that fails it always (it runs no tests). The work order's reading
+   (FAIL on an empty DISCOVERED set; vacuous ≠ verified) was drafted.
+5. The `DISCOVERY_VACUOUS` path is not reachable through the entrypoint at
+   this SHA (`usage()` exits 2 on zero FULL_SUITE files first). The draft makes
+   it reachable as a FAIL.
+6. The builder used its own container on :54610, not any reviewer container.

@@ -1,0 +1,81 @@
+{
+  "watchdog": "aaliyah-core/scripts/test-watchdog.mjs",
+  "scope": "FULL_SUITE",
+  "git": {
+    "head": "7cbc6919aa68fc57b8d4b65e70497b0c298d5237",
+    "dirty": true
+  },
+  "node": "v24.9.0",
+  "startedAt": "2026-09-21T05:09:32.901Z",
+  "finishedAt": "2026-09-21T05:12:47.698Z",
+  "durationMs": 194797,
+  "environment": {
+    "nodeOptionsIgnored": null,
+    "tsNodeIgnored": {}
+  },
+  "bounds": {
+    "testTimeoutMs": 240000,
+    "deadlineMs": 900000,
+    "exitGraceMs": 15000,
+    "pgOptions": "-c statement_timeout=60000 -c lock_timeout=60000 -c idle_in_transaction_session_timeout=120000"
+  },
+  "files": 84,
+  "discovery": {
+    "scope": "FULL_SUITE",
+    "boundToCommit": true,
+    "ignored": [],
+    "untracked": [],
+    "missing": []
+  },
+  "verdict": "FAIL",
+  "reasons": [
+    "NONZERO_EXIT: code=1 signal=null",
+    "FAILED_TESTS: 1",
+    "PASSED_NOT_EQUAL_TESTS: 1087 of 1088",
+    "RUNNER_REPORTED_UNSUCCESSFUL"
+  ],
+  "counts": {
+    "tests": 1088,
+    "failed": 1,
+    "passed": 1087,
+    "cancelled": 0,
+    "skipped": 0,
+    "todo": 0,
+    "topLevel": 1088,
+    "suites": 0
+  },
+  "exit": {
+    "code": 1,
+    "signal": null
+  },
+  "timedOut": [],
+  "failures": [
+    {
+      "name": "R-1 K-02 (probe1): no transaction and no record lock is held ACROSS a slow provider call",
+      "file": "tests/wave1MemoryHoldErasurePostgres.integration.test.ts",
+      "failureType": "testCodeFailure",
+      "message": "a transaction stayed open 995ms across a 1500ms provider call",
+      "code": "ERR_ASSERTION"
+    }
+  ],
+  "filesWithoutResult": [],
+  "filesWithoutTests": [],
+  "filesWithoutSummary": [],
+  "testsNeverFinished": [],
+  "processGroup": {
+    "pgid": 76909,
+    "killedSurvivors": false,
+    "survivedSigkill": false
+  },
+  "database": {
+    "required": true,
+    "before": {
+      "reachable": true,
+      "reason": null
+    },
+    "after": {
+      "reachable": true,
+      "reason": null
+    }
+  }
+}

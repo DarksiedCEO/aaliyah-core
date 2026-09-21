@@ -1,0 +1,33 @@
+diff --git a/tests/wave1MemoryHoldErasurePostgres.integration.test.ts b/tests/wave1MemoryHoldErasurePostgres.integration.test.ts
+index 207d086..8e50ea2 100644
+--- a/tests/wave1MemoryHoldErasurePostgres.integration.test.ts
++++ b/tests/wave1MemoryHoldErasurePostgres.integration.test.ts
+@@ -5823,7 +5823,17 @@ test("R-1 K-02 (probe1): no transaction and no record lock is held ACROSS a slow
+   // open FOR THE PROVIDER'S WHOLE LATENCY, so the measurement is the oldest
+   // open transaction's age, and the bound is a fraction of the hang.
+   const HANG_MS = 1_500;
+-  const observed = { maxIdleTxMs: 0, maxAdvisoryMs: 0, samples: 0 };
++  const observed = { maxIdleTxMs: 0, maxAdvisoryMs: 0, samples: 0, culprit: "" as string };
++  const diag = setInterval(() => {
++    void adminPool.query(`SELECT pid, application_name, backend_start, xact_start, state, left(query, 160) AS q,
++         (EXTRACT(EPOCH FROM (clock_timestamp() - xact_start)) * 1000)::int AS age
++       FROM pg_stat_activity WHERE datname = current_database() AND state = 'idle in transaction'
++        AND pid <> pg_backend_pid() ORDER BY xact_start LIMIT 1`).then((r) => {
++      const row = r.rows[0];
++      if (row && row.age >= (observed as any).culpritAge0 ? true : false) {}
++      if (row && row.age > ((observed as any).culpritAge ?? -1)) { (observed as any).culpritAge = row.age; observed.culprit = JSON.stringify(row); }
++    }).catch(() => undefined);
++  }, 100);
+   const poll = setInterval(() => {
+     void adminPool
+       .query(
+@@ -5875,7 +5885,9 @@ test("R-1 K-02 (probe1): no transaction and no record lock is held ACROSS a slow
+     );
+   } finally {
+     clearInterval(poll);
++    clearInterval(diag);
+   }
++  process.stdout.write(`R1-DIAG probe1 maxIdleTxMs=${Math.round(observed.maxIdleTxMs)} culprit=${observed.culprit}\n`);
+   assert.equal(result.result.verified, true, result.result.rejection ?? "");
+   assert.ok(asked, "fixture precondition: the slow provider must actually have been consulted");
+   assert.ok(observed.samples >= 5, `the poller must have sampled during the wait: ${observed.samples}`);

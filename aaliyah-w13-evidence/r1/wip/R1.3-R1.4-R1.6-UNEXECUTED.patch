@@ -1,0 +1,542 @@
+diff --git a/scripts/ci-guards.sh b/scripts/ci-guards.sh
+index fc2aecb..74236de 100755
+--- a/scripts/ci-guards.sh
++++ b/scripts/ci-guards.sh
+@@ -84,12 +84,20 @@ fi
+ #    recorded `git.dirty: false`. Asked here as well as inside `npm test`,
+ #    because a guard that answers in under a second is worth having before
+ #    anyone pays for a suite.
+-if node scripts/test-watchdog.mjs --verify-discovery >/tmp/discovery.out 2>&1; then
+-  ok "the full suite's executed set is bound to the commit"
++#    It now also FAILS on an empty discovered set (R1.6: a binding over the
++#    empty set is undefined, not satisfied) and on a file set the committed
++#    manifest does not name (R1.3). It still runs no tests: it cannot say the
++#    suite PASSED, only that what would run is what the commit pins.
++#    Its own output file is private to this run (I-4: a fixed /tmp path let
++#    concurrent guard runs read each other's answers).
++discovery_out="$(mktemp "${TMPDIR:-/tmp}/ci-guards-discovery.XXXXXX")"
++if node scripts/test-watchdog.mjs --verify-discovery >"$discovery_out" 2>&1; then
++  ok "the full suite's discovered files are bound to the commit and to its manifest (no tests run)"
+ else
+   bad "test discovery is not bound to the commit:"
+-  sed 's/^/    /' /tmp/discovery.out
++  sed 's/^/    /' "$discovery_out"
+ fi
++rm -f "$discovery_out"
+ 
+ echo
+ if [ "$fail" -ne 0 ]; then
+diff --git a/scripts/test-watchdog.mjs b/scripts/test-watchdog.mjs
+index da36b85..7a6e98b 100644
+--- a/scripts/test-watchdog.mjs
++++ b/scripts/test-watchdog.mjs
+@@ -74,6 +74,7 @@ function parseArgs(argv) {
+     requireDb: true,
+     evidence: null,
+     verifyDiscoveryOnly: false,
++    writeManifest: false,
+     files: [],
+   };
+   const numeric = {
+@@ -97,6 +98,11 @@ function parseArgs(argv) {
+       // Answers ONE question — is the full suite the commit's suite? — and
+       // runs nothing. A release guard can ask it without paying for a suite.
+       options.verifyDiscoveryOnly = true;
++    } else if (arg === "--write-manifest") {
++      // Records this FULL_SUITE run's executed set as scripts/test-manifest.tsv.
++      // Only from an otherwise-clean run, and the run is then NOT a verdict:
++      // a run that defines its own denominator cannot also be measured by it.
++      options.writeManifest = true;
+     } else if (arg === "--evidence") {
+       options.evidence = argv[++i] ?? usage("--evidence needs a path");
+     } else if (arg in numeric) {
+@@ -162,7 +168,20 @@ function fullSuiteFiles() {
+ function discoveryBinding(files) {
+   const relative = files.filter((file) => !path.isAbsolute(file));
+   if (relative.length === 0) {
+-    return { verified: true, ignored: [], untracked: [], missing: [], reason: null };
++    // A BINDING OVER THE EMPTY SET IS UNDEFINED, NOT SATISFIED (R1.6, red team
++    // RT4-5 against e71b51e). This returned `verified: true`, so zero
++    // discovered files affirmed "the executed set is bound to the commit" —
++    // every property holds of the empty set. `vacuous` is recorded as its own
++    // answer and refused, never folded into `verified`.
++    return {
++      verified: false,
++      vacuous: true,
++      ignored: [],
++      untracked: [],
++      missing: [],
++      reason:
++        "DISCOVERY_VACUOUS: no test files were discovered, so there is no executed set to bind to the commit — an empty binding is undefined, not satisfied",
++    };
+   }
+   let ignored = [];
+   let untracked = [];
+@@ -232,6 +251,7 @@ function discoveryBinding(files) {
+   }
+   return {
+     verified: true,
++    vacuous: false,
+     ignored,
+     untracked,
+     missing,
+@@ -239,6 +259,84 @@ function discoveryBinding(files) {
+   };
+ }
+ 
++/**
++ * THE DENOMINATOR IS PINNED TO THE COMMIT (R1.3).
++ *
++ * Candidate-4's review saw 1086, 1087, 1088, 1091 and 1093 tests at ONE SHA,
++ * and nothing in the repository said which was right: a moving count could be
++ * noticed, never refused. `scripts/test-manifest.tsv` is the commit's executed
++ * set, one line per test — file, nesting, name — and a FULL_SUITE run whose
++ * executed set differs from it in EITHER direction is FAIL, naming each
++ * test added or lost.
++ *
++ * The executed set is every `test:pass` / `test:fail` that is not a FILE-level
++ * entry. File-level entries are counted separately: node:test synthesizes one,
++ * and counts it in `tests`, whenever a worker exits non-zero after its tests
++ * passed (gate 1 F2, the repository's own hookSentinel does exactly that) or
++ * dies at file level (gate 5 I-10). So the summary's `tests` must ALSO equal
++ * the manifest's length — a synthetic entry is then a named delta, not a
++ * silent +1.
++ *
++ * Lines beginning with `#` are comments. Duplicate lines are meaningful: two
++ * tests may share a name, and the comparison is of multisets.
++ */
++const MANIFEST = path.join(ROOT, "scripts", "test-manifest.tsv");
++
++function manifestKey(file, nesting, name) {
++  return `${file}\t${nesting}\t${String(name).replace(/[\t\n\r]/g, " ")}`;
++}
++
++function readManifest() {
++  if (!fs.existsSync(MANIFEST)) return null;
++  return fs
++    .readFileSync(MANIFEST, "utf8")
++    .split("\n")
++    .filter((line) => line !== "" && !line.startsWith("#"));
++}
++
++/** Multiset difference, both ways: what ran and is not pinned, what is pinned and did not run. */
++function multisetDelta(executed, expected) {
++  const remaining = new Map();
++  for (const key of expected) remaining.set(key, (remaining.get(key) ?? 0) + 1);
++  const added = [];
++  for (const key of executed) {
++    const left = remaining.get(key) ?? 0;
++    if (left > 0) remaining.set(key, left - 1);
++    else added.push(key);
++  }
++  const lost = [];
++  for (const [key, left] of remaining) for (let i = 0; i < left; i += 1) lost.push(key);
++  return { added: added.sort(), lost: lost.sort() };
++}
++
++/**
++ * `--verify-discovery` answers from the manifest too: it must exist, be
++ * non-empty, and name exactly the discovered FILE set. It still runs nothing,
++ * so it cannot vouch for the test NAMES — only a run can, and a FULL_SUITE run
++ * does.
++ */
++function manifestFileBinding(files) {
++  const lines = readManifest();
++  if (lines === null) {
++    return `MANIFEST_MISSING: ${path.relative(ROOT, MANIFEST)} does not exist, so nothing pins what the full suite executes`;
++  }
++  if (lines.length === 0) {
++    return `MANIFEST_EMPTY: ${path.relative(ROOT, MANIFEST)} pins no tests — a denominator of zero is not a pin`;
++  }
++  const pinned = new Set(lines.map((line) => line.split("\t")[0]));
++  const discovered = new Set(files);
++  const unpinned = [...discovered].filter((file) => !pinned.has(file)).sort();
++  const vanished = [...pinned].filter((file) => !discovered.has(file)).sort();
++  const reasons = [];
++  if (unpinned.length > 0) {
++    reasons.push(`MANIFEST_FILE_DELTA: ${unpinned.length} discovered test file(s) have no pinned tests: ${unpinned.join(", ")}`);
++  }
++  if (vanished.length > 0) {
++    reasons.push(`MANIFEST_FILE_DELTA: ${vanished.length} pinned test file(s) were not discovered: ${vanished.join(", ")}`);
++  }
++  return reasons.length > 0 ? reasons.join(" | ") : null;
++}
++
+ function pgOptions(options) {
+   const ours = {
+     statement_timeout: options.statementTimeoutMs,
+@@ -365,7 +463,11 @@ async function main() {
+   const options = parseArgs(process.argv.slice(2));
+   const scope = options.files.length === 0 ? "FULL_SUITE" : "FOCUSED";
+   const files = scope === "FULL_SUITE" ? fullSuiteFiles() : options.files;
+-  if (files.length === 0) usage("no test files");
++  // FULL_SUITE with nothing discovered is not a usage error: it is refused
++  // below as DISCOVERY_VACUOUS, so guard 8 FAILS on it rather than erroring.
++  if (scope === "FOCUSED" && files.length === 0) usage("no test files");
++  if (options.writeManifest && scope !== "FULL_SUITE") usage("--write-manifest records the FULL suite only");
++  if (options.writeManifest && options.verifyDiscoveryOnly) usage("--write-manifest needs a run; --verify-discovery runs nothing");
+   for (const file of files) {
+     if (!fs.existsSync(path.resolve(ROOT, file))) usage(`no such test file: ${file}`);
+   }
+@@ -383,7 +485,7 @@ async function main() {
+         // reads. A FOCUSED run's files are named on argv and routinely live
+         // outside the repository, so there is nothing to bind them to; the
+         // honest record is that nobody looked.
+-        { verified: null, ignored: [], untracked: [], reason: null };
++        { verified: null, vacuous: null, ignored: [], untracked: [], reason: null };
+ 
+   const startedAt = new Date();
+   const runDir = fs.mkdtempSync(path.join(ROOT, ".test-evidence-run-"));
+@@ -431,10 +533,26 @@ async function main() {
+           : discovery.verified &&
+             discovery.ignored.length === 0 &&
+             (discovery.missing ?? []).length === 0,
++      vacuous: discovery.vacuous,
+       ignored: discovery.ignored,
+       untracked: discovery.untracked,
+       missing: discovery.missing ?? [],
+     },
++    // FULL_SUITE only (R1.3). `null` for FOCUSED: nothing is pinned for an
++    // arbitrary file list, and nothing is claimed.
++    manifest:
++      scope === "FULL_SUITE"
++        ? {
++            path: path.relative(ROOT, MANIFEST),
++            mode: options.writeManifest ? "write" : "enforce",
++            expected: null,
++            executed: null,
++            syntheticFileEntries: [],
++            added: [],
++            lost: [],
++          }
++        : null,
++    discoveryOnly: options.verifyDiscoveryOnly,
+     verdict: null,
+     reasons: [],
+     counts: null,
+@@ -459,6 +577,7 @@ async function main() {
+     const counts = evidence.counts;
+     process.stdout.write(
+       `\nWATCHDOG VERDICT: ${verdict} scope=${scope}` +
++        (evidence.discoveryOnly ? " tests=NOT_RUN(discovery-only)" : "") +
+         (counts
+           ? ` tests=${counts.tests} pass=${counts.passed} fail=${counts.failed} cancelled=${counts.cancelled} skipped=${counts.skipped} todo=${counts.todo}`
+           : "") +
+@@ -477,6 +596,16 @@ async function main() {
+     finish("FAIL");
+     return;
+   }
++  // The pinned FILE set is checked before anything runs, like discovery: a
++  // suite whose files the manifest does not name cannot match it by running.
++  if (scope === "FULL_SUITE" && !options.writeManifest) {
++    const manifestRefusal = manifestFileBinding(files);
++    if (manifestRefusal !== null) {
++      evidence.reasons.push(manifestRefusal);
++      finish("FAIL");
++      return;
++    }
++  }
+   if (options.verifyDiscoveryOnly) {
+     finish("PASS");
+     return;
+@@ -695,6 +824,63 @@ async function main() {
+     reasons.push(`FILES_WITHOUT_TESTS: ${evidence.filesWithoutTests.join(", ")}`);
+   }
+ 
++  // ---- THE EXECUTED SET AGAINST THE PINNED ONE (R1.3) -------------------
++  if (evidence.manifest !== null) {
++    const executed = [];
++    const synthetic = [];
++    for (const event of events) {
++      if (event.type !== "test:pass" && event.type !== "test:fail") continue;
++      const isFileLevel = event.nesting === 0 && absoluteFiles.has(path.resolve(ROOT, event.name ?? ""));
++      if (isFileLevel) {
++        synthetic.push(path.relative(ROOT, path.resolve(ROOT, event.name)));
++        continue;
++      }
++      const file = event.file ? path.relative(ROOT, path.resolve(ROOT, event.file)) : "?";
++      executed.push(manifestKey(file, event.nesting, event.name));
++    }
++    evidence.manifest.executed = executed.length;
++    evidence.manifest.syntheticFileEntries = synthetic.sort();
++    if (synthetic.length > 0) {
++      reasons.push(
++        `SYNTHETIC_FILE_ENTRIES: ${synthetic.length} file-level entr${synthetic.length === 1 ? "y was" : "ies were"} counted as tests — a worker exited non-zero or died at file level: ${synthetic.join(", ")}`,
++      );
++    }
++    if (options.writeManifest) {
++      if (reasons.length > 0) {
++        reasons.push("MANIFEST_NOT_WRITTEN: only an otherwise-clean run may define the denominator");
++      } else {
++        const header = [
++          "# THE COMMIT'S EXECUTED TEST SET — scripts/test-watchdog.mjs fails a FULL_SUITE run on any delta.",
++          "# One line per test: file<TAB>nesting<TAB>name. Duplicates are meaningful (multiset).",
++          "# Regenerate ONLY by `node scripts/test-watchdog.mjs --write-manifest` from a clean run,",
++          "# and review the diff: every added or removed line is a test the commit gained or lost.",
++        ];
++        fs.writeFileSync(MANIFEST, `${[...header, ...executed.sort()].join("\n")}\n`);
++        evidence.manifest.expected = executed.length;
++        reasons.push(
++          `MANIFEST_WRITTEN: ${executed.length} tests recorded to ${path.relative(ROOT, MANIFEST)}; a run that defines its own denominator is not a verdict`,
++        );
++      }
++    } else {
++      const expected = readManifest() ?? [];
++      evidence.manifest.expected = expected.length;
++      const { added, lost } = multisetDelta(executed, expected);
++      evidence.manifest.added = added;
++      evidence.manifest.lost = lost;
++      if (added.length > 0 || lost.length > 0) {
++        const show = (list) => list.slice(0, 20).map((key) => key.replace(/\t/g, " :: ")).join(" | ") + (list.length > 20 ? ` | … ${list.length - 20} more (evidence manifest.*)` : "");
++        reasons.push(
++          `MANIFEST_DELTA: executed ${executed.length}, pinned ${expected.length}; ${added.length} not pinned, ${lost.length} pinned and not executed` +
++            (added.length > 0 ? ` — NOT PINNED: ${show(added)}` : "") +
++            (lost.length > 0 ? ` — NOT EXECUTED: ${show(lost)}` : ""),
++        );
++      }
++      if (summary && summary.counts.tests !== expected.length) {
++        reasons.push(`DENOMINATOR_NOT_PINNED: the runner counted tests=${summary.counts.tests}, the manifest pins ${expected.length}`);
++      }
++    }
++  }
++
+   if (reasons.length === 0) {
+     finish("PASS");
+     return;
+diff --git a/src/persistence/postgres/migrations.ts b/src/persistence/postgres/migrations.ts
+index 7cf2e93..93010b5 100644
+--- a/src/persistence/postgres/migrations.ts
++++ b/src/persistence/postgres/migrations.ts
+@@ -6125,7 +6125,7 @@ function migrationOrdinal(id: string): number {
+  * already wrong once. The fix is the advisory lock below, which stops the race
+  * from being run at all.
+  */
+-const LEDGER_RACE_LOST = new Set(["42P07", "23505", "42710"]);
++export const LEDGER_RACE_LOST: ReadonlySet<string> = new Set(["42P07", "23505", "42710"]);
+ 
+ /**
+  * The advisory-lock key concurrent migrators serialize on, taken BEFORE the
+diff --git a/tests/testWatchdog.test.ts b/tests/testWatchdog.test.ts
+index 71b00a3..91151e4 100644
+--- a/tests/testWatchdog.test.ts
++++ b/tests/testWatchdog.test.ts
+@@ -528,3 +528,184 @@ test("a git-ignored test file in tests/ is FAIL: it would execute while git stat
+     fs.rmSync(dir, { recursive: true, force: true });
+   }
+ });
++
++/**
++ * R1.3 / R1.6 — THE DENOMINATOR IS PINNED, AND AN EMPTY BINDING IS REFUSED.
++ *
++ * These drive the REAL watchdog at FULL_SUITE scope, which walks `tests/`
++ * beside the script and binds it to git. Doing that in this repository would
++ * mean rewriting its own manifest or emptying its own tests directory mid-run,
++ * so each case builds a throwaway git repository holding a copy of the
++ * watchdog, its reporter and the hook sentinel — the same files, byte for
++ * byte — plus exactly the tests and manifest the case needs.
++ */
++const MANIFEST_HEADER = "# test manifest fixture\n";
++
++function manifestLine(file: string, name: string, nesting = 0): string {
++  return `${file}\t${nesting}\t${name}`;
++}
++
++function miniRepo(
++  tests: Record<string, string>,
++  manifest: string[] | null,
++  untracked: Record<string, string> = {},
++): string {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "watchdog-minirepo-"));
++  fs.mkdirSync(path.join(dir, "scripts"));
++  fs.mkdirSync(path.join(dir, "tests/support"), { recursive: true });
++  for (const rel of ["scripts/test-watchdog.mjs", "scripts/test-watchdog-reporter.mjs", "tests/support/hookSentinel.cjs", "tsconfig.json"]) {
++    fs.copyFileSync(path.join(ROOT, rel), path.join(dir, rel));
++  }
++  fs.symlinkSync(path.join(ROOT, "node_modules"), path.join(dir, "node_modules"));
++  fs.writeFileSync(path.join(dir, ".gitignore"), "node_modules\n.test-evidence-run-*/\n");
++  for (const [rel, body] of Object.entries(tests)) fs.writeFileSync(path.join(dir, rel), body);
++  if (manifest !== null) {
++    fs.writeFileSync(path.join(dir, "scripts/test-manifest.tsv"), MANIFEST_HEADER + manifest.map((l) => `${l}\n`).join(""));
++  }
++  const git = (args: string[]) => {
++    const r = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
++    assert.equal(r.status, 0, `fixture precondition: git ${args.join(" ")}: ${r.stderr}`);
++  };
++  git(["init", "-q"]);
++  git(["add", "-A"]);
++  git(["-c", "user.name=fixture", "-c", "user.email=fixture@invalid", "commit", "-q", "-m", "fixture"]);
++  for (const [rel, body] of Object.entries(untracked)) fs.writeFileSync(path.join(dir, rel), body);
++  return dir;
++}
++
++function runMiniRepo(dir: string, flags: string[]): { status: number | null; evidence: Evidence & Record<string, any>; elapsedMs: number; stdout: string } {
++  const evidencePath = path.join(dir, "evidence.json");
++  const started = Date.now();
++  const result = spawnSync(process.execPath, [path.join(dir, "scripts/test-watchdog.mjs"), "--evidence", evidencePath, ...flags], {
++    cwd: dir,
++    encoding: "utf8",
++    timeout: 120_000,
++    killSignal: "SIGKILL",
++    env: { ...process.env, AALIYAH_TEST_DATABASE_URL: DB_URL },
++  });
++  const elapsedMs = Date.now() - started;
++  assert.equal(result.error, undefined, `watchdog did not complete: ${result.error}`);
++  const evidence = JSON.parse(fs.readFileSync(evidencePath, "utf8"));
++  return { status: result.status, evidence, elapsedMs, stdout: `${result.stdout}${result.stderr}` };
++}
++
++const TWO_TESTS = 'import { test } from "node:test";\ntest("alpha", () => {});\ntest("beta", () => {});\n';
++const PINNED_TWO = [manifestLine("tests/two.test.ts", "alpha"), manifestLine("tests/two.test.ts", "beta")];
++const MINI_FLAGS = ["--no-db", "--test-timeout-ms", "60000", "--deadline-ms", "110000", "--exit-grace-ms", "15000"];
++
++test("R1.3 POSITIVE CONTROL: an executed set EQUAL to the manifest is PASS, so the refusals below are specific", () => {
++  const dir = miniRepo({ "tests/two.test.ts": TWO_TESTS }, PINNED_TWO);
++  try {
++    const run = runMiniRepo(dir, MINI_FLAGS);
++    assert.equal(run.evidence.verdict, "PASS", JSON.stringify(run.evidence.reasons));
++    assert.equal(run.status, 0);
++    assert.equal(run.evidence.manifest.executed, 2);
++    assert.equal(run.evidence.manifest.expected, 2);
++    assert.deepEqual([run.evidence.manifest.added, run.evidence.manifest.lost], [[], []]);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("R1.3: a test the manifest does NOT pin is FAIL, named — the denominator cannot grow silently", () => {
++  const dir = miniRepo({ "tests/two.test.ts": TWO_TESTS }, [PINNED_TWO[0]!]);
++  try {
++    const run = runMiniRepo(dir, MINI_FLAGS);
++    assertFail(run, /^MANIFEST_DELTA: executed 2, pinned 1; 1 not pinned, 0 pinned and not executed — NOT PINNED: tests\/two\.test\.ts :: 0 :: beta$/);
++    assert.ok(run.evidence.reasons.some((r: string) => /^DENOMINATOR_NOT_PINNED: the runner counted tests=2, the manifest pins 1$/.test(r)));
++    assert.deepEqual(run.evidence.manifest.added, [PINNED_TWO[1]]);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("R1.3: a pinned test that did NOT execute is FAIL, named — the denominator cannot shrink silently", () => {
++  const dir = miniRepo(
++    { "tests/two.test.ts": TWO_TESTS },
++    [...PINNED_TWO, manifestLine("tests/two.test.ts", "gamma, which was deleted")],
++  );
++  try {
++    const run = runMiniRepo(dir, MINI_FLAGS);
++    assertFail(run, /NOT EXECUTED: tests\/two\.test\.ts :: 0 :: gamma, which was deleted$/);
++    assert.deepEqual(run.evidence.manifest.lost, [manifestLine("tests/two.test.ts", "gamma, which was deleted")]);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("R1.3 / F2: a worker that exits non-zero after its tests passed adds a SYNTHETIC entry, and it is named, not counted", () => {
++  // Gate 1's F2 mechanism, reproduced under the pinned denominator: the
++  // hook sentinel's own `process.exitCode = 70` shape. Every REAL test is
++  // pinned and passes, so the only thing that can refuse this run is the
++  // synthetic file-level entry node:test adds to `tests`.
++  const exits = 'import { test } from "node:test";\ntest("passes", () => {});\nprocess.on("exit", () => { process.exitCode = 70; });\n';
++  const dir = miniRepo(
++    { "tests/two.test.ts": TWO_TESTS, "tests/exits.test.ts": exits },
++    [...PINNED_TWO, manifestLine("tests/exits.test.ts", "passes")],
++  );
++  try {
++    const run = runMiniRepo(dir, MINI_FLAGS);
++    assertFail(run, /^SYNTHETIC_FILE_ENTRIES: 1 file-level entry was counted as tests — .*: tests\/exits\.test\.ts$/);
++    assert.ok(run.evidence.reasons.some((r: string) => /^DENOMINATOR_NOT_PINNED: the runner counted tests=4, the manifest pins 3$/.test(r)));
++    // The executed set itself matched: the +1 is the synthetic entry alone.
++    assert.deepEqual([run.evidence.manifest.added, run.evidence.manifest.lost], [[], []]);
++    assert.deepEqual(run.evidence.manifest.syntheticFileEntries, ["tests/exits.test.ts"]);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("R1.3: with NO committed manifest a full-suite run is refused before anything runs", () => {
++  const dir = miniRepo({ "tests/two.test.ts": TWO_TESTS }, null);
++  try {
++    const run = runMiniRepo(dir, MINI_FLAGS);
++    assertFail(run, /^MANIFEST_MISSING: scripts\/test-manifest\.tsv does not exist/);
++    assert.equal(run.evidence.counts, null);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("R1.3 / RT4-5: an UNTRACKED extra test file is refused before it runs — it is in no manifest", () => {
++  // The red team's exact attack against e71b51e: a not-ignored, untracked
++  // test file ran, the suite reported PASS at 1090 against a commit of 1088,
++  // `boundToCommit: true`, and guard 8 was green. Now it cannot run at all.
++  const dir = miniRepo({ "tests/two.test.ts": TWO_TESTS }, PINNED_TWO, {
++    "tests/zzRedTeamExtra.test.ts": 'import { test } from "node:test";\ntest("extra", () => {});\n',
++  });
++  try {
++    const run = runMiniRepo(dir, MINI_FLAGS);
++    assertFail(run, /^MANIFEST_FILE_DELTA: 1 discovered test file\(s\) have no pinned tests: tests\/zzRedTeamExtra\.test\.ts$/);
++    assert.equal(run.evidence.counts, null);
++    const discovery = runMiniRepo(dir, ["--verify-discovery"]);
++    assertFail(discovery, /^MANIFEST_FILE_DELTA:/);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("R1.6: --verify-discovery over an EMPTY discovered set is FAIL, not a vacuous PASS", () => {
++  const dir = miniRepo({ "tests/README.md": "no tests here\n" }, PINNED_TWO);
++  try {
++    const run = runMiniRepo(dir, ["--verify-discovery"]);
++    assertFail(run, /^DISCOVERY_VACUOUS: no test files were discovered/);
++    assert.equal(run.evidence.discovery!.boundToCommit, false);
++    assert.equal(run.evidence.discovery.vacuous, true);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("R1.6 POSITIVE CONTROL: --verify-discovery on a bound, pinned set is PASS — and says it ran nothing", () => {
++  const dir = miniRepo({ "tests/two.test.ts": TWO_TESTS }, PINNED_TWO);
++  try {
++    const run = runMiniRepo(dir, ["--verify-discovery"]);
++    assert.equal(run.evidence.verdict, "PASS", JSON.stringify(run.evidence.reasons));
++    assert.equal(run.evidence.discovery.vacuous, false);
++    assert.equal(run.evidence.discoveryOnly, true);
++    assert.equal(run.evidence.counts, null);
++    assert.match(run.stdout, /WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=NOT_RUN\(discovery-only\)/);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
+diff --git a/tests/wave1MigrationReplayPostgres.integration.test.ts b/tests/wave1MigrationReplayPostgres.integration.test.ts
+index 61a067e..999d50e 100644
+--- a/tests/wave1MigrationReplayPostgres.integration.test.ts
++++ b/tests/wave1MigrationReplayPostgres.integration.test.ts
+@@ -5,6 +5,7 @@ import type { PoolClient } from "pg";
+ 
+ import {
+   createLedgerToleratingARace,
++  LEDGER_RACE_LOST,
+   runMailMigrations,
+ } from "../src/persistence/postgres/migrations";
+ import { MIGRATION_BOUNDS } from "../src/persistence/postgres/pool";
+@@ -781,9 +782,19 @@ test("POSITIVE CONTROL: bare concurrent CREATE TABLE IF NOT EXISTS really does c
+         codes.length >= 1,
+         `expected at least one concurrent creator to lose; all ${results.length} succeeded`,
+       );
+-      assert.ok(
+-        codes.every((code) => code === "23505"),
+-        `expected 23505 unique-violation losses; got ${JSON.stringify(codes)}`,
++      // THE LOSS IS ONE PRODUCTION FORGIVES (R1.4, candidate-4 gate 3 R-11).
++      // This read `code === "23505"` while `createLedgerToleratingARace`
++      // tolerates `LEDGER_RACE_LOST` — 42P07, 23505 and 42710 — so a
++      // legitimate 42710 loss (the ROW TYPE's name, about 1 run in 360 here)
++      // failed the control, and 42P07/42710 had never been exercised by it.
++      // Asserted against the PRODUCTION constant, not a re-typed list: if a
++      // code the server really raises is ever dropped from the tolerance, this
++      // is the test that says so.
++      const unforgiven = codes.filter((code) => typeof code !== "string" || !LEDGER_RACE_LOST.has(code));
++      assert.deepEqual(
++        unforgiven,
++        [],
++        `a concurrent creator lost with a code the migrator does NOT tolerate; got ${JSON.stringify(codes)}, tolerated ${JSON.stringify([...LEDGER_RACE_LOST])}`,
+       );
+     } finally {
+       await Promise.all(pools.map((p) => p.end()));
