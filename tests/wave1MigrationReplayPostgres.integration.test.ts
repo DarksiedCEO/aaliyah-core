@@ -767,7 +767,19 @@ test("POSITIVE CONTROL: bare concurrent CREATE TABLE IF NOT EXISTS really does c
   // Proves the hazard is real on THIS server, so the refusal below is about
   // the runner's ordering and not about `IF NOT EXISTS` being safe anyway.
   await withFreshDatabase("control", async (url) => {
-    const pools = Array.from({ length: 3 }, () => new Pool({ connectionString: url, max: 1 }));
+    // R1.5 — THE 57P01 THAT KILLED THIS TEST WAS ITS OWN (candidate-4 gate 3
+    // R-14). `pool.end()` can resolve before every socket has closed, and
+    // `withFreshDatabase`'s `DROP DATABASE ... WITH (FORCE)` then terminates
+    // the leftovers. With no listener, that `error` event on an already-ended
+    // pool is an uncaught throw attributed to whatever test is running.
+    // Measured in isolation: 2 in 200 teardowns, matched 1:1 by the server
+    // log's terminations on that database. The concurrency cases below
+    // already carried this listener; this one did not.
+    const pools = Array.from({ length: 3 }, () => {
+      const pool = new Pool({ connectionString: url, max: 1 });
+      pool.on("error", () => undefined);
+      return pool;
+    });
     try {
       const results = await Promise.allSettled(
         pools.map((p) =>

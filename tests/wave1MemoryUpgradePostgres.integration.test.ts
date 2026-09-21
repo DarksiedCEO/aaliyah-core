@@ -146,6 +146,12 @@ before(async () => {
   await serverPool.query(`DROP DATABASE IF EXISTS ${UPGRADE_DB} WITH (FORCE)`);
   await serverPool.query(`CREATE DATABASE ${UPGRADE_DB}`);
   adminPool = new Pool({ connectionString: DB_URL, max: 4 });
+  // R1.5 — the same mechanism as the replay file's positive control (gate 5
+  // I-10 caught it HERE: "Test hook before ... generated asynchronous activity
+  // ... terminating connection due to administrator command"). This pool is
+  // connected to UPGRADE_DB, and `after` drops that database WITH (FORCE) once
+  // `adminPool.end()` has resolved, which can be before its sockets closed.
+  adminPool.on("error", () => undefined);
   await runMailMigrations(adminPool, { through: "049_memory_reconciliation_bindings_not_vacuous" });
   writePool = createMailDbPool({ AALIYAH_DATABASE_URL: DB_URL } as NodeJS.ProcessEnv);
   readPool = createMailDbPool({ AALIYAH_DATABASE_URL: DB_URL } as NodeJS.ProcessEnv);

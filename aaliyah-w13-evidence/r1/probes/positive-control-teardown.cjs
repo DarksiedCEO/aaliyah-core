@@ -16,7 +16,7 @@ process.on("uncaughtException", (e) => { uncaught += 1; codes[e.code] = (codes[e
     await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
     await admin.query(`CREATE DATABASE ${name}`);
     const url = ADMIN.replace(/\/[^/]+$/, `/${name}`);
-    const pools = Array.from({ length: 3 }, () => new Pool({ connectionString: url, max: 1 }));
+    const pools = Array.from({ length: 3 }, () => { const p = new Pool({ connectionString: url, max: 1 }); if (process.argv[3] === "listener") p.on("error", (e) => { global.absorbed = (global.absorbed ?? 0) + 1; }); return p; });
     try {
       await Promise.allSettled(pools.map((p) => p.query(`CREATE TABLE IF NOT EXISTS aaliyah_mail_migrations (id text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`)));
     } finally {
@@ -26,5 +26,5 @@ process.on("uncaughtException", (e) => { uncaught += 1; codes[e.code] = (codes[e
     await new Promise((r) => setTimeout(r, 20));
   }
   await admin.end();
-  console.log(JSON.stringify({ N, uncaughtAfterEnd: uncaught, codes }));
+  console.log(JSON.stringify({ N, uncaughtAfterEnd: uncaught, codes, absorbedByListener: global.absorbed ?? 0 }));
 })();
