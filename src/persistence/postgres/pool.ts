@@ -198,6 +198,10 @@ export async function enterMemoryRole(
  * may answer with the previous caller's result. Destroy instead: the pool
  * opens a fresh one on the next checkout.
  */
+/** node-postgres' exact message (pg/lib/client.js) for a query on a client whose connection has errored. */
+export const PG_NOT_QUERYABLE_AFTER_CONNECTION_ERROR =
+  "Client has encountered a connection error and is not queryable";
+
 export function isConnectionAmbiguous(error: unknown): boolean {
   const code = (error as { code?: unknown } | null)?.code;
   if (typeof code === "string") {
@@ -207,6 +211,15 @@ export function isConnectionAmbiguous(error: unknown): boolean {
     if (code.startsWith("08")) return true;
   }
   const message = String((error as { message?: unknown } | null)?.message ?? "");
+  // pg's rejection of a query sent on a client whose socket has ALREADY
+  // errored — a backend terminated before the next query was written. It
+  // carries no SQLSTATE and no code, so it is matched by its exact text, and
+  // ONLY that text: widening this to "any error without a code" would send
+  // ordinary programmer errors down the destroy path (founder decision
+  // 2026-09-21). Measured in R1: 13 of 800 terminations surfaced this way,
+  // 100 of 100 once the backend was gone before the query; K-05 depended on
+  // which one the timing produced.
+  if (message === PG_NOT_QUERYABLE_AFTER_CONNECTION_ERROR) return true;
   return (
     /Query read timeout/i.test(message) ||
     /Connection terminated/i.test(message) ||

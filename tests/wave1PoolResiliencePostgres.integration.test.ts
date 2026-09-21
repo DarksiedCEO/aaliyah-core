@@ -10,6 +10,7 @@ import {
   createMailDbPool,
   isConnectionAmbiguous,
   MAIL_DB_POOL_BOUNDS,
+  PG_NOT_QUERYABLE_AFTER_CONNECTION_ERROR,
   releaseClient,
 } from "../src/persistence/postgres/pool";
 import { createReadinessProbe } from "../src/http/readiness";
@@ -559,6 +560,63 @@ test("K-05: an AMBIGUOUS connection is DESTROYED, and an ordinary error's connec
     assert.equal((await pool.query("SELECT 1 AS ok")).rows[0].ok, 1);
   } finally {
     await endWithin(pool, "K-05 release-decision pool");
+  }
+});
+
+test("K-05b: pg's un-coded 'not queryable' rejection is AMBIGUOUS — that exact shape only, never code-less errors in general", async () => {
+  // ---- R1, AND A PRODUCTION CHANGE (founder decision 2026-09-21) ------
+  // A query on a terminated client rejects in one of two real shapes: 57P01,
+  // or — when the socket error arrived first — pg's own un-coded
+  // "Client has encountered a connection error and is not queryable".
+  // `isConnectionAmbiguous` knew only the first, so K-05 passed or failed on
+  // timing (13 of 800 in R1's probe). pg-pool still evicted that client
+  // (`!client._queryable`), so production was safe by accident, not by the
+  // guard. Both directions are asserted: the shape is recognised, and a
+  // code-less error that is NOT that shape is not.
+  const seen: Array<boolean | undefined> = [];
+  const spy = { release: (destroy?: boolean) => seen.push(destroy) };
+  const notQueryable = new Error(PG_NOT_QUERYABLE_AFTER_CONNECTION_ERROR);
+  assert.equal(isConnectionAmbiguous(notQueryable), true, "the 'not queryable' shape was not classified ambiguous");
+  releaseClient(spy, notQueryable);
+  assert.deepEqual(seen, [true], "a 'not queryable' client was returned to the pool");
+
+  for (const codeless of [
+    new Error("Cannot read properties of undefined (reading 'rows')"),
+    new TypeError("client.query is not a function"),
+    new Error(`${PG_NOT_QUERYABLE_AFTER_CONNECTION_ERROR} — but wrapped by a caller`),
+    new Error("Client was closed and is not queryable"),
+  ]) {
+    assert.equal(isConnectionAmbiguous(codeless), false, `a code-less error was widened into ambiguity: ${codeless.message}`);
+  }
+
+  // AND THE SHAPE IS PG'S REAL ONE, produced rather than typed: wait for the
+  // backend to be GONE before the next query, which R1 measured to yield this
+  // rejection every time. If pg ever rewords it, this fails here, by name.
+  const pool = createMailDbPool({ AALIYAH_DATABASE_URL: DB_URL } as NodeJS.ProcessEnv, {
+    name: "not-queryable",
+    onError: () => undefined,
+  });
+  try {
+    const client = await pool.connect();
+    let failure: unknown;
+    try {
+      const pid = (await client.query("SELECT pg_backend_pid() AS pid")).rows[0].pid as number;
+      await adminPool.query("SELECT pg_terminate_backend($1, 5000)", [pid]);
+      // Let the FATAL reach the socket before the next query is written.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await client.query("SELECT 1");
+    } catch (error) {
+      failure = error;
+    }
+    releaseClient(client, failure);
+    assert.equal(
+      (failure as Error | undefined)?.message,
+      PG_NOT_QUERYABLE_AFTER_CONNECTION_ERROR,
+      `fixture precondition: expected pg's not-queryable rejection, got ${String(failure)}`,
+    );
+    assert.equal(isConnectionAmbiguous(failure), true);
+  } finally {
+    await endWithin(pool, "K-05b not-queryable pool");
   }
 });
 
