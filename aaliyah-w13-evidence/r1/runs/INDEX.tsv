@@ -22,3 +22,13 @@ i9-killed-90s	killed@90s	fc43cc2	1	WATCHDOG VERDICT: FAIL scope=FULL_SUITE
 i9-after-kill-90s	used	fc43cc2	0	WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0
 i9-killed-150s	killed@150s	fc43cc2	1	WATCHDOG VERDICT: FAIL scope=FULL_SUITE
 i9-after-kill-150s	used	fc43cc2	0	WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0
+ACC-pristine-1	pristine	fa14db0	0	WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0
+ACC-pristine-2	pristine	fa14db0	0	WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0
+ACC-pristine-3	pristine	fa14db0	0	WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0
+ACC-pristine-4	pristine	fa14db0	0	WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0
+ACC-pristine-5	pristine	fa14db0	0	WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0
+ACC-used-1	used	fa14db0	0	WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0
+ACC-used-2	used	fa14db0	0	WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0
+ACC-used-3	used	fa14db0	0	WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0
+ACC-used-4	used	fa14db0	0	WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0
+ACC-used-5	used	fa14db0	0	WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0
