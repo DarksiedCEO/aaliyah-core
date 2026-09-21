@@ -2296,3 +2296,38 @@ side.
 - **C.** Confirm Data & Persistence as the permanent seventh gate. The
   coordinator inferred it because only six gate files existed, and it produced
   the D-09 headline.
+
+### FOUNDER DECISION C — ANSWERED 2026-09-20
+
+**Data & Persistence is CONFIRMED as the permanent seventh gate.** It is no
+longer an inference by the coordinator; it is a named, standing gate of the
+review set, and candidate-5 is reviewed by all seven on that basis.
+
+This closes the anomaly that the gate which produced the D-09 headline — and
+which settles this register's previously-unreproducible CHECK-constraint
+figures at 162 / 17 / 0-of-56 — existed only because the coordinator noticed
+six gate files where seven were expected. The CHECK-constraint drop-test audit
+belongs to this gate structurally and is now owned rather than orphaned.
+
+**A (merge/split identity semantics) and B (database-enforced tenant isolation)
+remain OPEN.** B carries the adjudicator's recommendation — RLS on all 21
+`memory_%` tables as a scheduled W1.4 item, not folded into W1.3 — and is
+deferred deliberately for consideration, not by oversight. Neither blocks R1.
+
+### BRANCH WRITER HANDOFF — R1
+
+**Sole-writer discipline, effective at this commit.** The session that recorded
+the adjudication and issued the work order is **read-only on this branch** from
+here. A fresh builder session opens in `~/aaliyah-w13/aaliyah-wave1-core` with
+`docs/W13_R1_WORK_ORDER.md` as its first input and is the **sole writer** until
+R1 acceptance is met.
+
+The reason is this round's own lesson rather than preference: two writers on one
+branch is how evidence is lost, and this branch's findings have repeatedly been
+about records that could not be trusted to mean what they said. The retiring
+session's reasoning is already in this register and in the commit messages,
+which is where it belongs — it is not carried forward in a context window.
+
+Note this is distinct from, and narrower than, **R4.2**: R4.2 bars the BUILDER
+from running gates 1–3 at all, permanently. This entry only fixes who may write
+to the branch during R1.
