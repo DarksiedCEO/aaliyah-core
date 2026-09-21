@@ -1,5 +1,10 @@
 # W1.3 R1 — OVERNIGHT BUILDER REPORT
 
+> **UPDATE 2026-09-21 ~05:10 — R1 ACCEPTANCE MET at `fa14db0`.** After the founder's
+> answers (03:00) the run resumed. The section "CONTINUATION" at the end supersedes the
+> status, 2×2 and next-task sections below it. Those sections are kept unedited as the
+> record of the first stop.
+
     session     builder, sole writer on wave1/w13-trusted-memory
     started     2026-09-20 21:31 PDT     stopped  2026-09-20 ~22:20 PDT
     base        f6bb3ab (work order blob 0904da9e… verified)
@@ -126,4 +131,84 @@ Andre's answer to Q1 decides it. If the answer is "treat K-02 probe1 and K-05 as
 3. Should I-9 also be tested under gate 5's definition of "used", meaning a database left by a
    killed run?
 
-W1.3 status: RED
+(first stop, 2026-09-20 22:20: W1.3 status: RED)
+
+---
+
+## CONTINUATION — 2026-09-21 03:15 to ~05:10
+
+Resumed on the founder's answers: (1) R1.5 is the main thread, and the K-02 probe1 fix is in
+scope; (2) `pool.ts` may classify pg's exact "not queryable" error; (3) test I-9
+after a killed run. Plus a new rule: a premise that fails to reproduce stops its own item only.
+
+**A correction to the founder's note, applied.** The note described the 57P01 as K-02
+probe1's. They're two separate defects: the 57P01 is the replay POSITIVE CONTROL's own
+FORCE-drop (R1.5), and K-02 probe1 is cross-file contamination. Both fixed, both test-only.
+
+### R1 ITEMS — FINAL
+
+| item | status | commits |
+|---|---|---|
+| R1.1 | DONE, forced-failure proof | `fe78fd0`, `7cbc691` |
+| R1.2 | **I-9 CLOSED, NOT REPRODUCED** (clean-used and killed-used); refusal not built | `fd71d4d`, `fa14db0` |
+| R1.3 | DONE: manifest of 1098, refusals; 9 of 9 mutants killed (M7 needed a new detector) | `f54adc1`, `27b545e`, `d0b4c14`, `565d6d3` |
+| R1.4 | DONE: asserted against the exported production set; 23505-drop mutant killed | `f54adc1`, `d0b4c14` |
+| R1.5 | DONE: listeners where missing; 0 uncaught with 4 terminations absorbed (was 2 of 2 uncaught) | `d65cb05` |
+| R1.6 | DONE: DISCOVERY_VACUOUS; private temp file; guard 8 PASS | `f54adc1` |
+| K-02 probe1 | DONE: scoped by application_name; old fails on contamination, new catches its own held transaction | `7eadfa1`, `3859022` |
+| **pool.ts (production)** | DONE: exact shape only; K-05b kills both the "unrecognised" and the "widened" mutant | `fd7432a`, `e045070` |
+
+### BOTH ACCEPTANCE CELLS — at `fa14db0`, verbatim
+
+Serial, quiet host (load 1.8–3.0), clean tree, executed set equal to the committed manifest
+in every run (1098 executed, 1098 pinned, 0 added, 0 lost, 0 synthetic entries):
+
+| # | pristine | used |
+|---|---|---|
+| 1 | `WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0` | `WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0` |
+| 2 | `WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0` | `WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0` |
+| 3 | `WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0` | `WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0` |
+| 4 | `WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0` | `WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0` |
+| 5 | `WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0` | `WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0` |
+
+The used cell passed. The I-9 hypothesis is falsified, and the harness does not enforce pristine.
+The server log shows 80 terminations across the ten runs, 8 per run, every one deliberate.
+
+### I-9 AFTER A KILLED RUN (gate 5's condition)
+
+    kill@45s  -> WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0
+    kill@90s  -> WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0
+    kill@150s -> WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0
+
+The residue was real: 60 ledger rows and 99 record versions after the 45s kill.
+
+### THE DENOMINATOR
+
+1098 = 1088 (candidate-4) + 9 new watchdog tests + K-05b. It's now pinned, and a
+delta is a named refusal.
+
+### PUSHES
+
+Every commit pushed. None denied.
+
+### NOT COVERED BY R1 (also in the register)
+
+- The concurrent column of the 2×2, never run by rule.
+- `boundToCommit` still ignores `untracked` (R4).
+- `/tmp/frozen.out` and `/tmp/contracts-provenance.out` (R4.3).
+- pool-resilience `adminPool` has no client-side bound.
+- Gates 1–3 at the new SHA (R4.2).
+
+### STATE LEFT FOR THE REVIEW SIDE
+
+Container `aaliyah-w13-r1` (:54610) and worktrees `~/aaliyah-w13-r1run` (clean at `fa14db0`)
+and `~/aaliyah-w13-r1mut` (disposable) are kept as evidence, per the founder. Tear down after
+review.
+
+### NEXT
+
+Candidate-5 is declared by the review side, not here. It's a **production-code descendant**
+(`pool.ts`), so full gates 1–3 run on the review side under R4.2, then the seven gates, then
+adjudication. R2–R4 remain.
+
+R1 acceptance: MET at fa14db0; W1.3 status: RED pending R2–R4

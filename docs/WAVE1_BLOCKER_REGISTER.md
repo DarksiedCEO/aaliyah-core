@@ -2450,3 +2450,83 @@ It contains no manifest yet: generating one needs a clean full run.
    this SHA (`usage()` exits 2 on zero FULL_SUITE files first). The draft makes
    it reachable as a FAIL.
 6. The builder used its own container on :54610, not any reviewer container.
+
+---
+
+## R1 — CONTINUED 2026-09-21 AFTER FOUNDER ANSWERS: R1 ACCEPTANCE MET at `fa14db0`
+
+### FOUNDER ANSWERS AND RULE CHANGE (2026-09-21, ~03:00)
+
+1. R1.5 is the main thread; the K-02 probe1 fix is in R1 scope. R1's scope is
+   "the instrument", not a file list. Test-only.
+2. `isConnectionAmbiguous` may classify pg's "not queryable" rejection as
+   ambiguous — ONLY that exact pg shape, never code-less errors generally.
+   Separate commit, own detector, recorded here as a production change.
+3. Test I-9 against a database left by a KILLED run (gate 5's actual
+   condition). If it reproduces, R1.2 returns as "refuse a database left by
+   abnormal exit"; if not, I-9 closes as not reproduced.
+
+**RULE CHANGE, standing:** a premise that fails to reproduce stops ITS OWN
+item only. Every independent item continues. (The overnight run stopped the
+whole run at 22:15 and left R1.3/R1.4/R1.6 unexecuted for five hours.)
+
+Builder's reading, recorded: the founder's note described the 57P01 as K-02
+probe1's; the report named two DISTINCT defects — the 57P01 is the replay
+POSITIVE CONTROL's own FORCE-drop (R1.5), and K-02 probe1 is cross-file
+contamination. Answer 1 was applied to both; both are test-only.
+
+### WHAT LANDED
+
+| item | commit(s) | executed proof |
+|---|---|---|
+| R1.3 manifest + refusals | `f54adc1`, `27b545e`, manifest `565d6d3` | 9 mutants, 9 killed (`d0b4c14`); M7 survived first, detector added |
+| R1.4 full LEDGER_RACE_LOST | `f54adc1` | mutant dropping 23505 killed by R1.4's control, K-06b, K-06 REOPENED |
+| R1.6 vacuous discovery, private temp file | `f54adc1` | M1/M1b killed; guard 8 PASS on the real repo |
+| R1.5 listeners where missing | `d65cb05` | isolated: no listener 2 uncaught / 2 terminations; listener 0 uncaught / 4 absorbed / 4 terminations |
+| K-02 probe1 scoped to own sessions | `7eadfa1`, proof `3859022` | old probe FAILS on another session (1493ms); scoped PASSES it and still FAILS the store's own held tx (1473ms) |
+| **PRODUCTION: pool.ts** | `fd7432a`, proof `e045070` | K-05b kills "shape unrecognised" and "widened to code-less" |
+| I-9 after a killed run | `fa14db0` | 3/3 PASS after SIGTERM at 45/90/150s — **NOT REPRODUCED, CLOSED** |
+
+### PRODUCTION CHANGE — `src/persistence/postgres/pool.ts` (`fd7432a`)
+
+`isConnectionAmbiguous` returns true for an error whose message is EXACTLY
+`PG_NOT_QUERYABLE_AFTER_CONNECTION_ERROR` = "Client has encountered a
+connection error and is not queryable" (node-postgres, pg/lib/client.js).
+Nothing else changed. `LEDGER_RACE_LOST` in `migrations.ts` is now exported
+(`f54adc1`), no runtime change. `.aegis-frozen.sha256` covers neither file.
+**Candidate-5 is therefore a production-code descendant: full gates 1–3 run
+by the review side (register rule 3, R4.2).**
+
+### I-9 — CLOSED AS NOT REPRODUCED
+
+Two definitions of "used", both measured, neither changes the verdict:
+the database a clean previous run left (`fd71d4d`: the single failure was
+K-02 probe1 in both states, and a used run passed), and the database a
+SIGTERMed run left (3/3 PASS, with real residue: 60 ledger rows, 99
+record versions). R1.2's harness refusal was NOT built. Gate 5's 118
+failures remain unexplained by database state; the two contamination
+mechanisms R1 found are the better-supported candidates, unproven for that
+specific run.
+
+### R1 ACCEPTANCE — MET at `fa14db0` (`9e83dd3`)
+
+Five pristine, then five used, serial, quiet host, clean tree, executed set
+equal to the committed manifest every run:
+
+    pristine 1-5  WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0   (x5)
+    used 1-5      WATCHDOG VERDICT: PASS scope=FULL_SUITE tests=1098 pass=1098 fail=0 cancelled=0 skipped=0 todo=0   (x5)
+
+80 server-side terminations across the ten, all attributed (8 per run, all
+deliberate). The used cell PASSED: the I-9 hypothesis is falsified, as the
+work order anticipated.
+
+### WHAT R1 DID NOT COVER
+
+- The 2×2's CONCURRENT column: never run (run rules forbid concurrent suites).
+- `boundToCommit` still excludes `untracked` (RT4-5's field-level point). The
+  manifest now refuses the attack it enabled, but the field is unchanged — R4.
+- `ci-guards.sh` still writes `/tmp/frozen.out` and
+  `/tmp/contracts-provenance.out` (I-4's other two paths) — R4.3.
+- The pool-resilience `adminPool` still has no client-side bound (gate 3
+  R-13 point 2).
+- Gates 1–3 at the new SHA: not run here, by R4.2.
