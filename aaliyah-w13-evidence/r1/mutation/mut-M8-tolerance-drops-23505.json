@@ -1,0 +1,98 @@
+{
+  "watchdog": "aaliyah-core/scripts/test-watchdog.mjs",
+  "scope": "FOCUSED",
+  "git": {
+    "head": "f54adc1d958cd080b2166deed187fcfbd077bd89",
+    "dirty": true
+  },
+  "node": "v24.9.0",
+  "startedAt": "2026-09-21T10:20:22.803Z",
+  "finishedAt": "2026-09-21T10:20:25.073Z",
+  "durationMs": 2270,
+  "environment": {
+    "nodeOptionsIgnored": null,
+    "tsNodeIgnored": {}
+  },
+  "bounds": {
+    "testTimeoutMs": 240000,
+    "deadlineMs": 900000,
+    "exitGraceMs": 15000,
+    "pgOptions": "-c statement_timeout=60000 -c lock_timeout=60000 -c idle_in_transaction_session_timeout=120000"
+  },
+  "files": 1,
+  "discovery": {
+    "scope": "FOCUSED",
+    "boundToCommit": null,
+    "vacuous": null,
+    "ignored": [],
+    "untracked": [],
+    "missing": []
+  },
+  "manifest": null,
+  "discoveryOnly": false,
+  "verdict": "FAIL",
+  "reasons": [
+    "NONZERO_EXIT: code=1 signal=null",
+    "FAILED_TESTS: 3",
+    "PASSED_NOT_EQUAL_TESTS: 15 of 18",
+    "RUNNER_REPORTED_UNSUCCESSFUL"
+  ],
+  "counts": {
+    "tests": 18,
+    "failed": 3,
+    "passed": 15,
+    "cancelled": 0,
+    "skipped": 0,
+    "todo": 0,
+    "topLevel": 18,
+    "suites": 0
+  },
+  "exit": {
+    "code": 1,
+    "signal": null
+  },
+  "timedOut": [],
+  "failures": [
+    {
+      "name": "K-06b: each SQLSTATE a lost ledger race can raise is tolerated, and only when the ledger really appeared",
+      "file": "tests/wave1MigrationReplayPostgres.integration.test.ts",
+      "failureType": "testCodeFailure",
+      "message": "already exists (23505)",
+      "code": "23505"
+    },
+    {
+      "name": "K-06 REOPENED: the real migrator survives a concurrent OLDER build on a FRESH database",
+      "file": "tests/wave1MigrationReplayPostgres.integration.test.ts",
+      "failureType": "testCodeFailure",
+      "message": "trial 0: the real migrator was crashed by an older build: error: duplicate key value violates unique constraint \"pg_type_typname_nsp_index\"\n+ actual - expected\n\n+ 'rejected'\n- 'fulfilled'\n",
+      "code": "ERR_ASSERTION"
+    },
+    {
+      "name": "POSITIVE CONTROL: bare concurrent CREATE TABLE IF NOT EXISTS really does crash N-1, with a lost-race code the migrator tolerates",
+      "file": "tests/wave1MigrationReplayPostgres.integration.test.ts",
+      "failureType": "testCodeFailure",
+      "message": "a concurrent creator lost with a code the migrator does NOT tolerate; got [\"23505\",\"23505\"], tolerated [\"42P07\",\"42710\"]\n+ actual - expected\n\n+ [\n+   '23505',\n+   '23505'\n+ ]\n- []\n",
+      "code": "ERR_ASSERTION"
+    }
+  ],
+  "filesWithoutResult": [],
+  "filesWithoutTests": [],
+  "filesWithoutSummary": [],
+  "testsNeverFinished": [],
+  "processGroup": {
+    "pgid": 97923,
+    "killedSurvivors": false,
+    "survivedSigkill": false
+  },
+  "database": {
+    "required": true,
+    "before": {
+      "reachable": true,
+      "reason": null
+    },
+    "after": {
+      "reachable": true,
+      "reason": null
+    }
+  }
+}

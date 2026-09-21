@@ -1,0 +1,91 @@
+{
+  "watchdog": "aaliyah-core/scripts/test-watchdog.mjs",
+  "scope": "FOCUSED",
+  "git": {
+    "head": "f54adc1d958cd080b2166deed187fcfbd077bd89",
+    "dirty": true
+  },
+  "node": "v24.9.0",
+  "startedAt": "2026-09-21T10:18:48.692Z",
+  "finishedAt": "2026-09-21T10:19:19.827Z",
+  "durationMs": 31135,
+  "environment": {
+    "nodeOptionsIgnored": null,
+    "tsNodeIgnored": {}
+  },
+  "bounds": {
+    "testTimeoutMs": 240000,
+    "deadlineMs": 900000,
+    "exitGraceMs": 15000,
+    "pgOptions": "-c statement_timeout=60000 -c lock_timeout=60000 -c idle_in_transaction_session_timeout=120000"
+  },
+  "files": 1,
+  "discovery": {
+    "scope": "FOCUSED",
+    "boundToCommit": null,
+    "vacuous": null,
+    "ignored": [],
+    "untracked": [],
+    "missing": []
+  },
+  "manifest": null,
+  "discoveryOnly": false,
+  "verdict": "FAIL",
+  "reasons": [
+    "NONZERO_EXIT: code=1 signal=null",
+    "FAILED_TESTS: 2",
+    "PASSED_NOT_EQUAL_TESTS: 32 of 34",
+    "RUNNER_REPORTED_UNSUCCESSFUL"
+  ],
+  "counts": {
+    "tests": 34,
+    "failed": 2,
+    "passed": 32,
+    "cancelled": 0,
+    "skipped": 0,
+    "todo": 0,
+    "topLevel": 34,
+    "suites": 0
+  },
+  "exit": {
+    "code": 1,
+    "signal": null
+  },
+  "timedOut": [],
+  "failures": [
+    {
+      "name": "POSITIVE CONTROL: on a clean tree the full suite is bound to the commit, so the refusal below is specific",
+      "file": "tests/testWatchdog.test.ts",
+      "failureType": "testCodeFailure",
+      "message": "[\"MANIFEST_MISSING: scripts/test-manifest.tsv does not exist, so nothing pins what the full suite executes\"]\n\n'FAIL' !== 'PASS'\n",
+      "code": "ERR_ASSERTION"
+    },
+    {
+      "name": "R1.3: a test the manifest does NOT pin is FAIL, named — the denominator cannot grow silently",
+      "file": "tests/testWatchdog.test.ts",
+      "failureType": "testCodeFailure",
+      "message": "expected a reason matching /^MANIFEST_DELTA: executed 2, pinned 1; 1 not pinned, 0 pinned and not executed — NOT PINNED: tests\\/two\\.test\\.ts :: 0 :: beta$/; got [\"DENOMINATOR_NOT_PINNED: the runner counted tests=2, the manifest pins 1\"]",
+      "code": "ERR_ASSERTION"
+    }
+  ],
+  "filesWithoutResult": [],
+  "filesWithoutTests": [],
+  "filesWithoutSummary": [],
+  "testsNeverFinished": [],
+  "processGroup": {
+    "pgid": 93275,
+    "killedSurvivors": false,
+    "survivedSigkill": false
+  },
+  "database": {
+    "required": true,
+    "before": {
+      "reachable": true,
+      "reason": null
+    },
+    "after": {
+      "reachable": true,
+      "reason": null
+    }
+  }
+}

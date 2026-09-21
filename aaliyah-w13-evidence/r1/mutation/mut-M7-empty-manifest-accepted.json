@@ -1,0 +1,91 @@
+{
+  "watchdog": "aaliyah-core/scripts/test-watchdog.mjs",
+  "scope": "FOCUSED",
+  "git": {
+    "head": "27b545e4607c62e8e74df9799183540e10f00eb7",
+    "dirty": true
+  },
+  "node": "v24.9.0",
+  "startedAt": "2026-09-21T10:20:39.451Z",
+  "finishedAt": "2026-09-21T10:21:10.707Z",
+  "durationMs": 31256,
+  "environment": {
+    "nodeOptionsIgnored": null,
+    "tsNodeIgnored": {}
+  },
+  "bounds": {
+    "testTimeoutMs": 240000,
+    "deadlineMs": 900000,
+    "exitGraceMs": 15000,
+    "pgOptions": "-c statement_timeout=60000 -c lock_timeout=60000 -c idle_in_transaction_session_timeout=120000"
+  },
+  "files": 1,
+  "discovery": {
+    "scope": "FOCUSED",
+    "boundToCommit": null,
+    "vacuous": null,
+    "ignored": [],
+    "untracked": [],
+    "missing": []
+  },
+  "manifest": null,
+  "discoveryOnly": false,
+  "verdict": "FAIL",
+  "reasons": [
+    "NONZERO_EXIT: code=1 signal=null",
+    "FAILED_TESTS: 2",
+    "PASSED_NOT_EQUAL_TESTS: 33 of 35",
+    "RUNNER_REPORTED_UNSUCCESSFUL"
+  ],
+  "counts": {
+    "tests": 35,
+    "failed": 2,
+    "passed": 33,
+    "cancelled": 0,
+    "skipped": 0,
+    "todo": 0,
+    "topLevel": 35,
+    "suites": 0
+  },
+  "exit": {
+    "code": 1,
+    "signal": null
+  },
+  "timedOut": [],
+  "failures": [
+    {
+      "name": "POSITIVE CONTROL: on a clean tree the full suite is bound to the commit, so the refusal below is specific",
+      "file": "tests/testWatchdog.test.ts",
+      "failureType": "testCodeFailure",
+      "message": "[\"MANIFEST_MISSING: scripts/test-manifest.tsv does not exist, so nothing pins what the full suite executes\"]\n\n'FAIL' !== 'PASS'\n",
+      "code": "ERR_ASSERTION"
+    },
+    {
+      "name": "R1.3: a manifest that pins NOTHING is refused — a denominator of zero is not a pin (mutation M7)",
+      "file": "tests/testWatchdog.test.ts",
+      "failureType": "testCodeFailure",
+      "message": "expected a reason matching /^MANIFEST_EMPTY: scripts\\/test-manifest\\.tsv pins no tests/; got [\"MANIFEST_FILE_DELTA: 1 discovered test file(s) have no pinned tests: tests/two.test.ts\"]",
+      "code": "ERR_ASSERTION"
+    }
+  ],
+  "filesWithoutResult": [],
+  "filesWithoutTests": [],
+  "filesWithoutSummary": [],
+  "testsNeverFinished": [],
+  "processGroup": {
+    "pgid": 98052,
+    "killedSurvivors": false,
+    "survivedSigkill": false
+  },
+  "database": {
+    "required": true,
+    "before": {
+      "reachable": true,
+      "reason": null
+    },
+    "after": {
+      "reachable": true,
+      "reason": null
+    }
+  }
+}
