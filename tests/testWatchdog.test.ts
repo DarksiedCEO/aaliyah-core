@@ -710,3 +710,16 @@ test("R1.6 POSITIVE CONTROL: --verify-discovery on a bound, pinned set is PASS �
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("R1.3: a manifest that pins NOTHING is refused — a denominator of zero is not a pin (mutation M7)", () => {
+  // Found by R1's own sweep: the MANIFEST_EMPTY refusal could be deleted and
+  // nothing failed. An empty manifest would otherwise be caught only later, as
+  // a delta — after the whole suite had been paid for.
+  const dir = miniRepo({ "tests/two.test.ts": TWO_TESTS }, []);
+  try {
+    const run = runMiniRepo(dir, ["--verify-discovery"]);
+    assertFail(run, /^MANIFEST_EMPTY: scripts\/test-manifest\.tsv pins no tests/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
