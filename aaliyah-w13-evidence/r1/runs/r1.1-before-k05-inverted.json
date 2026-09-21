@@ -1,0 +1,86 @@
+{
+  "watchdog": "aaliyah-core/scripts/test-watchdog.mjs",
+  "scope": "FOCUSED",
+  "git": {
+    "head": "98321de7882aa3ce59f5c12cf4c7c111de05e4b9",
+    "dirty": true
+  },
+  "node": "v24.9.0",
+  "startedAt": "2026-09-21T04:38:45.783Z",
+  "finishedAt": "2026-09-21T04:43:46.231Z",
+  "durationMs": 300448,
+  "environment": {
+    "nodeOptionsIgnored": null,
+    "tsNodeIgnored": {}
+  },
+  "bounds": {
+    "testTimeoutMs": 240000,
+    "deadlineMs": 900000,
+    "exitGraceMs": 15000,
+    "pgOptions": "-c statement_timeout=60000 -c lock_timeout=60000 -c idle_in_transaction_session_timeout=120000"
+  },
+  "files": 1,
+  "discovery": {
+    "scope": "FOCUSED",
+    "boundToCommit": null,
+    "ignored": [],
+    "untracked": [],
+    "missing": []
+  },
+  "verdict": "FAIL",
+  "reasons": [
+    "HUNG_WORKER: a timeout occurred and the run produced no further events for 15000ms",
+    "ORPHANED_PROCESSES: processes from this run were still alive and were killed",
+    "NONZERO_EXIT: code=1 signal=null",
+    "NO_SUMMARY: the runner never reported final counts",
+    "TIMED_OUT: tests/wave1PoolResiliencePostgres.integration.test.ts :: K-05: an AMBIGUOUS connection is DESTROYED, and an ordinary error's connection is not",
+    "FILES_WITHOUT_RESULT: tests/wave1PoolResiliencePostgres.integration.test.ts",
+    "FILES_WITHOUT_SUMMARY: tests/wave1PoolResiliencePostgres.integration.test.ts",
+    "TESTS_NEVER_FINISHED: tests/wave1PoolResiliencePostgres.integration.test.ts queued=17 finished=15"
+  ],
+  "counts": null,
+  "exit": {
+    "code": 1,
+    "signal": null
+  },
+  "timedOut": [
+    {
+      "name": "K-05: an AMBIGUOUS connection is DESTROYED, and an ordinary error's connection is not",
+      "file": "tests/wave1PoolResiliencePostgres.integration.test.ts",
+      "failureType": "testTimeoutFailure",
+      "message": "test timed out after 240000ms",
+      "code": "ERR_TEST_FAILURE"
+    }
+  ],
+  "failures": [],
+  "filesWithoutResult": [
+    "tests/wave1PoolResiliencePostgres.integration.test.ts"
+  ],
+  "filesWithoutTests": [],
+  "filesWithoutSummary": [
+    "tests/wave1PoolResiliencePostgres.integration.test.ts"
+  ],
+  "testsNeverFinished": [
+    {
+      "file": "tests/wave1PoolResiliencePostgres.integration.test.ts",
+      "queued": 17,
+      "finished": 15
+    }
+  ],
+  "processGroup": {
+    "pgid": 64304,
+    "killedSurvivors": true,
+    "survivedSigkill": false
+  },
+  "database": {
+    "required": true,
+    "before": {
+      "reachable": true,
+      "reason": null
+    },
+    "after": {
+      "reachable": true,
+      "reason": null
+    }
+  }
+}

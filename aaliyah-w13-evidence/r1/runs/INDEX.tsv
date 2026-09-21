@@ -1,0 +1,4 @@
+r1.1-before-k05-inverted	pristine	98321de	1	WATCHDOG VERDICT: FAIL scope=FOCUSED
+r1.1-after-k05-inverted	pristine	fe78fd0	0	WATCHDOG VERDICT: PASS scope=FOCUSED tests=17 pass=17 fail=0 cancelled=0 skipped=0 todo=0
+r1.1-after-k05-forced	pristine	fe78fd0	1	WATCHDOG VERDICT: FAIL scope=FOCUSED tests=17 pass=16 fail=1 cancelled=0 skipped=0 todo=0
+r1.1-after-f6-d3-mutant	pristine	fe78fd0	1	WATCHDOG VERDICT: FAIL scope=FOCUSED tests=17 pass=15 fail=2 cancelled=0 skipped=0 todo=0

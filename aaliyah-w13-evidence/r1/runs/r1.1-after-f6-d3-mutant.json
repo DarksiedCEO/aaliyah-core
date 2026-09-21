@@ -1,0 +1,88 @@
+{
+  "watchdog": "aaliyah-core/scripts/test-watchdog.mjs",
+  "scope": "FOCUSED",
+  "git": {
+    "head": "fe78fd0632856b4ca5686fea657c51fa44f0a286",
+    "dirty": true
+  },
+  "node": "v24.9.0",
+  "startedAt": "2026-09-21T04:49:34.698Z",
+  "finishedAt": "2026-09-21T04:52:03.727Z",
+  "durationMs": 149029,
+  "environment": {
+    "nodeOptionsIgnored": null,
+    "tsNodeIgnored": {}
+  },
+  "bounds": {
+    "testTimeoutMs": 240000,
+    "deadlineMs": 900000,
+    "exitGraceMs": 15000,
+    "pgOptions": "-c statement_timeout=60000 -c lock_timeout=60000 -c idle_in_transaction_session_timeout=120000"
+  },
+  "files": 1,
+  "discovery": {
+    "scope": "FOCUSED",
+    "boundToCommit": null,
+    "ignored": [],
+    "untracked": [],
+    "missing": []
+  },
+  "verdict": "FAIL",
+  "reasons": [
+    "NONZERO_EXIT: code=1 signal=null",
+    "FAILED_TESTS: 2",
+    "PASSED_NOT_EQUAL_TESTS: 15 of 17",
+    "RUNNER_REPORTED_UNSUCCESSFUL"
+  ],
+  "counts": {
+    "tests": 17,
+    "failed": 2,
+    "passed": 15,
+    "cancelled": 0,
+    "skipped": 0,
+    "todo": 0,
+    "topLevel": 17,
+    "suites": 0
+  },
+  "exit": {
+    "code": 1,
+    "signal": null
+  },
+  "timedOut": [],
+  "failures": [
+    {
+      "name": "K-05: an AMBIGUOUS connection is DESTROYED, and an ordinary error's connection is not",
+      "file": "tests/wave1PoolResiliencePostgres.integration.test.ts",
+      "failureType": "testCodeFailure",
+      "message": "not destroyed: Query read timeout\n+ actual - expected\n\n  [\n+   undefined\n-   true\n  ]\n",
+      "code": "ERR_ASSERTION"
+    },
+    {
+      "name": "a STORE that connects and releases by hand destroys an ambiguous client too, not just pool.query",
+      "file": "tests/wave1PoolResiliencePostgres.integration.test.ts",
+      "failureType": "testCodeFailure",
+      "message": "an ambiguous client was returned to the pool by a hand-written release (idle=1)\n\n1 !== 0\n",
+      "code": "ERR_ASSERTION"
+    }
+  ],
+  "filesWithoutResult": [],
+  "filesWithoutTests": [],
+  "filesWithoutSummary": [],
+  "testsNeverFinished": [],
+  "processGroup": {
+    "pgid": 66279,
+    "killedSurvivors": false,
+    "survivedSigkill": false
+  },
+  "database": {
+    "required": true,
+    "before": {
+      "reachable": true,
+      "reason": null
+    },
+    "after": {
+      "reachable": true,
+      "reason": null
+    }
+  }
+}

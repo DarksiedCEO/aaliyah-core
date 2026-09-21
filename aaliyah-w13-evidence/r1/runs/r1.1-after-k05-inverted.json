@@ -1,0 +1,65 @@
+{
+  "watchdog": "aaliyah-core/scripts/test-watchdog.mjs",
+  "scope": "FOCUSED",
+  "git": {
+    "head": "fe78fd0632856b4ca5686fea657c51fa44f0a286",
+    "dirty": true
+  },
+  "node": "v24.9.0",
+  "startedAt": "2026-09-21T04:44:11.440Z",
+  "finishedAt": "2026-09-21T04:46:40.813Z",
+  "durationMs": 149373,
+  "environment": {
+    "nodeOptionsIgnored": null,
+    "tsNodeIgnored": {}
+  },
+  "bounds": {
+    "testTimeoutMs": 240000,
+    "deadlineMs": 900000,
+    "exitGraceMs": 15000,
+    "pgOptions": "-c statement_timeout=60000 -c lock_timeout=60000 -c idle_in_transaction_session_timeout=120000"
+  },
+  "files": 1,
+  "discovery": {
+    "scope": "FOCUSED",
+    "boundToCommit": null,
+    "ignored": [],
+    "untracked": [],
+    "missing": []
+  },
+  "verdict": "PASS",
+  "reasons": [],
+  "counts": {
+    "tests": 17,
+    "failed": 0,
+    "passed": 17,
+    "cancelled": 0,
+    "skipped": 0,
+    "todo": 0,
+    "topLevel": 17,
+    "suites": 0
+  },
+  "exit": {
+    "code": 0,
+    "signal": null
+  },
+  "timedOut": [],
+  "failures": [],
+  "filesWithoutResult": [],
+  "filesWithoutTests": [],
+  "filesWithoutSummary": [],
+  "testsNeverFinished": [],
+  "processGroup": {
+    "pgid": 65835,
+    "killedSurvivors": false,
+    "survivedSigkill": false
+  },
+  "database": {
+    "required": true,
+    "before": {
+      "reachable": true,
+      "reason": null
+    },
+    "after": null
+  }
+}
