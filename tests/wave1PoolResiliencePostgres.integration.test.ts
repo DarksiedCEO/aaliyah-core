@@ -43,6 +43,40 @@ after(async () => {
   await adminPool.end();
 });
 
+/**
+ * R1.1 — A FAILING ASSERTION MUST REPORT, NOT HANG.
+ *
+ * `pool.end()` waits for every checked-out client, with no bound of its own.
+ * K-05 asserted BEFORE it released, and the proxy tests drained the pool
+ * BEFORE they unwedged the transport, so in each the one state in which the
+ * assertion fails was also the one state in which `finally { pool.end() }`
+ * could never return — reviewers saw HUNG_WORKER at 240s and never the
+ * assertion's own message (candidate-4 gate 1 F6, gate 3 R-13).
+ *
+ * The orderings are fixed at each call site. This is the backstop behind
+ * them: an end that has not settled in `ms` is a NAMED failure that says a
+ * client was never handed back, instead of a silent wait for the file timeout.
+ */
+async function endWithin(pool: Pool, label: string, ms = 15_000): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  const settled = await Promise.race([
+    pool.end().then(
+      () => true,
+      () => true,
+    ),
+    new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), ms);
+    }),
+  ]);
+  clearTimeout(timer);
+  if (!settled) {
+    throw new Error(
+      `${label}: pool.end() did not settle within ${ms}ms — a client was never handed back ` +
+        `(total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount})`,
+    );
+  }
+}
+
 type ProbeOutcome = {
   exitCode: number | null;
   stdout: string;
@@ -512,15 +546,19 @@ test("K-05: an AMBIGUOUS connection is DESTROYED, and an ordinary error's connec
     } catch (error) {
       failure = error;
     }
-    assert.equal(isConnectionAmbiguous(failure), true, String(failure));
+    // RELEASED BEFORE ANYTHING IS ASSERTED (R1.1). The assertion used to come
+    // first, so when it failed the client was never handed back and
+    // `pool.end()` below waited on it forever. `releaseClient` makes the same
+    // decision either way; only the order changed.
     releaseClient(client, failure);
+    assert.equal(isConnectionAmbiguous(failure), true, String(failure));
     // Destroyed, so the pool holds no idle client that might answer with a
     // dead session's result.
     assert.equal(pool.idleCount, 0, `a destroyed client was kept: idle=${pool.idleCount}`);
     // Positive control: the pool still serves.
     assert.equal((await pool.query("SELECT 1 AS ok")).rows[0].ok, 1);
   } finally {
-    await pool.end().catch(() => undefined);
+    await endWithin(pool, "K-05 release-decision pool");
   }
 });
 
@@ -631,8 +669,13 @@ test("a STORE that connects and releases by hand destroys an ambiguous client to
     );
     assert.ok(isConnectionAmbiguous(new Error("Query read timeout")));
   } finally {
-    await pool.end().catch(() => undefined);
+    // UNWEDGE BEFORE DRAINING (R1.1, gate 1 F6). The assertion above fails
+    // exactly when the wedged client was returned to the pool — the one state
+    // in which `pool.end()` must wait for it — and the proxy was closed only
+    // AFTER that wait, so nothing could ever end it. Destroying the proxy's
+    // sockets first lets the pool close whatever it holds.
     await proxy.close();
+    await endWithin(pool, "hand-release store pool");
   }
 });
 
@@ -681,7 +724,8 @@ test("a WEDGED transport is abandoned by the client within its own bound, and th
       `the abandoned client was returned to the pool (idle=${pool.idleCount}, backend rows=${survivors.rows[0].n})`,
     );
   } finally {
-    await pool.end().catch(() => undefined);
+    // Same shape as the hand-release test above, same order: unwedge, then drain.
     await proxy.close();
+    await endWithin(pool, "wedged-transport pool");
   }
 });
