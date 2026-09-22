@@ -193,6 +193,35 @@ const FAMILY_A: ReadonlyArray<[string, string, string]> = [
 ];
 const NON_OBJECTS = ['["not","an","object"]', '"a string"', "42", "true", "null"];
 
+/** The non-object values no CHECK other than `guard` refuses on `table` — the proof's evaluator. */
+async function unmaskedValues(client: Pool | PoolClient, table: string, column: string, guard: string): Promise<string[]> {
+  const others = (
+    await client.query(
+      `SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint
+        WHERE conrelid = $1::regclass AND contype = 'c' AND conname <> $2 ORDER BY conname`,
+      [table, guard],
+    )
+  ).rows as Array<{ conname: string; def: string }>;
+  const unmasked: string[] = [];
+  for (const value of NON_OBJECTS) {
+    let refused = false;
+    for (const { def } of others) {
+      const expression = def.replace(/^CHECK \(/, "(").replace(/\)( NOT VALID)?$/, ")");
+      const verdict = await client.query(
+        `SELECT (${expression}) AS ok
+           FROM (SELECT (jsonb_populate_record(NULL::${table}, jsonb_build_object($1::text, $2::jsonb))).*) AS candidate`,
+        [column, value],
+      );
+      if (verdict.rows[0].ok === false) {
+        refused = true;
+        break;
+      }
+    }
+    if (!refused) unmasked.push(`${table}.${column} = ${value}`);
+  }
+  return unmasked;
+}
+
 test("R3.3 family A: every payload type guard is MASKED — for every non-object JSON value another CHECK is FALSE (executed redundancy proof)", async () => {
   const unmasked: string[] = [];
   for (const [table, column, guard] of FAMILY_A) {
@@ -201,33 +230,33 @@ test("R3.3 family A: every payload type guard is MASKED — for every non-object
       [table, guard],
     );
     assert.equal(guardPresent.rows[0].n, 1, `fixture precondition: ${guard} exists on ${table}`);
-    const others = (
-      await adminPool.query(
-        `SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint
-          WHERE conrelid = $1::regclass AND contype = 'c' AND conname <> $2 ORDER BY conname`,
-        [table, guard],
-      )
-    ).rows as Array<{ conname: string; def: string }>;
-    for (const value of NON_OBJECTS) {
-      let refusedBy: string | null = null;
-      for (const { conname, def } of others) {
-        const expression = def.replace(/^CHECK \(/, "(").replace(/\)( NOT VALID)?$/, ")");
-        const verdict = await adminPool.query(
-          `SELECT (${expression}) AS ok
-             FROM (SELECT (jsonb_populate_record(NULL::${table}, jsonb_build_object($1::text, $2::jsonb))).*) AS candidate`,
-          [column, value],
-        );
-        if (verdict.rows[0].ok === false) {
-          refusedBy = conname;
-          break;
-        }
-      }
-      if (refusedBy === null) unmasked.push(`${table}.${column} = ${value}`);
-    }
+    unmasked.push(...(await unmaskedValues(adminPool, table, column, guard)));
   }
   assert.deepEqual(
     unmasked,
     [],
     `a non-object value that NO other CHECK refuses — the type guard is the SOLE enforcement there and needs a drop-test of its own:\n${unmasked.join("\n")}`,
   );
+});
+
+test("R3.3 family A NEGATIVE CONTROL: the proof's evaluator DOES report an unmasked guard, so its silence above means something", async () => {
+  // A table whose ONLY check is the type guard, plus one check that never
+  // mentions the payload. Every non-object value must come back unmasked.
+  const client = await adminPool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`CREATE TEMP TABLE r33_unmasked (
+      id integer NOT NULL,
+      payload jsonb NOT NULL,
+      CONSTRAINT r33_unmasked_id_positive CHECK (id > 0),
+      CONSTRAINT r33_unmasked_payload_object CHECK (jsonb_typeof(payload) = 'object')
+    ) ON COMMIT DROP`);
+    assert.deepEqual(
+      await unmaskedValues(client, "r33_unmasked", "payload", "r33_unmasked_payload_object"),
+      NON_OBJECTS.map((v) => `r33_unmasked.payload = ${v}`),
+    );
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
 });
