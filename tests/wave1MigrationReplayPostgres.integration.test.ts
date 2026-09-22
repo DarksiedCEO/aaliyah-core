@@ -339,6 +339,25 @@ test("K-06c: migrators SERIALIZE on the advisory lock before the ledger exists",
       );
       assert.equal(finished, false, "the migrator finished while the lock was held");
 
+      // ---- AND IT WAITS *BEFORE* THE LEDGER EXISTS (R2.3, red team RT4-3) --
+      //
+      // The two assertions above are satisfied by a migrator that CREATES the
+      // ledger and only then asks for the lock: an ungranted request appears
+      // either way. The red team swapped the two lines (MUT-B), kept this file
+      // 18/18 green, and measured the race back at N-1 of N migrators — the
+      // lock taken after the creation it exists to cover protects nothing.
+      // The ordering is the entire property, so it is read directly: while the
+      // migrator is blocked on the lock, the ledger it would create must not
+      // exist yet. This is a FRESH database; nothing else could have made it.
+      const ledgerWhileBlocked = await held.query(
+        `SELECT to_regclass('public.aaliyah_mail_migrations') IS NOT NULL AS present`,
+      );
+      assert.equal(
+        ledgerWhileBlocked.rows[0].present,
+        false,
+        "the migrator created the ledger BEFORE taking the advisory lock — the lock no longer covers the creation it exists for",
+      );
+
       await held.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [
         "aaliyah_mail_migrations",
       ]);
