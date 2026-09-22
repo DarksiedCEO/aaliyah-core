@@ -1,6 +1,13 @@
 import * as crypto from "node:crypto";
 import type { Pool } from "pg";
 import {
+  catalogMismatches,
+  describeMismatches,
+  expectedCatalog,
+  readCatalog,
+} from "./migrationCatalog";
+import { MIGRATION_CATALOG_EVIDENCE } from "./migrationEvidence.generated";
+import {
   boundedQuery,
   isConnectionAmbiguous,
   MIGRATION_BOUNDS,
@@ -16,7 +23,7 @@ import {
  * held an id and nothing else, so an edited migration re-ran as a no-op and
  * reported success with the old definition still live.
  */
-function migrationDigest(sql: string): string {
+export function migrationDigest(sql: string): string {
   return `sha256:${crypto.createHash("sha256").update(sql, "utf8").digest("hex")}`;
 }
 
@@ -26,7 +33,7 @@ function migrationDigest(sql: string): string {
  * tenant-owned table carries tenant_id + workspace_id and every read is
  * expected to filter on them — scoping is a query contract, not an option.
  */
-const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
+export const MIGRATIONS: ReadonlyArray<{ readonly id: string; readonly sql: string }> = [
   {
     id: "001_mail_oauth_states",
     sql: `CREATE TABLE IF NOT EXISTS mail_oauth_states (
@@ -6070,7 +6077,40 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
         FOREIGN KEY (settled_by)
         REFERENCES memory_key_destruction_settlements (settlement_receipt_id)`,
   },
+  {
+    /*
+     * A DIGEST NOBODY VERIFIED IS NOT WRITTEN SILENTLY (candidate-4 I-5, D-03).
+     *
+     * Rows written before 057 carry no digest, and the runner used to fill
+     * them from the CURRENT source on the next run — certifying, permanently,
+     * that the database ran SQL nobody compared it with. Gate 5 proved the
+     * laundering is not even recoverable: restoring the correct source then
+     * made the correct source the thing refused.
+     *
+     * Filling such a row is now an OPERATOR ATTESTATION (see runMailMigrations'
+     * `attestUndigestedRows`, and scripts/attest-migration-ledger.ts), and
+     * the ledger records who attested and when, beside the digest. A row a
+     * migration run applied itself needs no attestation: that run is the
+     * evidence. Whole or absent, never half: an actor with no time, a time with
+     * no actor, a blank actor, or an attestation without a digest is refused
+     * by the table itself.
+     */
+    id: "061_ledger_backfill_attestation",
+    sql: `ALTER TABLE aaliyah_mail_migrations
+      ADD COLUMN IF NOT EXISTS digest_attested_by text;
+    ALTER TABLE aaliyah_mail_migrations
+      ADD COLUMN IF NOT EXISTS digest_attested_at timestamptz;
+    ALTER TABLE aaliyah_mail_migrations
+      DROP CONSTRAINT IF EXISTS aaliyah_mail_migrations_attestation_whole;
+    ALTER TABLE aaliyah_mail_migrations
+      ADD CONSTRAINT aaliyah_mail_migrations_attestation_whole
+        CHECK ((digest_attested_by IS NULL) = (digest_attested_at IS NULL)
+               AND (digest_attested_by IS NULL OR length(btrim(digest_attested_by)) > 0)
+               AND (digest_attested_by IS NULL OR sql_digest IS NOT NULL))`,
+  },
 ];
+
+const MIGRATION_ORDER: ReadonlyArray<string> = MIGRATIONS.map((m) => m.id);
 
 /**
  * The numeric prefix of a migration id, as a number.
@@ -6191,12 +6231,27 @@ export async function createLedgerToleratingARace(bounded: BoundedQuery): Promis
   }
 }
 
+export type MigrationRunOptions = {
+  through?: string;
+  /**
+   * An OPERATOR's attestation that the schema holds what the ledger's
+   * undigested rows claim, so they may be given this build's digests. Recorded
+   * in the ledger beside each digest it writes. Never supplied by boot; see
+   * scripts/attest-migration-ledger.ts.
+   */
+  attestUndigestedRows?: { actor: string };
+};
+
 export async function runMailMigrations(
   pool: Pool,
-  options: { through?: string } = {},
+  options: MigrationRunOptions = {},
 ): Promise<void> {
   if (options.through !== undefined && !MIGRATIONS.some((m) => m.id === options.through)) {
     throw new Error(`runMailMigrations: no migration named ${options.through}`);
+  }
+  const attestation = options.attestUndigestedRows;
+  if (attestation !== undefined && (typeof attestation.actor !== "string" || attestation.actor.trim() === "")) {
+    throw new Error("runMailMigrations: an attestation must name the operator making it");
   }
   const client = await pool.connect();
   // BOUNDED, AND WIDER THAN THE POOL'S DEFAULTS ON PURPOSE. A second instance
@@ -6323,6 +6378,109 @@ export async function runMailMigrations(
     const applied = new Set(appliedRows.map((r) => r.id));
     const recordedDigest = new Map(appliedRows.map((r) => [r.id, r.sql_digest]));
 
+    // ---- THIS BUILD'S EVIDENCE DESCRIBES THIS BUILD'S MIGRATIONS -------
+    // The read-back below is only as good as the recorded effect it compares
+    // against. Evidence generated from different SQL — a migration edited
+    // without regenerating it, or a build patched after compilation — would
+    // compare the schema against the wrong expectation, so it is refused
+    // before it is used (candidate-4 I-5's p4 probe edited a compiled build).
+    for (const migration of MIGRATIONS) {
+      const entry = MIGRATION_CATALOG_EVIDENCE[migration.id];
+      if (entry === undefined || entry.sqlDigest !== migrationDigest(migration.sql)) {
+        throw new Error(
+          `this build's recorded catalog effect for ${migration.id} was not generated from ` +
+            `the SQL this build carries (regenerate migrationEvidence.generated.ts). Refusing.`,
+        );
+      }
+    }
+
+    // ---- THE LEDGER IS READ BACK AGAINST THE SCHEMA (candidate-4 D-03) --
+    // Every check below this one compares the ledger with the SOURCE. This one
+    // compares it with the DATABASE: every applied migration's recorded catalog
+    // effect must be present. A row inserted for a migration that never ran
+    // (L4), even one carrying its true digest (L4b), is refused here, before
+    // anything is applied. See migrationCatalog.ts for what is compared.
+    const verifyCatalog = async (appliedIds: ReadonlySet<string>, when: string): Promise<void> => {
+      const actual = await readCatalog(bounded);
+      if (appliedIds.size === 0) {
+        // AN EMPTY LEDGER OVER A POPULATED SCHEMA (candidate-4 I-6, B5). A
+        // restore that lost the ledger used to replay 001 forward and die on
+        // whichever DDL was not idempotent — safe by accident, and not the
+        // refusal this runner claimed to make. It is refused by design now.
+        const stray = MIGRATION_ORDER.filter((id) =>
+          Object.keys(MIGRATION_CATALOG_EVIDENCE[id]?.set ?? {}).some((key) => actual.has(key)),
+        );
+        if (stray.length > 0) {
+          throw new Error(
+            `the migration ledger is EMPTY but the schema already holds objects created by ` +
+              `${stray.length} migration(s) (${stray.slice(0, 3).join(", ")}${stray.length > 3 ? ", ..." : ""}). ` +
+              `This is what a partial restore that lost the ledger looks like; replaying from 001 ` +
+              `over it is not a repair. Refusing.`,
+          );
+        }
+        return;
+      }
+      const { expected, owner } = expectedCatalog(MIGRATION_ORDER, appliedIds, MIGRATION_CATALOG_EVIDENCE);
+      const mismatches = catalogMismatches(expected, owner, actual);
+      if (mismatches.length > 0) {
+        throw new Error(
+          `the ledger lists migrations whose effect the schema does not hold ${when}: ` +
+            `${describeMismatches(mismatches)}. The ledger records intent; the schema is what ` +
+            `was applied. Refusing.`,
+        );
+      }
+    };
+    // ---- A HOLE IN THE LEDGER IS REFUSED FIRST (W1BR-014, see below) ------
+    // Asked before the catalog read-back because it is the more precise
+    // diagnosis: a deleted row for a migration that later ones hardened leaves
+    // the schema holding THEIR definitions, which the read-back would report as
+    // "differs" against the older migration's. The ordering rule names the
+    // actual problem. Same semantics as before: up to and including `through`.
+    const highestApplied = [...applied]
+      .map(migrationOrdinal)
+      .reduce((high, ordinal) => (ordinal > high ? ordinal : high), -1);
+    for (const migration of MIGRATIONS) {
+      if (!applied.has(migration.id) && migrationOrdinal(migration.id) < highestApplied) {
+        throw new Error(
+          `migration ${migration.id} is older than migration ordinal ` +
+            `${highestApplied}, which is already applied. Replaying it would ` +
+            `revert any definition a later migration hardened. Refusing.`,
+        );
+      }
+      if (migration.id === options.through) break;
+    }
+    await verifyCatalog(applied, "before anything was applied");
+
+    // ---- AN UNDIGESTED ROW IS NEVER RE-BLESSED SILENTLY (D-03 L5, I-5) --
+    // A row with no digest either predates 057, or had its digest removed —
+    // and the runner cannot tell which. Deriving one from the CURRENT source
+    // would certify content nobody compared. Unless an operator attests, the
+    // run is refused while such rows exist and this run would give them a
+    // digest; a pre-057 database migrated only up to a point before 057
+    // gains no digest column, so nothing is certified and nothing is refused.
+    const undigested = MIGRATION_ORDER.filter(
+      (id) => applied.has(id) && recordedDigest.get(id) === null,
+    );
+    const digestIndex = MIGRATION_ORDER.indexOf("057_migration_content_digest");
+    const throughIndex =
+      options.through === undefined ? MIGRATION_ORDER.length - 1 : MIGRATION_ORDER.indexOf(options.through);
+    const runEndsWithDigests = hasDigest || throughIndex >= digestIndex;
+    if (undigested.length > 0 && runEndsWithDigests && attestation === undefined) {
+      throw new Error(
+        (hasDigest
+          ? `${undigested.length} applied migration(s) carry NO digest on a ledger that records ` +
+            `digests (${undigested.slice(0, 3).join(", ")}${undigested.length > 3 ? ", ..." : ""}). ` +
+            `A removed digest and a never-written one look the same, and neither is re-derived ` +
+            `from this build's source without an operator's attestation.`
+          : `this ledger predates migration digests: ${undigested.length} applied migration(s) ` +
+            `carry none. Giving them this build's digests certifies content nobody compared, so it ` +
+            `is an operator attestation, not something a migration run does on its own.`) +
+          ` Refusing. An operator who has verified the schema may attest with ` +
+          `scripts/attest-migration-ledger.ts --actor <name>.`,
+      );
+    }
+    const appliedThisRun = new Set<string>();
+
     // ---- AN APPLIED MIGRATION'S CONTENT MUST NOT HAVE CHANGED --------
     //
     // Integration review of 86d33c9, HIGH: the ledger recorded only an id, so
@@ -6355,25 +6513,25 @@ export async function runMailMigrations(
     //
     // The runner already skips applied ids, so this cannot happen on an
     // ordinary upgrade. It happens when a row is deleted and the runner is
-    // re-run, when tooling replays by id, or after a partial restore — and in
-    // every one of those cases the operator believes they are repairing
-    // something. Refusing is the only safe answer: applying an older
-    // definition over a newer one is not a repair.
-    const highestApplied = [...applied]
-      .map(migrationOrdinal)
-      .reduce((high, ordinal) => (ordinal > high ? ordinal : high), -1);
+    // re-run, or when tooling replays by id — and in both cases the operator
+    // believes they are repairing something. Refusing is the only safe answer:
+    // applying an older definition over a newer one is not a repair.
+    //
+    // WHAT THIS CHECK DOES NOT COVER, stated because an earlier version of
+    // this comment claimed it covered "a partial restore" and candidate-4's
+    // integration gate (I-6) falsified that by execution:
+    //   - a missing TAIL of rows (the newest ones) is REPLAYED, deliberately:
+    //     nothing later exists for it to revert, and refusing would make an
+    //     ordinary re-run after an interrupted deploy impossible (pinned by the
+    //     "deleting the HIGHEST applied migration" test);
+    //   - an EMPTIED ledger has no highest ordinal at all, so this check cannot
+    //     see it. That case is refused by the catalog read-back above, which
+    //     finds the schema holding objects no ledger row accounts for.
+    // (The refusal itself is made above, before the catalog read-back.)
     for (const migration of MIGRATIONS) {
       if (applied.has(migration.id)) {
         if (migration.id === options.through) break;
         continue;
-      }
-      const ordinal = migrationOrdinal(migration.id);
-      if (ordinal < highestApplied) {
-        throw new Error(
-          `migration ${migration.id} is older than migration ordinal ` +
-            `${highestApplied}, which is already applied. Replaying it would ` +
-            `revert any definition a later migration hardened. Refusing.`,
-        );
       }
       await bounded(migration.sql);
       await bounded(
@@ -6382,13 +6540,20 @@ export async function runMailMigrations(
           : "INSERT INTO aaliyah_mail_migrations (id) VALUES ($1)",
         hasDigest ? [migration.id, migrationDigest(migration.sql)] : [migration.id],
       );
+      appliedThisRun.add(migration.id);
       if (migration.id === options.through) break;
     }
-    // ---- BACKFILL, ONCE, AND DISCLOSED -------------------------------
-    // Rows written before 057 have no digest. They are filled in from the
-    // current source, which means a content edit made BEFORE 057 existed is
-    // blessed here — there is nothing to compare it against. Only edits after
-    // this point are detectable, and the register says so.
+    // ---- AND READ BACK AGAIN AFTER APPLYING ------------------------------
+    // Every migration this run applied must have left its recorded effect.
+    // `CREATE ... IF NOT EXISTS` over an object that was already there with a
+    // different shape, for instance, succeeds without producing it.
+    await verifyCatalog(new Set([...applied, ...appliedThisRun]), "after this run applied its migrations");
+    // ---- DIGESTS FOR WHAT THIS RUN APPLIED, AND FOR WHAT AN OPERATOR ATTESTS
+    // A row THIS run applied is digested from the SQL this run executed: the
+    // run is the evidence. A row it did not apply is digested ONLY under an
+    // operator's attestation, which is recorded beside it (061), and only after
+    // the catalog read-back above found its recorded effect in the schema.
+    // (This used to fill every NULL from the current source, silently: I-5.)
     //
     // The column's presence is re-read HERE rather than reused from the top of
     // the run. On a fresh database, 001..056 are applied before 057 exists, so
@@ -6405,11 +6570,36 @@ export async function runMailMigrations(
       ).rows[0].n as number) === 1;
     if (digestColumnNow) {
       for (const migration of MIGRATIONS) {
+        if (!appliedThisRun.has(migration.id)) continue;
         await bounded(
           `UPDATE aaliyah_mail_migrations SET sql_digest = $2
             WHERE id = $1 AND sql_digest IS NULL`,
           [migration.id, migrationDigest(migration.sql)],
         );
+      }
+      if (attestation !== undefined && undigested.length > 0) {
+        const attestable =
+          ((
+            await bounded(
+              `SELECT count(*)::int AS n FROM information_schema.columns
+                WHERE table_name = 'aaliyah_mail_migrations' AND column_name = 'digest_attested_by'`,
+            )
+          ).rows[0].n as number) === 1;
+        if (!attestable) {
+          throw new Error(
+            "an attestation can only be recorded once 061_ledger_backfill_attestation is applied; " +
+              "run it without `through`, or through 061 or later. Refusing.",
+          );
+        }
+        const source = new Map(MIGRATIONS.map((m) => [m.id, m.sql]));
+        for (const id of undigested) {
+          await bounded(
+            `UPDATE aaliyah_mail_migrations
+                SET sql_digest = $2, digest_attested_by = $3, digest_attested_at = now()
+              WHERE id = $1 AND sql_digest IS NULL`,
+            [id, migrationDigest(source.get(id)!), attestation.actor.trim()],
+          );
+        }
       }
     }
     await bounded("COMMIT");

@@ -6,6 +6,8 @@ import type { PoolClient } from "pg";
 import {
   createLedgerToleratingARace,
   LEDGER_RACE_LOST,
+  migrationDigest,
+  MIGRATIONS,
   runMailMigrations,
 } from "../src/persistence/postgres/migrations";
 import { MIGRATION_BOUNDS } from "../src/persistence/postgres/pool";
@@ -36,6 +38,16 @@ const REPLAY_URL = ADMIN_URL.replace(/\/[^/]+$/, `/${REPLAY_DB}`);
 
 let adminPool: Pool;
 let replayPool: Pool;
+
+/** Re-insert a ledger row a test deleted, with the digest it had. */
+async function restoreLedgerRow(id: string): Promise<void> {
+  const migration = MIGRATIONS.find((m) => m.id === id);
+  assert.ok(migration, `no migration ${id}`);
+  await replayPool.query(
+    `INSERT INTO aaliyah_mail_migrations (id, sql_digest) VALUES ($1, $2)`,
+    [id, migrationDigest(migration.sql)],
+  );
+}
 
 before(async () => {
   adminPool = new Pool({ connectionString: ADMIN_URL, max: 2 });
@@ -110,11 +122,10 @@ test("W1BR-014: replaying an OLDER migration is REFUSED, so later hardening cann
   );
   assert.match(String(definition.rows[0].def), /SET search_path/);
 
-  // Put the row back so the rest of the file runs against a consistent ledger.
-  await replayPool.query(
-    `INSERT INTO aaliyah_mail_migrations (id)
-     VALUES ('027_memory_exact_numeric_domain')`,
-  );
+  // Put the row back EXACTLY as it was, digest included, so the rest of the
+  // file runs against a consistent ledger. (Restoring the id alone left a NULL
+  // digest, which R2.1 now refuses as the D-03 L5 shape — correctly.)
+  await restoreLedgerRow("027_memory_exact_numeric_domain");
 });
 
 test("the migrator leaves NO session state on the connection it returns — success AND refusal", async () => {
@@ -442,10 +453,7 @@ test("W1BR-014: the refusal is about ORDER, not about that one migration", async
     /038_memory_one_authorization_one_mutation is older than migration ordinal/,
   );
 
-  await replayPool.query(
-    `INSERT INTO aaliyah_mail_migrations (id)
-     VALUES ('038_memory_one_authorization_one_mutation')`,
-  );
+  await restoreLedgerRow("038_memory_one_authorization_one_mutation");
 });
 
 test("W1BR-014: deleting the HIGHEST applied migration is allowed to re-apply", async () => {
@@ -489,77 +497,94 @@ test("a migration id without a three-digit ordinal fails loudly rather than sort
 test("047 REFUSES to run over an existing plaintext alias binding, and the plaintext row survives the refusal", async () => {
   // P6 survivor P3-13: disabling this refusal left the suite green, because no
   // test ever built a database that still held a plaintext binding when 047
-  // arrived. Built here: a migrated database is walked back to its pre-047
-  // shape — the plaintext column restored, one binding in it, and 047..049
-  // unrecorded — and the runner is asked to go forward again.
-  await runMailMigrations(replayPool);
-  const client = await replayPool.connect();
-  try {
-    await client.query(`ALTER TABLE memory_alias_bindings ADD COLUMN normalized_alias text`);
-    await client.query(
-      `INSERT INTO memory_alias_tenant_policy (tenant_id, cross_workspace_policy, set_by_actor_id, policy_version)
-       VALUES ('tenant-replay','workspace_isolated','actor.replay','alias-policy/v1')`,
-    );
-    await client.query("BEGIN");
-    await client.query(`ALTER TABLE memory_alias_bindings DISABLE TRIGGER USER`);
-    await client.query(
-      `INSERT INTO memory_alias_bindings
-         (tenant_id, workspace_id, principal_id, user_id, cross_workspace_policy, scope_key,
-          alias_id, skeleton_algorithm, normalization_profile, canonical_participant_id,
-          script_code, restriction_level, subject_participant_id, source_evidence_ref,
-          source_evidence_digest, observed_at, fresh_until, authorization_id,
-          mutation_receipt_id, bound_at, payload, pii_envelope, pii_key_ref, pii_key_version,
-          normalized_alias)
-       VALUES ('tenant-replay','workspace-replay','p','u','workspace_isolated','workspace-replay',
-               'alias-replay','sk','np','participant-replay','Latn','ascii_only','participant-replay',
-               'identity:x/y',$1, now(), now() + interval '1 hour','auth-replay','mutation.replay',
-               now(), $2::jsonb, '{"keyRef":"k","keyVersion":1}'::jsonb,'k',1,
-               'plaintext.person@example.com')`,
-      [
-        `sha256:${"a".repeat(64)}`,
-        JSON.stringify({
-          scope: { tenantId: "tenant-replay", workspaceId: "workspace-replay", principalId: "p", userId: "u" },
-          aliasId: "alias-replay",
-          canonicalParticipantId: "participant-replay",
-          subjectParticipantId: "participant-replay",
-          crossWorkspacePolicy: "workspace_isolated",
-          scopeKey: "workspace-replay",
-          authorizationId: "auth-replay",
-          mutationReceiptId: "mutation.replay",
-        }),
-      ],
-    );
-    await client.query("COMMIT");
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => undefined);
-    throw error;
-  } finally {
-    client.release();
-  }
-  await replayPool.query(
-    `DELETE FROM aaliyah_mail_migrations WHERE id IN (
-       SELECT id FROM aaliyah_mail_migrations WHERE substring(id from 1 for 3)::int >= 47)`,
-  );
+  // arrived.
+  //
+  // R2: built as a GENUINE pre-047 database — migrated through 046 and never
+  // further. It used to be a fully migrated database walked back by hand (the
+  // plaintext column re-added, 047..049 unrecorded), and the catalog read-back
+  // R2 added refused it, correctly: 047 had also dropped `skeleton` and
+  // `registrable_domain`, which the walk-back never restored, so it was not a
+  // pre-047 schema at all. A fixture the runner can tell is fake was testing a
+  // state no real database is in.
+  await withFreshDatabase("pre047", async (url) => {
+    const pool = new Pool({ connectionString: url, max: 2 });
+    pool.on("error", () => undefined);
+    try {
+      await runMailMigrations(pool, { through: "046_memory_identity_edge_bindings_not_vacuous" });
+      const client = await pool.connect();
+      try {
+        await client.query(
+          `INSERT INTO memory_alias_tenant_policy (tenant_id, cross_workspace_policy, set_by_actor_id, policy_version)
+           VALUES ('tenant-replay','workspace_isolated','actor.replay','alias-policy/v1')`,
+        );
+        await client.query("BEGIN");
+        await client.query(`ALTER TABLE memory_alias_bindings DISABLE TRIGGER USER`);
+        await client.query(
+          `INSERT INTO memory_alias_bindings
+             (tenant_id, workspace_id, principal_id, user_id, cross_workspace_policy, scope_key,
+              alias_id, normalized_alias, skeleton, skeleton_algorithm, normalization_profile,
+              canonical_participant_id, registrable_domain, script_code, restriction_level,
+              subject_participant_id, source_evidence_ref, source_evidence_digest, observed_at,
+              fresh_until, authorization_id, mutation_receipt_id, bound_at, payload)
+           VALUES ('tenant-replay','workspace-replay','p','u','workspace_isolated','workspace-replay',
+                   'alias-replay','plaintext.person@example.com','sk','sk','np',
+                   'participant-replay','example.com','Latn','ascii_only',
+                   'participant-replay','identity:x/y',$1, now(),
+                   now() + interval '1 hour','auth-replay','mutation.replay', now(), $2::jsonb)`,
+          [
+            `sha256:${"a".repeat(64)}`,
+            JSON.stringify({
+              scope: { tenantId: "tenant-replay", workspaceId: "workspace-replay", principalId: "p", userId: "u" },
+              aliasId: "alias-replay",
+              // A pre-047 payload carries the plaintext too; 031's binding
+              // CHECKs hold the columns equal to it.
+              normalizedAlias: "plaintext.person@example.com",
+              skeleton: "sk",
+              canonicalParticipantId: "participant-replay",
+              subjectParticipantId: "participant-replay",
+              crossWorkspacePolicy: "workspace_isolated",
+              scopeKey: "workspace-replay",
+              authorizationId: "auth-replay",
+              mutationReceiptId: "mutation.replay",
+            }),
+          ],
+        );
+        await client.query(`ALTER TABLE memory_alias_bindings ENABLE TRIGGER USER`);
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
 
-  await assert.rejects(
-    () => runMailMigrations(replayPool),
-    /1 plaintext alias binding\(s\) exist; migration 047 will not drop personal identifiers it cannot first re-encrypt/,
-  );
-  const survived = await replayPool.query(
-    `SELECT normalized_alias FROM memory_alias_bindings WHERE alias_id = 'alias-replay'`,
-  );
-  assert.equal(survived.rows[0]?.normalized_alias, "plaintext.person@example.com");
+      // A pre-057 ledger: the forward run needs an operator's attestation
+      // (R2.2), which is not what this test is about — supplied, so the
+      // refusal below can only be 047's own.
+      const attest = { attestUndigestedRows: { actor: "operator:047-replay" } };
+      await assert.rejects(
+        () => runMailMigrations(pool, attest),
+        /1 plaintext alias binding\(s\) exist; migration 047 will not drop personal identifiers it cannot first re-encrypt/,
+      );
+      const survived = await pool.query(
+        `SELECT normalized_alias FROM memory_alias_bindings WHERE alias_id = 'alias-replay'`,
+      );
+      assert.equal(survived.rows[0]?.normalized_alias, "plaintext.person@example.com");
 
-  // Positive control: with the plaintext gone, the same forward run succeeds.
-  await replayPool.query(`ALTER TABLE memory_alias_bindings DISABLE TRIGGER USER`);
-  await replayPool.query(`DELETE FROM memory_alias_bindings`);
-  await replayPool.query(`ALTER TABLE memory_alias_bindings ENABLE TRIGGER USER`);
-  await runMailMigrations(replayPool);
-  const column = await replayPool.query(
-    `SELECT count(*)::int AS n FROM information_schema.columns
-      WHERE table_name = 'memory_alias_bindings' AND column_name = 'normalized_alias'`,
-  );
-  assert.equal(column.rows[0].n, 0);
+      // Positive control: with the plaintext gone, the same forward run succeeds.
+      await pool.query(`ALTER TABLE memory_alias_bindings DISABLE TRIGGER USER`);
+      await pool.query(`DELETE FROM memory_alias_bindings`);
+      await pool.query(`ALTER TABLE memory_alias_bindings ENABLE TRIGGER USER`);
+      await runMailMigrations(pool, attest);
+      const column = await pool.query(
+        `SELECT count(*)::int AS n FROM information_schema.columns
+          WHERE table_name = 'memory_alias_bindings' AND column_name = 'normalized_alias'`,
+      );
+      assert.equal(column.rows[0].n, 0);
+    } finally {
+      await pool.end().catch(() => undefined);
+    }
+  });
 });
 
 /**

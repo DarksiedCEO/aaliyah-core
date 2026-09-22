@@ -66,8 +66,15 @@ const COL057 = `SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE ta
   { // I-5 pre-057 upgrade: through 056, then the full build — is the backfill silent?
     const p = await fresh("r2p_pre057"); await runMailMigrations(p, { through: all.find((i) => i.startsWith("056"))! });
     const r = await outcome(runMailMigrations(p));
-    const d = (await p.query(`SELECT count(*)::int AS n, count(sql_digest)::int AS d FROM aaliyah_mail_migrations`)).rows[0];
-    out.push({ case: "I-5-pre057-upgrade", result: r, rows: d.n, digested: d.d, note: "ACCEPTED+fully digested = silent unattested backfill" }); await p.end();
+    const col = await present(p, COL057);
+    const d = col ? (await p.query(`SELECT count(*)::int AS n, count(sql_digest)::int AS d FROM aaliyah_mail_migrations`)).rows[0] : { n: (await ids(p)).length, d: 0 };
+    out.push({ case: "I-5-pre057-upgrade", result: r, rows: d.n, digested: d.d, digestColumn: col, note: "ACCEPTED+fully digested = silent unattested backfill" });
+    // ...and the same database WITH an operator's attestation (R2.2): applies, and says who.
+    const withAttestation = await outcome((runMailMigrations as any)(p, { attestUndigestedRows: { actor: "probe-operator" } }));
+    const attested = withAttestation === "ACCEPTED"
+      ? (await p.query(`SELECT count(*)::int AS n, count(sql_digest)::int AS d, count(digest_attested_by)::int AS a,
+                               min(digest_attested_by) AS who FROM aaliyah_mail_migrations`)).rows[0] : null;
+    out.push({ case: "I-5-pre057-upgrade-ATTESTED", result: withAttestation, ledger: attested }); await p.end();
   }
   { // I-6 B5: emptied ledger over a populated schema
     const p = await fresh("r2p_b5"); await runMailMigrations(p);
