@@ -69,6 +69,19 @@ export const MIGRATION_BOUNDS = {
   statementTimeoutMs: 300_000,
   /** Above `statementTimeoutMs`, for the same reason as the pool's. */
   queryTimeoutMs: 330_000,
+  /**
+   * HOW LONG A SECOND INSTANCE WAITS, IN TOTAL, FOR ANOTHER MIGRATOR TO FINISH.
+   *
+   * Candidate-4 reliability R-04, executed: the wait for the migrators' ledger
+   * lock was ONE attempt of `lockTimeoutMs` (120s), while the migration being
+   * waited on may run a 300s statement, sixty times over. A rolling deploy over
+   * a slow migration crashed every second instance at boot after two minutes.
+   * The ledger lock is now retried in `lockTimeoutMs` attempts up to this total:
+   * a waiter outlasts TWELVE maximal statements (asserted, in tests, against
+   * `statementTimeoutMs` rather than as a number). Past it the waiter still
+   * fails closed — a migration run longer than an hour is not a rolling deploy.
+   */
+  ledgerLockTotalWaitMs: 3_600_000,
 } as const;
 
 /**

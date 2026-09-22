@@ -1,0 +1,1 @@
+{"lockTimeoutMs":120000,"statementTimeoutMs":300000,"heldForMs":125000,"result":"REJECTED 55P03 canceling statement due to lock timeout","elapsedMs":120021}

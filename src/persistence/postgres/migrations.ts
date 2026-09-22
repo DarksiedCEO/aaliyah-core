@@ -6231,6 +6231,51 @@ export async function createLedgerToleratingARace(bounded: BoundedQuery): Promis
   }
 }
 
+/**
+ * TAKE THE MIGRATORS' LOCK, WAITING AS LONG AS ANOTHER MIGRATOR LEGITIMATELY RUNS.
+ *
+ * Candidate-4 reliability R-04, executed: this was one `pg_advisory_lock`
+ * under `lock_timeout = lockTimeoutMs` (120s), and the run it waits for may
+ * take far longer — so a second instance booting during a slow rolling deploy
+ * died at boot with 55P03, and kept dying until the first one finished. Each
+ * attempt is still bounded by `lockTimeoutMs` (an attempt is a real, visible,
+ * ungranted lock request, which K-06c reads); a lock timeout on THIS lock is
+ * retried until `ledgerLockTotalWaitMs` has passed, and every retry says so.
+ * Any other error is not a wait and is thrown at once.
+ */
+async function takeLedgerLockPatiently(bounded: BoundedQuery): Promise<void> {
+  // AND THE STATEMENT BOUND MUST NOT END THE WAIT FIRST. The runner's
+  // connection comes from the application pool, whose sessions carry a 30s
+  // `statement_timeout` (MAIL_DB_POOL_BOUNDS) — measured in R2: the waiter
+  // died with 57014 at 30,018ms, before its own 120s `lock_timeout` was ever
+  // reached. For the wait, the session's statement bound is raised above one
+  // attempt so `lock_timeout` is what ends it; `finally` in runMailMigrations
+  // RESETs it with `lock_timeout`, so it never rides back into the pool.
+  await bounded(`SET statement_timeout = '${MIGRATION_BOUNDS.lockTimeoutMs + 10_000}ms'`);
+  const started = Date.now();
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await bounded("SELECT pg_advisory_lock(hashtextextended($1, 0))", [LEDGER_LOCK_KEY]);
+      return;
+    } catch (error) {
+      const waited = Date.now() - started;
+      const code = (error as { code?: unknown } | null)?.code;
+      if (code !== "55P03" || waited + MIGRATION_BOUNDS.lockTimeoutMs > MIGRATION_BOUNDS.ledgerLockTotalWaitMs) {
+        throw error;
+      }
+      process.stderr.write(
+        `${JSON.stringify({
+          level: "warn",
+          event: "migration_waiting_for_another_migrator",
+          attempt,
+          waitedMs: waited,
+          totalWaitMs: MIGRATION_BOUNDS.ledgerLockTotalWaitMs,
+        })}\n`,
+      );
+    }
+  }
+}
+
 export type MigrationRunOptions = {
   through?: string;
   /**
@@ -6330,7 +6375,7 @@ export async function runMailMigrations(
     // It still does NOT bind an OLDER build that does not take it — that was
     // the 86d33c9 review's correct finding, and the tolerance is what covers
     // that case.
-    await bounded("SELECT pg_advisory_lock(hashtextextended($1, 0))", [LEDGER_LOCK_KEY]);
+    await takeLedgerLockPatiently(bounded);
     await createLedgerToleratingARace(bounded);
 
     // ---- ONE CLEANUP PATH, NOT TWO -----------------------------------
@@ -6640,6 +6685,7 @@ export async function runMailMigrations(
         LEDGER_LOCK_KEY,
       ]).catch(() => undefined);
       await bounded("RESET lock_timeout").catch(() => undefined);
+      await bounded("RESET statement_timeout").catch(() => undefined);
     }
     releaseClient(client, ambiguous);
   }

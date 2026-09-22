@@ -129,10 +129,10 @@ test("W1BR-014: replaying an OLDER migration is REFUSED, so later hardening cann
 });
 
 test("the migrator leaves NO session state on the connection it returns — success AND refusal", async () => {
-  // ---- WHAT THE ADVISORY LOCK'S REMOVAL LEFT BEHIND ------------------
-  // The runner used to take a session advisory lock and raise `lock_timeout`
-  // to MIGRATION bounds. The lock is gone (removed as unfalsifiable once the
-  // ledger creation tolerated a lost race), but the raised `lock_timeout` is
+  // ---- WHAT THE MIGRATOR'S SESSION STATE MUST NOT LEAVE BEHIND ------
+  // The runner takes a session advisory lock (restored in c2e5747; an earlier
+  // version of this comment said it was gone — candidate-4 I-7) and raises
+  // `lock_timeout` and, since R2.4, `statement_timeout` for its wait. Both are
   // real session state that outlives the transaction, and the `finally` block
   // that resets it is gated on the CONNECTION's health rather than on "did
   // anything throw" — because the first version of that gate returned a
@@ -148,8 +148,15 @@ test("the migrator leaves NO session state on the connection it returns — succ
     pool.on("error", () => undefined);
     try {
       const pid = async () => {
-        const r = await pool.query(`SELECT pg_backend_pid()::int AS pid, current_setting('lock_timeout') AS lt`);
-        return { pid: r.rows[0].pid as number, lockTimeout: String(r.rows[0].lt) };
+        const r = await pool.query(
+          `SELECT pg_backend_pid()::int AS pid, current_setting('lock_timeout') AS lt,
+                  current_setting('statement_timeout') AS st`,
+        );
+        return {
+          pid: r.rows[0].pid as number,
+          lockTimeout: String(r.rows[0].lt),
+          statementTimeout: String(r.rows[0].st),
+        };
       };
       // The BASELINE, not a literal: the watchdog sets its own `lock_timeout`
       // through PGOPTIONS, so a fresh connection here reads `1min`, not `0`.
@@ -175,6 +182,11 @@ test("the migrator leaves NO session state on the connection it returns — succ
         before.lockTimeout,
         "the migrator left its raised lock_timeout on the connection it returned",
       );
+      assert.equal(
+        afterSuccess.statementTimeout,
+        before.statementTimeout,
+        "the migrator left its raised statement_timeout on the connection it returned (R2.4)",
+      );
 
       // ---- AND THE REFUSAL PATH, WHICH IS THE ONE THAT BROKE ----
       await pool.query(
@@ -190,6 +202,11 @@ test("the migrator leaves NO session state on the connection it returns — succ
         afterRefusal.lockTimeout,
         before.lockTimeout,
         "an ordinary refusal returned a healthy connection carrying migrator session state",
+      );
+      assert.equal(
+        afterRefusal.statementTimeout,
+        before.statementTimeout,
+        "an ordinary refusal returned a connection carrying the migrator's raised statement_timeout (R2.4)",
       );
       // No advisory lock either, from either path.
       const held = await pool.query(
