@@ -1,0 +1,42 @@
+[
+ {
+  "name": "R2.4-M1-no-retry",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "      if (code !== \"55P03\" || waited + MIGRATION_BOUNDS.lockTimeoutMs > MIGRATION_BOUNDS.ledgerLockTotalWaitMs) {",
+  "new": "      if (true) {",
+  "tests": [
+   "tests/wave1MigrationLockPatiencePostgres.integration.test.ts"
+  ],
+  "expect_killer": "WAITS, says so"
+ },
+ {
+  "name": "R2.4-M2-statement-bound-not-raised",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "  await bounded(`SET statement_timeout = '${MIGRATION_BOUNDS.lockTimeoutMs + 10_000}ms'`);\n",
+  "new": "",
+  "tests": [
+   "tests/wave1MigrationLockPatiencePostgres.integration.test.ts"
+  ],
+  "expect_killer": "WAITS, says so"
+ },
+ {
+  "name": "R2.4-M3-statement-bound-not-reset",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "      await bounded(\"RESET statement_timeout\").catch(() => undefined);\n",
+  "new": "",
+  "tests": [
+   "tests/wave1MigrationReplayPostgres.integration.test.ts"
+  ],
+  "expect_killer": "NO session state"
+ },
+ {
+  "name": "R2.4-M4-total-wait-too-short",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "  ledgerLockTotalWaitMs: 3_600_000,",
+  "new": "  ledgerLockTotalWaitMs: 600_000,",
+  "tests": [
+   "tests/wave1MigrationLockPatiencePostgres.integration.test.ts"
+  ],
+  "expect_killer": "bounds are related"
+ }
+]
