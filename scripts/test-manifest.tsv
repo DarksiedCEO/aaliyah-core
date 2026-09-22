@@ -611,6 +611,10 @@ tests/wave1LifecyclePostgres.integration.test.ts	0	event-id lookup cannot cross 
 tests/wave1LifecyclePostgres.integration.test.ts	0	insert failure rolls back and leaves the store connection reusable
 tests/wave1LifecyclePostgres.integration.test.ts	0	two PostgreSQL stores atomically admit only one competing branch
 tests/wave1LifecycleStore.test.ts	0	both PostgreSQL lookup paths reject relational/payload binding corruption
+tests/wave1MemoryCheckDropTestsPostgres.integration.test.ts	0	R3.3 family A: every payload type guard is MASKED — for every non-object JSON value another CHECK is FALSE (executed redundancy proof)
+tests/wave1MemoryCheckDropTestsPostgres.integration.test.ts	0	R3.3 family B: PII key AUDITS — an audited state outside the vocabulary is refused by its own constraint
+tests/wave1MemoryCheckDropTestsPostgres.integration.test.ts	0	R3.3 family B: key-destruction OBLIGATIONS — state, reason and resolution are each refused by their own constraint
+tests/wave1MemoryCheckDropTestsPostgres.integration.test.ts	0	R3.3 family B: key-destruction SETTLEMENTS — decision, states, digest and policy are each refused by their own constraint
 tests/wave1MemoryConstraintDestroyersPostgres.integration.test.ts	0	a non-object payload is refused on every table — though NEVER by the constraint written for it
 tests/wave1MemoryConstraintDestroyersPostgres.integration.test.ts	0	memory_alias_bindings: memory_alias_bindings_alias_id_binding — a payload naming a different alias id than its column
 tests/wave1MemoryConstraintDestroyersPostgres.integration.test.ts	0	memory_alias_bindings: memory_alias_bindings_authorization_binding — a payload naming a different authorization than its column
@@ -766,6 +770,7 @@ tests/wave1MemoryHoldErasurePostgres.integration.test.ts	0	R-2 K-02 (probe2): co
 tests/wave1MemoryHoldErasurePostgres.integration.test.ts	0	R-3 K-04 (probe3): the settled-key audit is BOUNDED per pass, and round-robins so every key is still reached
 tests/wave1MemoryHoldErasurePostgres.integration.test.ts	0	R-4 K-04 (probe4): one hung provider call is bounded by the store's own deadline, not by the provider
 tests/wave1MemoryHoldErasurePostgres.integration.test.ts	0	R-5 K-11: two racing completion passes report the destructions that ACTUALLY landed, never more
+tests/wave1MemoryHoldErasurePostgres.integration.test.ts	0	R3.1 / R-15: the PRODUCTION provider deadline bounds a hung provider — the default, not an injected one
 tests/wave1MemoryHoldErasurePostgres.integration.test.ts	0	RT5-R1 K-03: with the provider BACK, the second erasure after a retention_expiry + restore is verified ONLY because the key is really destroyed
 tests/wave1MemoryHoldErasurePostgres.integration.test.ts	0	RT5-R1 K-03: with the provider BACK, the second erasure after a subject_erasure_request + restore is verified ONLY because the key is really destroyed
 tests/wave1MemoryHoldErasurePostgres.integration.test.ts	0	RT5-R1b K-03: with the provider STILL DOWN, the second erasure after a retention_expiry + restore is NOT erased, and counts the first attempt's key
@@ -896,6 +901,7 @@ tests/wave1MemoryPrivilegesPostgres.integration.test.ts	0	POSITIVE CONTROL: B4 �
 tests/wave1MemoryPrivilegesPostgres.integration.test.ts	0	POSITIVE CONTROL: W2/W3 — an object HIDDEN IN ANOTHER SCHEMA is reported, then removed
 tests/wave1MemoryPrivilegesPostgres.integration.test.ts	0	POSITIVE CONTROL: a widened grant IS reported as a difference, then removed
 tests/wave1MemoryPrivilegesPostgres.integration.test.ts	0	POSITIVE CONTROL: each widening the first map could not see IS reported, then removed
+tests/wave1MemoryPrivilegesPostgres.integration.test.ts	0	R3.4 / G-07: the databases section reads BOTH branches of its NULL-datacl fallback — reached by construction, not by luck
 tests/wave1MemoryPrivilegesPostgres.integration.test.ts	0	the declared map itself keeps the boundaries the register relies on
 tests/wave1MemoryPrivilegesPostgres.integration.test.ts	0	the privilege map of every memory role equals the declared map, section by section
 tests/wave1MemoryReachabilityPostgres.integration.test.ts	0	S-6 an alias REDIRECTED to a survivor that cannot be retrieved is refused as unresolvable, never answered as 'no memory'
@@ -982,6 +988,8 @@ tests/wave1PoolResiliencePostgres.integration.test.ts	0	K-10: a FAILING reconcil
 tests/wave1PoolResiliencePostgres.integration.test.ts	0	NO pooled client in src/ is released without the ambiguity guard — structural, so the class cannot come back
 tests/wave1PoolResiliencePostgres.integration.test.ts	0	POSITIVE CONTROL: a CHECKED-OUT client terminated mid-transaction kills an unguarded pool's process at ROLLBACK
 tests/wave1PoolResiliencePostgres.integration.test.ts	0	POSITIVE CONTROL: a pool with no error listener DIES when its idle backend is terminated
+tests/wave1PoolResiliencePostgres.integration.test.ts	0	R3.1: a caller waiting on an EXHAUSTED mail pool is refused within the connection bound — measured, not configured
+tests/wave1PoolResiliencePostgres.integration.test.ts	0	R3.1: every mail-pool and migration bound is at or under its independent ceiling, read back where the server holds it
 tests/wave1PoolResiliencePostgres.integration.test.ts	0	a STORE that connects and releases by hand destroys an ambiguous client too, not just pool.query
 tests/wave1PoolResiliencePostgres.integration.test.ts	0	a WEDGED transport is abandoned by the client within its own bound, and the connection is not reused
 tests/wave1PoolResiliencePostgres.integration.test.ts	0	a lock held elsewhere is not waited on forever by a mail-pool connection

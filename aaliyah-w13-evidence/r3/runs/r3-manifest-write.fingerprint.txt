@@ -1,0 +1,82 @@
+label       r3-manifest-write
+mode        pristine
+root        /Users/andrelove/aaliyah-w13-r1run/aaliyah-wave1-core
+files       --write-manifest
+--- before (pre-reset)
+time        2026-09-22T02:46:18Z
+load        { 2.09 2.85 3.86 }
+head        705a3993cfe5d02aa4c2b82d689fe84bfc76d39b
+porcelain   1 lines
+lsfiles-v   0 flagged
+databases   aaliyah_test,postgres,template0,template1
+backends    0
+watchdogs   0
+worktrees:
+  /Users/andrelove/IdeaProjects/aaliyah-core                       3a65b02 [codex/phase5-inbound-hardening]
+  /private/tmp/w13gate/aaliyah-wave1-core                          e71b51e (detached HEAD) prunable
+  /Users/andrelove/aaliyah-w12-verify/aaliyah-wave1-core           7382a7c (detached HEAD)
+  /Users/andrelove/aaliyah-w13-gauntlet/mutfuzz/aaliyah-wave1-core e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-r1mut/aaliyah-wave1-core            97960e4 (detached HEAD)
+  /Users/andrelove/aaliyah-w13-r1run/aaliyah-wave1-core            705a399 (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-data/aaliyah-wave1-core         e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-int/aaliyah-wave1-core          e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-red/aaliyah-wave1-core          e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-rel/aaliyah-wave1-core          e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-sec/aaliyah-wave1-core          e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-test/aaliyah-wave1-core         e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13/aaliyah-wave1-core                  705a399 [wave1/w13-trusted-memory]
+  /Users/andrelove/aaliyah-w13/review-core-34ac77f                 34ac77f (detached HEAD)
+  /Users/andrelove/aaliyah-w13/review-core-e4904c0                 e4904c0 (detached HEAD)
+  /Users/andrelove/IdeaProjects/aaliyah-wave1-core                 7382a7c [codex/wave1-core]
+--- after pristine reset
+time        2026-09-22T02:46:19Z
+load        { 2.57 2.94 3.89 }
+head        705a3993cfe5d02aa4c2b82d689fe84bfc76d39b
+porcelain   1 lines
+lsfiles-v   0 flagged
+databases   aaliyah_test,postgres,template0,template1
+backends    0
+watchdogs   0
+worktrees:
+  /Users/andrelove/IdeaProjects/aaliyah-core                       3a65b02 [codex/phase5-inbound-hardening]
+  /private/tmp/w13gate/aaliyah-wave1-core                          e71b51e (detached HEAD) prunable
+  /Users/andrelove/aaliyah-w12-verify/aaliyah-wave1-core           7382a7c (detached HEAD)
+  /Users/andrelove/aaliyah-w13-gauntlet/mutfuzz/aaliyah-wave1-core e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-r1mut/aaliyah-wave1-core            97960e4 (detached HEAD)
+  /Users/andrelove/aaliyah-w13-r1run/aaliyah-wave1-core            705a399 (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-data/aaliyah-wave1-core         e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-int/aaliyah-wave1-core          e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-red/aaliyah-wave1-core          e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-rel/aaliyah-wave1-core          e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-sec/aaliyah-wave1-core          e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-test/aaliyah-wave1-core         e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13/aaliyah-wave1-core                  705a399 [wave1/w13-trusted-memory]
+  /Users/andrelove/aaliyah-w13/review-core-34ac77f                 34ac77f (detached HEAD)
+  /Users/andrelove/aaliyah-w13/review-core-e4904c0                 e4904c0 (detached HEAD)
+  /Users/andrelove/IdeaProjects/aaliyah-wave1-core                 7382a7c [codex/wave1-core]
+--- after run (exit 1)
+time        2026-09-22T02:50:02Z
+load        { 1.89 3.57 4.08 }
+head        705a3993cfe5d02aa4c2b82d689fe84bfc76d39b
+porcelain   1 lines
+lsfiles-v   0 flagged
+databases   aaliyah_test,postgres,template0,template1
+backends    0
+watchdogs   0
+worktrees:
+  /Users/andrelove/IdeaProjects/aaliyah-core                       3a65b02 [codex/phase5-inbound-hardening]
+  /private/tmp/w13gate/aaliyah-wave1-core                          e71b51e (detached HEAD) prunable
+  /Users/andrelove/aaliyah-w12-verify/aaliyah-wave1-core           7382a7c (detached HEAD)
+  /Users/andrelove/aaliyah-w13-gauntlet/mutfuzz/aaliyah-wave1-core e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-r1mut/aaliyah-wave1-core            97960e4 (detached HEAD)
+  /Users/andrelove/aaliyah-w13-r1run/aaliyah-wave1-core            705a399 (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-data/aaliyah-wave1-core         e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-int/aaliyah-wave1-core          e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-red/aaliyah-wave1-core          e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-rel/aaliyah-wave1-core          e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-sec/aaliyah-wave1-core          e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13-rv5-test/aaliyah-wave1-core         e71b51e (detached HEAD)
+  /Users/andrelove/aaliyah-w13/aaliyah-wave1-core                  705a399 [wave1/w13-trusted-memory]
+  /Users/andrelove/aaliyah-w13/review-core-34ac77f                 34ac77f (detached HEAD)
+  /Users/andrelove/aaliyah-w13/review-core-e4904c0                 e4904c0 (detached HEAD)
+  /Users/andrelove/IdeaProjects/aaliyah-wave1-core                 7382a7c [codex/wave1-core]

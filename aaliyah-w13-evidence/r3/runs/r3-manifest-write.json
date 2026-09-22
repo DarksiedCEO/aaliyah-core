@@ -1,0 +1,81 @@
+{
+  "watchdog": "aaliyah-core/scripts/test-watchdog.mjs",
+  "scope": "FULL_SUITE",
+  "git": {
+    "head": "705a3993cfe5d02aa4c2b82d689fe84bfc76d39b",
+    "dirty": true
+  },
+  "node": "v24.9.0",
+  "startedAt": "2026-09-22T02:46:19.451Z",
+  "finishedAt": "2026-09-22T02:49:54.711Z",
+  "durationMs": 215260,
+  "environment": {
+    "nodeOptionsIgnored": null,
+    "tsNodeIgnored": {}
+  },
+  "bounds": {
+    "testTimeoutMs": 240000,
+    "deadlineMs": 900000,
+    "exitGraceMs": 15000,
+    "pgOptions": "-c statement_timeout=60000 -c lock_timeout=60000 -c idle_in_transaction_session_timeout=120000"
+  },
+  "files": 87,
+  "discovery": {
+    "scope": "FULL_SUITE",
+    "boundToCommit": true,
+    "vacuous": false,
+    "ignored": [],
+    "untracked": [],
+    "missing": []
+  },
+  "manifest": {
+    "path": "scripts/test-manifest.tsv",
+    "mode": "write",
+    "expected": 1123,
+    "executed": 1123,
+    "syntheticFileEntries": [],
+    "added": [],
+    "lost": []
+  },
+  "discoveryOnly": false,
+  "verdict": "FAIL",
+  "reasons": [
+    "MANIFEST_WRITTEN: 1123 tests recorded to scripts/test-manifest.tsv; a run that defines its own denominator is not a verdict"
+  ],
+  "counts": {
+    "tests": 1123,
+    "failed": 0,
+    "passed": 1123,
+    "cancelled": 0,
+    "skipped": 0,
+    "todo": 0,
+    "topLevel": 1123,
+    "suites": 0
+  },
+  "exit": {
+    "code": 0,
+    "signal": null
+  },
+  "timedOut": [],
+  "failures": [],
+  "filesWithoutResult": [],
+  "filesWithoutTests": [],
+  "filesWithoutSummary": [],
+  "testsNeverFinished": [],
+  "processGroup": {
+    "pgid": 17346,
+    "killedSurvivors": false,
+    "survivedSigkill": false
+  },
+  "database": {
+    "required": true,
+    "before": {
+      "reachable": true,
+      "reason": null
+    },
+    "after": {
+      "reachable": true,
+      "reason": null
+    }
+  }
+}
