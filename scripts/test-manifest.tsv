@@ -936,11 +936,28 @@ tests/wave1MemoryReconciliationPostgres.integration.test.ts	0	the store still ru
 tests/wave1MemoryReconciliationPostgres.integration.test.ts	0	the trusted-memory store and the reconciler agree on a normal mutation: nothing to reconcile
 tests/wave1MemoryReconciliationPostgres.integration.test.ts	0	two concurrent workers on one mutation produce exactly one verdict
 tests/wave1MemoryUpgradePostgres.integration.test.ts	0	U-0 at 049: a binding commits and an alias mutation is left UNKNOWN, by the current stores
-tests/wave1MemoryUpgradePostgres.integration.test.ts	0	U-1 050–060 apply over the populated database, and refuse nothing that is already there
+tests/wave1MemoryUpgradePostgres.integration.test.ts	0	U-1 050–061 apply over the populated database, and refuse nothing that is already there
 tests/wave1MemoryUpgradePostgres.integration.test.ts	0	U-2 a binding made BEFORE 050 is retired honestly AFTER it: 050's witness and version rules accept the real path
 tests/wave1MemoryUpgradePostgres.integration.test.ts	0	U-3 an alias mutation left UNKNOWN before 052 reconciles to COMMITTED_CONFIRMED after it
 tests/wave1MemoryUpgradePostgres.integration.test.ts	0	U-4 a participant whose address was bound before the upgrade is subject-erased after it: address, key and index gone
 tests/wave1MemoryUpgradePostgres.integration.test.ts	0	U-5 a migration name that does not exist is refused before anything is applied
+tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts	0	R2.1 / D-03 L4: ledger rows for migrations that never ran are REFUSED before anything is applied
+tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts	0	R2.1 / D-03 L4b: phantom rows carrying their TRUE digests are refused too — the digest proves the source, not the schema
+tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts	0	R2.1 / D-03 L5: an applied row's digest NULLed is REFUSED, and stays NULL — never re-derived from the source
+tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts	0	R2.2 / I-5: a pre-057 ledger is NOT backfilled silently; with an operator's attestation it is, and the ledger says who
+tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts	0	R2.2: a build whose recorded catalog effect was not generated from its own SQL is refused (the p4 shape)
+tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts	0	R2.2: a column a later migration DROPPED, put back, is refused — dropped means absent, not unchecked
+tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts	0	R2.2: a column whose TYPE drifted is refused — present is not the same as what the migration made (mutation R2-M12)
+tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts	0	R2.2: a guard function WEAKENED after it was applied is refused — the G-08 incident, read back from the schema
+tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts	0	R2.2: a ledger row whose migration's objects were REMOVED from the schema is refused, naming that migration
+tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts	0	R2.2: a migration whose SQL silently produced nothing is refused AFTER applying — read back, not assumed
+tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts	0	R2.2: a pre-057 database migrated only to a point BEFORE 057 needs no attestation — nothing is certified
+tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts	0	R2.2: the attestation columns are whole or absent — enforced by the table, not only by the runner
+tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts	0	R2.2: the committed catalog evidence is exactly what the SQL does — regenerated here and compared byte for byte
+tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts	0	R2.2: the operator's attestation tool — refuses without a named actor, and attests with one
+tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts	0	R2.5 / I-6 B5: an EMPTIED ledger over a populated schema is refused as a partial restore, by design
+tests/wave1MigrationLockPatiencePostgres.integration.test.ts	0	R2.4: a second migrator held past the single-attempt bound WAITS, says so, and then succeeds
+tests/wave1MigrationLockPatiencePostgres.integration.test.ts	0	R2.4: the migrators' total patience outlasts the work it waits for — the bounds are related, not independent
 tests/wave1MigrationReplayPostgres.integration.test.ts	0	047 REFUSES to run over an existing plaintext alias binding, and the plaintext row survives the refusal
 tests/wave1MigrationReplayPostgres.integration.test.ts	0	2 concurrent migrators on a FRESH database ALL fulfil, and the ledger is applied exactly once
 tests/wave1MigrationReplayPostgres.integration.test.ts	0	3 concurrent migrators on a FRESH database ALL fulfil, and the ledger is applied exactly once
