@@ -1,0 +1,90 @@
+[
+ {
+  "name": "R3.1-10x-MAIL.connectionTimeoutMillis",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "  connectionTimeoutMillis: 10_000,",
+  "new": "  connectionTimeoutMillis: 100_000,",
+  "tests": [],
+  "expect_killer": ""
+ },
+ {
+  "name": "R3.1-10x-MAIL.statementTimeoutMs",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "  statementTimeoutMs: 30_000,",
+  "new": "  statementTimeoutMs: 300_000,",
+  "tests": [],
+  "expect_killer": ""
+ },
+ {
+  "name": "R3.1-10x-MAIL.lockTimeoutMs",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "  lockTimeoutMs: 10_000,",
+  "new": "  lockTimeoutMs: 100_000,",
+  "tests": [],
+  "expect_killer": ""
+ },
+ {
+  "name": "R3.1-10x-MAIL.idleInTransactionSessionTimeoutMs",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "  idleInTransactionSessionTimeoutMs: 60_000,",
+  "new": "  idleInTransactionSessionTimeoutMs: 600_000,",
+  "tests": [],
+  "expect_killer": ""
+ },
+ {
+  "name": "R3.1-10x-MAIL.queryTimeoutMs",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "  queryTimeoutMs: 35_000,",
+  "new": "  queryTimeoutMs: 350_000,",
+  "tests": [],
+  "expect_killer": ""
+ },
+ {
+  "name": "R3.1-10x-MAIL.keepAliveInitialDelayMillis",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "  keepAliveInitialDelayMillis: 10_000,",
+  "new": "  keepAliveInitialDelayMillis: 100_000,",
+  "tests": [],
+  "expect_killer": ""
+ },
+ {
+  "name": "R3.1-10x-MIGRATION.lockTimeoutMs",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "  lockTimeoutMs: 120_000,",
+  "new": "  lockTimeoutMs: 1_200_000,",
+  "tests": [],
+  "expect_killer": ""
+ },
+ {
+  "name": "R3.1-10x-MIGRATION.statementTimeoutMs",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "  statementTimeoutMs: 300_000,",
+  "new": "  statementTimeoutMs: 3_000_000,",
+  "tests": [],
+  "expect_killer": ""
+ },
+ {
+  "name": "R3.1-10x-MIGRATION.queryTimeoutMs",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "  queryTimeoutMs: 330_000,",
+  "new": "  queryTimeoutMs: 3_300_000,",
+  "tests": [],
+  "expect_killer": ""
+ },
+ {
+  "name": "R3.1-10x-MIGRATION.ledgerLockTotalWaitMs",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "  ledgerLockTotalWaitMs: 3_600_000,",
+  "new": "  ledgerLockTotalWaitMs: 36_000_000,",
+  "tests": [],
+  "expect_killer": ""
+ },
+ {
+  "name": "R3.1-10x-PROVIDER_DEADLINE_MS",
+  "path": "src/persistence/postgres/wave1TrustedMemoryStore.ts",
+  "old": "export const PROVIDER_DEADLINE_MS = 5_000;",
+  "new": "export const PROVIDER_DEADLINE_MS = 50_000;",
+  "tests": [],
+  "expect_killer": ""
+ }
+]
