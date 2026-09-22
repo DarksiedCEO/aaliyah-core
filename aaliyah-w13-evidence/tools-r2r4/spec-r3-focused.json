@@ -260,8 +260,8 @@
  {
   "name": "R3.6-secdef-body-swapped",
   "path": "src/persistence/postgres/migrations.ts",
-  "old": "      SET search_path = pg_catalog, public, pg_temp\n      AS $fn$\n        WITH RECURSIVE absorbed(record_id) AS (",
-  "new": "      SET search_path = pg_catalog, public, pg_temp\n      AS $fn$\n        -- R3.6 mutant: a reimplemented body\n        WITH RECURSIVE absorbed(record_id) AS (",
+  "old": "    sql: `CREATE OR REPLACE FUNCTION public.aaliyah_memory_unerased_merged_records(\n      p_tenant text, p_workspace text, p_record text)\n      RETURNS SETOF text\n      LANGUAGE sql\n      STABLE\n      SECURITY DEFINER\n      SET search_path = pg_catalog, public, pg_temp\n      AS $fn$\n",
+  "new": "    sql: `CREATE OR REPLACE FUNCTION public.aaliyah_memory_unerased_merged_records(\n      p_tenant text, p_workspace text, p_record text)\n      RETURNS SETOF text\n      LANGUAGE sql\n      STABLE\n      SECURITY DEFINER\n      SET search_path = pg_catalog, public, pg_temp\n      AS $fn$\n        -- R3.6 mutant: a reimplemented body\n",
   "regen_evidence": true,
   "tests": [
    "tests/wave1MemoryPrivilegesPostgres.integration.test.ts"
