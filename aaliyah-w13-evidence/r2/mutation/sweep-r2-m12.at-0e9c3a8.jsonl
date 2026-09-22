@@ -1,0 +1,1 @@
+{"name": "R2-M12-column-types-not-compared", "status": "KILLED", "verdict": "FAIL", "counts": {"tests": 14, "failed": 1, "passed": 13, "cancelled": 0, "skipped": 0, "todo": 0, "topLevel": 14, "suites": 0}, "failed": ["R2.2: a column whose TYPE drifted is refused \u2014 present is not the same as what the migration made (mutation R2"]}

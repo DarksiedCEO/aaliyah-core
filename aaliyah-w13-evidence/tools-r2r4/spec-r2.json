@@ -130,6 +130,6 @@
   "tests": [
    "tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts"
   ],
-  "expect_killer": "silently produced nothing"
+  "expect_killer": "TYPE drifted"
  }
 ]
