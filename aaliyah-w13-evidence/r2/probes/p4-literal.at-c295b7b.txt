@@ -1,0 +1,20 @@
+--- build: 055 edited outside a function body, evidence stale
+{"mode":"setup","db":"p4_outside_stale_n","rows":56}
+{"mode":"setup","db":"p4_outside_stale_a","rows":56}
+{"mode":"upgrade","db":"p4_outside_stale_n","attested":null,"result":"REFUSED: this build's recorded catalog effect for 055_memory_key_destruction_settlement was not generated from the SQL this build carries (regenerate migrationEvidence.generated.t","digest055":"(no column)"}
+{"mode":"upgrade","db":"p4_outside_stale_a","attested":"operator:p4","result":"REFUSED: this build's recorded catalog effect for 055_memory_key_destruction_settlement was not generated from the SQL this build carries (regenerate migrationEvidence.generated.t","digest055":"(no column)"}
+--- build: 055 edited outside a function body, evidence regen
+{"mode":"setup","db":"p4_outside_regen_n","rows":56}
+{"mode":"setup","db":"p4_outside_regen_a","rows":56}
+{"mode":"upgrade","db":"p4_outside_regen_n","attested":null,"result":"REFUSED: this ledger predates migration digests: 56 applied migration(s) carry none. Giving them this build's digests certifies content nobody compared, so it is an operator attes","digest055":"(no column)"}
+{"mode":"upgrade","db":"p4_outside_regen_a","attested":"operator:p4","result":"ACCEPTED","digest055":"sha256:b6af17d28d44e13b6b586db00588e1de04e52290b1579c78cc4daba1b27e6542"}
+--- build: 055 edited inside a function body, evidence stale
+{"mode":"setup","db":"p4_inside_stale_n","rows":56}
+{"mode":"setup","db":"p4_inside_stale_a","rows":56}
+{"mode":"upgrade","db":"p4_inside_stale_n","attested":null,"result":"REFUSED: this build's recorded catalog effect for 055_memory_key_destruction_settlement was not generated from the SQL this build carries (regenerate migrationEvidence.generated.t","digest055":"(no column)"}
+{"mode":"upgrade","db":"p4_inside_stale_a","attested":"operator:p4","result":"REFUSED: this build's recorded catalog effect for 055_memory_key_destruction_settlement was not generated from the SQL this build carries (regenerate migrationEvidence.generated.t","digest055":"(no column)"}
+--- build: 055 edited inside a function body, evidence regen
+{"mode":"setup","db":"p4_inside_regen_n","rows":56}
+{"mode":"setup","db":"p4_inside_regen_a","rows":56}
+{"mode":"upgrade","db":"p4_inside_regen_n","attested":null,"result":"REFUSED: the ledger lists migrations whose effect the schema does not hold before anything was applied: 055_memory_key_destruction_settlement [fn:aaliyah_memory_settlement_binds_r","digest055":"(no column)"}
+{"mode":"upgrade","db":"p4_inside_regen_a","attested":"operator:p4","result":"REFUSED: the ledger lists migrations whose effect the schema does not hold before anything was applied: 055_memory_key_destruction_settlement [fn:aaliyah_memory_settlement_binds_r","digest055":"(no column)"}

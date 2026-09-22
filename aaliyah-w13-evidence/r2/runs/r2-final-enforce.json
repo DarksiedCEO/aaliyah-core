@@ -1,0 +1,76 @@
+{
+  "watchdog": "aaliyah-core/scripts/test-watchdog.mjs",
+  "scope": "FULL_SUITE",
+  "git": {
+    "head": "c295b7bf3800b8e6dca427c46bb2ab88be448286",
+    "dirty": false
+  },
+  "node": "v24.9.0",
+  "startedAt": "2026-09-22T01:55:33.534Z",
+  "finishedAt": "2026-09-22T01:58:56.104Z",
+  "durationMs": 202570,
+  "environment": {
+    "nodeOptionsIgnored": null,
+    "tsNodeIgnored": {}
+  },
+  "bounds": {
+    "testTimeoutMs": 240000,
+    "deadlineMs": 900000,
+    "exitGraceMs": 15000,
+    "pgOptions": "-c statement_timeout=60000 -c lock_timeout=60000 -c idle_in_transaction_session_timeout=120000"
+  },
+  "files": 86,
+  "discovery": {
+    "scope": "FULL_SUITE",
+    "boundToCommit": true,
+    "vacuous": false,
+    "ignored": [],
+    "untracked": [],
+    "missing": []
+  },
+  "manifest": {
+    "path": "scripts/test-manifest.tsv",
+    "mode": "enforce",
+    "expected": 1115,
+    "executed": 1115,
+    "syntheticFileEntries": [],
+    "added": [],
+    "lost": []
+  },
+  "discoveryOnly": false,
+  "verdict": "PASS",
+  "reasons": [],
+  "counts": {
+    "tests": 1115,
+    "failed": 0,
+    "passed": 1115,
+    "cancelled": 0,
+    "skipped": 0,
+    "todo": 0,
+    "topLevel": 1115,
+    "suites": 0
+  },
+  "exit": {
+    "code": 0,
+    "signal": null
+  },
+  "timedOut": [],
+  "failures": [],
+  "filesWithoutResult": [],
+  "filesWithoutTests": [],
+  "filesWithoutSummary": [],
+  "testsNeverFinished": [],
+  "processGroup": {
+    "pgid": 83241,
+    "killedSurvivors": false,
+    "survivedSigkill": false
+  },
+  "database": {
+    "required": true,
+    "before": {
+      "reachable": true,
+      "reason": null
+    },
+    "after": null
+  }
+}
