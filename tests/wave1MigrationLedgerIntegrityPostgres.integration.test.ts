@@ -147,6 +147,34 @@ test("R2.2: a migration whose SQL silently produced nothing is refused AFTER app
   });
 });
 
+test("R2.2: a guard function WEAKENED after it was applied is refused — the G-08 incident, read back from the schema", async () => {
+  // The incident behind 057: 055's trigger function was edited AFTER it was
+  // applied, and nothing noticed. A digest only notices when the SOURCE
+  // changes; this is the schema changing under an unchanged source.
+  await withLedgerDatabase("weakened", async (pool) => {
+    await runMailMigrations(pool);
+    await pool.query(`CREATE OR REPLACE FUNCTION public.aaliyah_memory_settled_obligation_frozen()
+      RETURNS trigger LANGUAGE plpgsql AS $fn$ BEGIN RETURN NEW; END; $fn$`);
+    await assert.rejects(
+      () => runMailMigrations(pool),
+      /058_settled_obligation_resolution_immutable \[fn:aaliyah_memory_settled_obligation_frozen\(\) differs\]/,
+    );
+  });
+});
+
+test("R2.2: a column a later migration DROPPED, put back, is refused — dropped means absent, not unchecked", async () => {
+  // 047 removed the plaintext alias column after re-encrypting it. A schema
+  // holding it again holds something every applied migration says is gone.
+  await withLedgerDatabase("undropped", async (pool) => {
+    await runMailMigrations(pool);
+    await pool.query(`ALTER TABLE memory_alias_bindings ADD COLUMN normalized_alias text`);
+    await assert.rejects(
+      () => runMailMigrations(pool),
+      /047_memory_alias_pii_vault \[col:memory_alias_bindings\.normalized_alias present \(dropped by then\)\]/,
+    );
+  });
+});
+
 test("R2.1 / D-03 L5: an applied row's digest NULLed is REFUSED, and stays NULL — never re-derived from the source", async () => {
   await withLedgerDatabase("l5", async (pool) => {
     await runMailMigrations(pool);
