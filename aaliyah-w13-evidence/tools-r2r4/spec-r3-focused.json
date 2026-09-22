@@ -1,0 +1,271 @@
+[
+ {
+  "name": "R3.1-ambig-57P01",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "    if (code === \"57P01\" || code === \"25P03\" || code === \"ECONNRESET\" || code === \"EPIPE\") {",
+  "new": "    if (code === \"XXXXX\" || code === \"25P03\" || code === \"ECONNRESET\" || code === \"EPIPE\") {",
+  "tests": [
+   "tests/wave1PoolResiliencePostgres.integration.test.ts"
+  ],
+  "expect_killer": "K-05"
+ },
+ {
+  "name": "R3.1-ambig-25P03",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "    if (code === \"57P01\" || code === \"25P03\" || code === \"ECONNRESET\" || code === \"EPIPE\") {",
+  "new": "    if (code === \"57P01\" || code === \"XXXXX\" || code === \"ECONNRESET\" || code === \"EPIPE\") {",
+  "tests": [
+   "tests/wave1PoolResiliencePostgres.integration.test.ts"
+  ],
+  "expect_killer": "K-05"
+ },
+ {
+  "name": "R3.1-ambig-ECONNRESET",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "    if (code === \"57P01\" || code === \"25P03\" || code === \"ECONNRESET\" || code === \"EPIPE\") {",
+  "new": "    if (code === \"57P01\" || code === \"25P03\" || code === \"XXXXX\" || code === \"EPIPE\") {",
+  "tests": [
+   "tests/wave1PoolResiliencePostgres.integration.test.ts"
+  ],
+  "expect_killer": "K-05"
+ },
+ {
+  "name": "R3.1-ambig-EPIPE",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "    if (code === \"57P01\" || code === \"25P03\" || code === \"ECONNRESET\" || code === \"EPIPE\") {",
+  "new": "    if (code === \"57P01\" || code === \"25P03\" || code === \"ECONNRESET\" || code === \"XXXXX\") {",
+  "tests": [
+   "tests/wave1PoolResiliencePostgres.integration.test.ts"
+  ],
+  "expect_killer": "K-05"
+ },
+ {
+  "name": "R3.1-ambig-class08",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "    if (code.startsWith(\"08\")) return true;",
+  "new": "",
+  "tests": [
+   "tests/wave1PoolResiliencePostgres.integration.test.ts"
+  ],
+  "expect_killer": "K-05"
+ },
+ {
+  "name": "R3.1-ambig-notqueryable",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "  if (message === PG_NOT_QUERYABLE_AFTER_CONNECTION_ERROR) return true;",
+  "new": "",
+  "tests": [
+   "tests/wave1PoolResiliencePostgres.integration.test.ts"
+  ],
+  "expect_killer": "K-05b"
+ },
+ {
+  "name": "R3.1-ambig-msg-Query_read_timeout",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "/Query read timeout/i.test(message)",
+  "new": "/NEVER_MATCHES_R31/i.test(message)",
+  "tests": [
+   "tests/wave1PoolResiliencePostgres.integration.test.ts"
+  ],
+  "expect_killer": "K-05"
+ },
+ {
+  "name": "R3.1-ambig-msg-Connection_terminated",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "/Connection terminated/i.test(message)",
+  "new": "/NEVER_MATCHES_R31/i.test(message)",
+  "tests": [
+   "tests/wave1PoolResiliencePostgres.integration.test.ts"
+  ],
+  "expect_killer": "K-05"
+ },
+ {
+  "name": "R3.1-ambig-msg-connection_is_closed",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "/connection is closed/i.test(message)",
+  "new": "/NEVER_MATCHES_R31/i.test(message)",
+  "tests": [
+   "tests/wave1PoolResiliencePostgres.integration.test.ts"
+  ],
+  "expect_killer": "K-05"
+ },
+ {
+  "name": "R3.1-ambig-msg-socket_hang_up",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "/socket hang up/i.test(message)",
+  "new": "/NEVER_MATCHES_R31/i.test(message)",
+  "tests": [
+   "tests/wave1PoolResiliencePostgres.integration.test.ts"
+  ],
+  "expect_killer": "K-05"
+ },
+ {
+  "name": "R3.1-release-never-destroys",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "  client.release(error !== undefined && isConnectionAmbiguous(error) ? true : undefined);",
+  "new": "  client.release(undefined);",
+  "tests": [
+   "tests/wave1PoolResiliencePostgres.integration.test.ts"
+  ],
+  "expect_killer": "K-05"
+ },
+ {
+  "name": "R3.1-release-always-destroys",
+  "path": "src/persistence/postgres/pool.ts",
+  "old": "  client.release(error !== undefined && isConnectionAmbiguous(error) ? true : undefined);",
+  "new": "  client.release(true);",
+  "tests": [
+   "tests/wave1PoolResiliencePostgres.integration.test.ts"
+  ],
+  "expect_killer": "K-05"
+ },
+ {
+  "name": "R3.2-G02-join-key_ref-only",
+  "path": "src/persistence/postgres/wave1TrustedMemoryStore.ts",
+  "old": "             ON want.tenant_id = s.tenant_id\n            AND want.workspace_id = s.workspace_id\n            AND want.key_ref = s.key_ref",
+  "new": "             ON want.key_ref = s.key_ref",
+  "tests": [
+   "tests/wave1MemoryHoldErasurePostgres.integration.test.ts"
+  ],
+  "expect_killer": "S-13"
+ },
+ {
+  "name": "R3.3-B-key_destruction_obligations_state_domain",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "      CONSTRAINT memory_key_destruction_obligations_state_domain\n        CHECK (",
+  "new": "      CONSTRAINT memory_key_destruction_obligations_state_domain\n        CHECK (true OR ",
+  "regen_evidence": true,
+  "tests": [
+   "tests/wave1MemoryCheckDropTestsPostgres.integration.test.ts"
+  ],
+  "expect_killer": "family B"
+ },
+ {
+  "name": "R3.3-B-key_destruction_obligations_reason_domain",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "      CONSTRAINT memory_key_destruction_obligations_reason_domain\n        CHECK (",
+  "new": "      CONSTRAINT memory_key_destruction_obligations_reason_domain\n        CHECK (true OR ",
+  "regen_evidence": true,
+  "tests": [
+   "tests/wave1MemoryCheckDropTestsPostgres.integration.test.ts"
+  ],
+  "expect_killer": "family B"
+ },
+ {
+  "name": "R3.3-B-key_destruction_obligations_resolution_named",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "      CONSTRAINT memory_key_destruction_obligations_resolution_named\n        CHECK (",
+  "new": "      CONSTRAINT memory_key_destruction_obligations_resolution_named\n        CHECK (true OR ",
+  "regen_evidence": true,
+  "tests": [
+   "tests/wave1MemoryCheckDropTestsPostgres.integration.test.ts"
+  ],
+  "expect_killer": "family B"
+ },
+ {
+  "name": "R3.3-B-key_destruction_settlements_decision_domain",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "      CONSTRAINT memory_key_destruction_settlements_decision_domain\n        CHECK (",
+  "new": "      CONSTRAINT memory_key_destruction_settlements_decision_domain\n        CHECK (true OR ",
+  "regen_evidence": true,
+  "tests": [
+   "tests/wave1MemoryCheckDropTestsPostgres.integration.test.ts"
+  ],
+  "expect_killer": "family B"
+ },
+ {
+  "name": "R3.3-B-key_destruction_settlements_states_known",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "      CONSTRAINT memory_key_destruction_settlements_states_known\n        CHECK (",
+  "new": "      CONSTRAINT memory_key_destruction_settlements_states_known\n        CHECK (true OR ",
+  "regen_evidence": true,
+  "tests": [
+   "tests/wave1MemoryCheckDropTestsPostgres.integration.test.ts"
+  ],
+  "expect_killer": "family B"
+ },
+ {
+  "name": "R3.3-B-key_destruction_settlements_digest_shape",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "      CONSTRAINT memory_key_destruction_settlements_digest_shape\n        CHECK (",
+  "new": "      CONSTRAINT memory_key_destruction_settlements_digest_shape\n        CHECK (true OR ",
+  "regen_evidence": true,
+  "tests": [
+   "tests/wave1MemoryCheckDropTestsPostgres.integration.test.ts"
+  ],
+  "expect_killer": "family B"
+ },
+ {
+  "name": "R3.3-B-key_destruction_settlements_policy_known",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "      CONSTRAINT memory_key_destruction_settlements_policy_known\n        CHECK (",
+  "new": "      CONSTRAINT memory_key_destruction_settlements_policy_known\n        CHECK (true OR ",
+  "regen_evidence": true,
+  "tests": [
+   "tests/wave1MemoryCheckDropTestsPostgres.integration.test.ts"
+  ],
+  "expect_killer": "family B"
+ },
+ {
+  "name": "R3.3-B-pii_key_audits_state_domain",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "      CONSTRAINT memory_pii_key_audits_state_domain\n        CHECK (",
+  "new": "      CONSTRAINT memory_pii_key_audits_state_domain\n        CHECK (true OR ",
+  "regen_evidence": true,
+  "tests": [
+   "tests/wave1MemoryCheckDropTestsPostgres.integration.test.ts"
+  ],
+  "expect_killer": "family B"
+ },
+ {
+  "name": "R3.4-coalesce-removed",
+  "path": "tests/support/memoryPrivileges.ts",
+  "old": "aclexplode(COALESCE(d.datacl, acldefault('d', d.datdba)))",
+  "new": "aclexplode(d.datacl)",
+  "tests": [
+   "tests/wave1MemoryPrivilegesPostgres.integration.test.ts"
+  ],
+  "expect_killer": "datacl"
+ },
+ {
+  "name": "R3.4-stored-acl-ignored",
+  "path": "tests/support/memoryPrivileges.ts",
+  "old": "aclexplode(COALESCE(d.datacl, acldefault('d', d.datdba)))",
+  "new": "aclexplode(acldefault('d', d.datdba))",
+  "tests": [
+   "tests/wave1MemoryPrivilegesPostgres.integration.test.ts"
+  ],
+  "expect_killer": "datacl"
+ },
+ {
+  "name": "R3.5-F1-no-shadow-table",
+  "path": "tests/wave1MemoryHoldErasurePostgres.integration.test.ts",
+  "old": "      `CREATE TABLE aaliyah_memory_mutator.memory_identity_edges\n         (LIKE public.memory_identity_edges)`,",
+  "new": "      `SELECT 1`,",
+  "tests": [
+   "tests/wave1MemoryHoldErasurePostgres.integration.test.ts"
+  ],
+  "expect_killer": "ATK-P1 K-07"
+ },
+ {
+  "name": "R3.5-F3-runner-skips-061",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "      await bounded(migration.sql);\n      await bounded(\n        hasDigest",
+  "new": "      if (migration.id === \"061_ledger_backfill_attestation\") break;\n      await bounded(migration.sql);\n      await bounded(\n        hasDigest",
+  "tests": [
+   "tests/wave1MigrationReplayPostgres.integration.test.ts"
+  ],
+  "expect_killer": "every migration must have applied"
+ },
+ {
+  "name": "R3.6-secdef-body-swapped",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "      SET search_path = pg_catalog, public, pg_temp\n      AS $fn$\n        WITH RECURSIVE absorbed(record_id) AS (",
+  "new": "      SET search_path = pg_catalog, public, pg_temp\n      AS $fn$\n        -- R3.6 mutant: a reimplemented body\n        WITH RECURSIVE absorbed(record_id) AS (",
+  "regen_evidence": true,
+  "tests": [
+   "tests/wave1MemoryPrivilegesPostgres.integration.test.ts"
+  ],
+  "expect_killer": "section by section"
+ }
+]
