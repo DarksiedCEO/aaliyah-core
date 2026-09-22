@@ -1,0 +1,6 @@
+{"case":"L5-control","result":"REFUSED: migration 055_memory_key_destruction_settlement was applied with different content (sha256:0000000000000000000000000000000000000000000000000000000000000000) tha"}
+{"case":"L4","phantomRows":["057_migration_content_digest","058_settled_obligation_resolution_immutable","059_settlement_evidence_bound","060_obligation_settlement_pointer_real"],"result":"ACCEPTED","col057":false,"trig058":false,"con060":false,"ledgerRows":60}
+{"case":"L4b","result":"ACCEPTED","trig058":false,"con060":false,"ledgerRows":60}
+{"case":"L5","result":"ACCEPTED","digestAfter":"sha256:5f39d2affcb1cb02cb42f9ac9c7633b4a506717e274c3da5b8b793b25556766c","reblessed":true}
+{"case":"I-5-pre057-upgrade","result":"ACCEPTED","rows":60,"digested":60,"note":"ACCEPTED+fully digested = silent unattested backfill"}
+{"case":"I-6-B5-emptied-ledger","result":"REFUSED: constraint \"wave1_lifecycle_tenant_binding\" for relation \"wave1_lifecycle_events\" already exists","ledgerRowsAfter":0}
