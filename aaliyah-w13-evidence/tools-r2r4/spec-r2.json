@@ -1,0 +1,135 @@
+[
+ {
+  "name": "R2-M1-no-readback-before",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "    await verifyCatalog(applied, \"before anything was applied\");\n",
+  "new": "\n",
+  "tests": [
+   "tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts"
+  ],
+  "expect_killer": "L4:"
+ },
+ {
+  "name": "R2-M2-no-readback-after",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "    await verifyCatalog(new Set([...applied, ...appliedThisRun]), \"after this run applied its migrations\");",
+  "new": "",
+  "tests": [
+   "tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts"
+  ],
+  "expect_killer": "silently produced nothing"
+ },
+ {
+  "name": "R2-M3-no-empty-ledger-check",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "        if (stray.length > 0) {",
+  "new": "        if (false) {",
+  "tests": [
+   "tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts"
+  ],
+  "expect_killer": "EMPTIED ledger"
+ },
+ {
+  "name": "R2-M4-undigested-not-refused",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "    if (undigested.length > 0 && runEndsWithDigests && attestation === undefined) {",
+  "new": "    if (false) {",
+  "tests": [
+   "tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts"
+  ],
+  "expect_killer": "L5:"
+ },
+ {
+  "name": "R2-M4b-pre057-not-refused",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "    const runEndsWithDigests = hasDigest || throughIndex >= digestIndex;",
+  "new": "    const runEndsWithDigests = hasDigest;",
+  "tests": [
+   "tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts"
+  ],
+  "expect_killer": "pre-057 ledger is NOT backfilled"
+ },
+ {
+  "name": "R2-M5-backfill-everything",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "        if (!appliedThisRun.has(migration.id)) continue;\n",
+  "new": "",
+  "tests": [
+   "tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts"
+  ],
+  "expect_killer": "pre-057 ledger is NOT backfilled"
+ },
+ {
+  "name": "R2-M6-no-evidence-integrity",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "      if (entry === undefined || entry.sqlDigest !== migrationDigest(migration.sql)) {",
+  "new": "      if (entry === undefined) {",
+  "tests": [
+   "tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts"
+  ],
+  "expect_killer": "p4 shape"
+ },
+ {
+  "name": "R2-M7-no-actor-validation",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "  if (attestation !== undefined && (typeof attestation.actor !== \"string\" || attestation.actor.trim() === \"\")) {",
+  "new": "  if (false) {",
+  "tests": [
+   "tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts"
+  ],
+  "expect_killer": "pre-057 ledger is NOT backfilled"
+ },
+ {
+  "name": "R2-M8-061-check-removed",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "    ALTER TABLE aaliyah_mail_migrations\n      ADD CONSTRAINT aaliyah_mail_migrations_attestation_whole\n",
+  "new": "    ALTER TABLE aaliyah_mail_migrations\n      ADD CONSTRAINT aaliyah_mail_migrations_attestation_whole_WEAK CHECK (true),\n      ADD CONSTRAINT aaliyah_mail_migrations_attestation_unused\n",
+  "regen_evidence": true,
+  "tests": [
+   "tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts"
+  ],
+  "expect_killer": "whole or absent"
+ },
+ {
+  "name": "R2-M9-no-ordering-precheck",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "      if (!applied.has(migration.id) && migrationOrdinal(migration.id) < highestApplied) {",
+  "new": "      if (false) {",
+  "tests": [
+   "tests/wave1MigrationReplayPostgres.integration.test.ts"
+  ],
+  "expect_killer": "W1BR-014"
+ },
+ {
+  "name": "R2-M10-drops-ignored",
+  "path": "src/persistence/postgres/migrationCatalog.ts",
+  "old": "    for (const key of entry.drop) {\n      expected.set(key, null);",
+  "new": "    for (const key of [] as string[]) {\n      expected.set(key, null);",
+  "tests": [
+   "tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts"
+  ],
+  "expect_killer": "DROPPED, put back"
+ },
+ {
+  "name": "R2-M11-function-bodies-not-compared",
+  "path": "src/persistence/postgres/migrationCatalog.ts",
+  "old": "           'sha256:' || encode(sha256(convert_to(p.prosrc, 'UTF8')), 'hex')",
+  "new": "           'fn'",
+  "regen_evidence": true,
+  "tests": [
+   "tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts"
+  ],
+  "expect_killer": "WEAKENED"
+ },
+ {
+  "name": "R2-M12-column-types-not-compared",
+  "path": "src/persistence/postgres/migrationCatalog.ts",
+  "old": "SELECT 'col:' || r.relname || '.' || a.attname, format_type(a.atttypid, a.atttypmod)",
+  "new": "SELECT 'col:' || r.relname || '.' || a.attname, 'col'",
+  "regen_evidence": true,
+  "tests": [
+   "tests/wave1MigrationLedgerIntegrityPostgres.integration.test.ts"
+  ],
+  "expect_killer": "silently produced nothing"
+ }
+]
