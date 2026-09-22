@@ -395,3 +395,43 @@ test("POSITIVE CONTROL: a widened grant IS reported as a difference, then remove
     await sharedTableLock.release();
   }
 });
+
+test("R3.4 / G-07: the databases section reads BOTH branches of its NULL-datacl fallback — reached by construction, not by luck", async () => {
+  // ---- A PUBLISHED UNREACHABILITY PROOF, FALSIFIED (candidate-4 RT4-6) ----
+  // The register classified the `COALESCE(d.datacl, acldefault(...))`
+  // fallback STRUCTURALLY_UNREACHABLE_WITH_PROOF: "every database created with
+  // CREATE DATABASE inherits a non-null ACL from template1". False — the red
+  // team showed a freshly created database has datacl NULL, including the
+  // harness's own. So the suite only ever took the NULL branch, and never the
+  // other. Both are driven here, on a database this test creates.
+  const name = "aaliyah_datacl_probe";
+  const admin = new Pool({ connectionString: DB_URL, max: 1 });
+  admin.on("error", () => undefined);
+  await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+  await admin.query(`CREATE DATABASE ${name}`);
+  const probe = new Pool({ connectionString: DB_URL.replace(/\/[^/]+$/, `/${name}`), max: 1 });
+  probe.on("error", () => undefined);
+  const datacl = async () =>
+    (await admin.query(`SELECT datacl IS NULL AS unset FROM pg_database WHERE datname = $1`, [name])).rows[0].unset as boolean;
+  try {
+    // BRANCH 1 — datacl NULL: the implicit default must be VISIBLE, not silent.
+    assert.equal(await datacl(), true, "fixture precondition: a freshly created database has datacl NULL");
+    assert.deepEqual((await memoryPrivilegeMap(probe)).databases, ["PUBLIC <current> CONNECT,TEMPORARY"]);
+
+    // BRANCH 2 — datacl set by an explicit grant: the stored ACL is what is read.
+    await admin.query(`GRANT CONNECT ON DATABASE ${name} TO aaliyah_memory_reader`);
+    assert.equal(await datacl(), false, "fixture precondition: an explicit grant sets datacl");
+    assert.deepEqual((await memoryPrivilegeMap(probe)).databases, [
+      "PUBLIC <current> CONNECT,TEMPORARY",
+      "aaliyah_memory_reader <current> CONNECT",
+    ]);
+    // ...and a REVOKE from PUBLIC must disappear from it: a fallback that
+    // ignored the stored ACL would still report the default here.
+    await admin.query(`REVOKE CONNECT, TEMPORARY ON DATABASE ${name} FROM PUBLIC`);
+    assert.deepEqual((await memoryPrivilegeMap(probe)).databases, ["aaliyah_memory_reader <current> CONNECT"]);
+  } finally {
+    await probe.end().catch(() => undefined);
+    await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`).catch(() => undefined);
+    await admin.end();
+  }
+});

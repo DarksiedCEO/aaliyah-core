@@ -10,6 +10,7 @@ import {
   createMailDbPool,
   isConnectionAmbiguous,
   MAIL_DB_POOL_BOUNDS,
+  MIGRATION_BOUNDS,
   PG_NOT_QUERYABLE_AFTER_CONNECTION_ERROR,
   releaseClient,
 } from "../src/persistence/postgres/pool";
@@ -37,7 +38,17 @@ const ROOT = path.resolve(__dirname, "..");
 let adminPool: Pool;
 
 before(() => {
-  adminPool = new Pool({ connectionString: DB_URL, max: 2 });
+  // R3.1 (candidate-4 gate 3 R-13, point 2): this fixture pool had NO client
+  // bound — `adminPool.query(...)` could wait forever for one of its two
+  // clients, the exact K-05 defect this file exists to prove fixed. Bounded
+  // now, above the longest legitimate wait it serves (the shared memory-table
+  // lock, SHARED_TABLE_LOCK_WAIT_MS = 200s).
+  adminPool = new Pool({
+    connectionString: DB_URL,
+    max: 2,
+    connectionTimeoutMillis: 30_000,
+    query_timeout: 240_000,
+  });
 });
 
 after(async () => {
@@ -447,6 +458,101 @@ function wedgeableProxy(target: { host: string; port: number }): {
   };
 }
 
+/**
+ * R3.1 — EVERY BOUND AGAINST AN INDEPENDENT CEILING (candidate-4 gate 3 R-10).
+ *
+ * Gate 3 weakened three of these 10x-60x and the WHOLE suite still passed,
+ * because every assertion that mentioned a bound compared it with ITSELF — the
+ * constant on both sides. The ceilings below are literals, written here, from
+ * the reasons each bound exists (pool.ts); a bound may be TIGHTENED without
+ * touching this test, never loosened. Server-side bounds are read back from the
+ * SERVER, so a bound that never arrived fails too.
+ */
+const CEILING_MS = {
+  connectionTimeoutMillis: 10_000,
+  statementTimeoutMs: 30_000,
+  lockTimeoutMs: 10_000,
+  idleInTransactionSessionTimeoutMs: 60_000,
+  queryTimeoutMs: 35_000,
+  keepAliveInitialDelayMillis: 10_000,
+  migrationLockTimeoutMs: 120_000,
+  migrationStatementTimeoutMs: 300_000,
+  migrationQueryTimeoutMs: 330_000,
+  migrationLedgerLockTotalWaitMs: 3_600_000,
+} as const;
+
+function serverMs(setting: string): number {
+  const match = /^(\d+)(ms|s|min|h)?$/.exec(setting);
+  assert.ok(match, `unparseable server bound: ${setting}`);
+  const unit = { ms: 1, s: 1_000, min: 60_000, h: 3_600_000 }[match[2] ?? "ms"]!;
+  return Number(match[1]) * unit;
+}
+
+test("R3.1: every mail-pool and migration bound is at or under its independent ceiling, read back where the server holds it", async () => {
+  const pool = createMailDbPool({ AALIYAH_DATABASE_URL: DB_URL } as NodeJS.ProcessEnv, { name: "ceilings", onError: () => undefined });
+  try {
+    const client = await pool.connect();
+    try {
+      const show = async (name: string) =>
+        serverMs(String((await client.query(`SELECT current_setting($1) AS v`, [name])).rows[0].v));
+      const statement = await show("statement_timeout");
+      const lock = await show("lock_timeout");
+      const idle = await show("idle_in_transaction_session_timeout");
+      assert.ok(statement > 0 && statement <= CEILING_MS.statementTimeoutMs, `statement_timeout ${statement}ms`);
+      assert.ok(lock > 0 && lock <= CEILING_MS.lockTimeoutMs, `lock_timeout ${lock}ms`);
+      assert.ok(idle > 0 && idle <= CEILING_MS.idleInTransactionSessionTimeoutMs, `idle_in_transaction_session_timeout ${idle}ms`);
+    } finally {
+      client.release();
+    }
+    const options = pool.options as unknown as { connectionTimeoutMillis?: number; query_timeout?: number; keepAliveInitialDelayMillis?: number };
+    for (const [name, value, ceiling] of [
+      ["connectionTimeoutMillis", options.connectionTimeoutMillis, CEILING_MS.connectionTimeoutMillis],
+      ["query_timeout", options.query_timeout, CEILING_MS.queryTimeoutMs],
+      ["keepAliveInitialDelayMillis", options.keepAliveInitialDelayMillis, CEILING_MS.keepAliveInitialDelayMillis],
+    ] as const) {
+      assert.ok(typeof value === "number" && value > 0 && value <= ceiling, `${name} ${value}ms over its ${ceiling}ms ceiling`);
+    }
+  } finally {
+    await endWithin(pool, "ceilings pool");
+  }
+  for (const [name, value, ceiling] of [
+    ["MIGRATION_BOUNDS.lockTimeoutMs", MIGRATION_BOUNDS.lockTimeoutMs, CEILING_MS.migrationLockTimeoutMs],
+    ["MIGRATION_BOUNDS.statementTimeoutMs", MIGRATION_BOUNDS.statementTimeoutMs, CEILING_MS.migrationStatementTimeoutMs],
+    ["MIGRATION_BOUNDS.queryTimeoutMs", MIGRATION_BOUNDS.queryTimeoutMs, CEILING_MS.migrationQueryTimeoutMs],
+    ["MIGRATION_BOUNDS.ledgerLockTotalWaitMs", MIGRATION_BOUNDS.ledgerLockTotalWaitMs, CEILING_MS.migrationLedgerLockTotalWaitMs],
+  ] as const) {
+    assert.ok(value > 0 && value <= ceiling, `${name} ${value}ms over its ${ceiling}ms ceiling`);
+  }
+});
+
+test("R3.1: a caller waiting on an EXHAUSTED mail pool is refused within the connection bound — measured, not configured", async () => {
+  // The finding behind connectionTimeoutMillis (b3efc82): store.create()
+  // pending past 8s with no error, holding a slot. Behaviourally: take every
+  // client, ask for one more, and time the refusal against the literal ceiling.
+  const pool = createMailDbPool({ AALIYAH_DATABASE_URL: DB_URL } as NodeJS.ProcessEnv, { name: "exhausted", onError: () => undefined });
+  const held: Array<{ release: () => void }> = [];
+  try {
+    for (let i = 0; i < MAIL_DB_POOL_BOUNDS.max; i += 1) held.push(await pool.connect());
+    const started = Date.now();
+    const outcome = await Promise.race([
+      pool.connect().then(
+        (client) => {
+          client.release();
+          return "connected";
+        },
+        (error: { message?: string }) => `refused:${error.message ?? ""}`,
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve("STILL_WAITING"), CEILING_MS.connectionTimeoutMillis + 10_000)),
+    ]);
+    const elapsed = Date.now() - started;
+    assert.match(outcome, /^refused:.*timeout/i, `an exhausted pool answered ${outcome} after ${elapsed}ms`);
+    assert.ok(elapsed <= CEILING_MS.connectionTimeoutMillis + 2_000, `refused only after ${elapsed}ms`);
+  } finally {
+    for (const client of held) client.release();
+    await endWithin(pool, "exhausted pool");
+  }
+});
+
 test("the mail pool carries a CLIENT-side query ceiling and TCP keepalives, not only the server's bounds", async () => {
   const pool = createMailDbPool({ AALIYAH_DATABASE_URL: DB_URL } as NodeJS.ProcessEnv);
   try {
@@ -499,6 +605,11 @@ test("K-05: an AMBIGUOUS connection is DESTROYED, and an ordinary error's connec
     Object.assign(new Error("terminating connection due to idle-in-transaction timeout"), { code: "25P03" }),
     Object.assign(new Error("connection exception"), { code: "08006" }),
     Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
+    // R3.1: every branch of isConnectionAmbiguous has a case, so deleting any
+    // one of them is a named failure (EPIPE and two message shapes had none).
+    Object.assign(new Error("write EPIPE"), { code: "EPIPE" }),
+    new Error("Client was closed: connection is closed"),
+    new Error("socket hang up"),
   ];
   for (const error of ambiguous) {
     assert.equal(isConnectionAmbiguous(error), true, String((error as Error).message));

@@ -64,7 +64,7 @@ import { MEMORY_IDENTITY_MERGE_ORDER_SCHEMA_VERSION } from "../src/application/m
 import { createPostgresAliasRegistryStore } from "../src/persistence/postgres/wave1AliasRegistryStore";
 import { createPostgresWave1MemoryService } from "../src/persistence/postgres/wave1IdentityGraphStore";
 import { createPostgresLegalHoldStore } from "../src/persistence/postgres/wave1LegalHoldStore";
-import { createPostgresTrustedMemoryStore } from "../src/persistence/postgres/wave1TrustedMemoryStore";
+import { createPostgresTrustedMemoryStore, PROVIDER_DEADLINE_MS } from "../src/persistence/postgres/wave1TrustedMemoryStore";
 import {
   lockSharedMemoryTables,
   type SharedTableLock,
@@ -5158,10 +5158,36 @@ test("ATK-P1 K-07: a mutator that can CREATE a schema named after itself cannot 
          (LIKE public.memory_identity_edges)`,
     );
     // FIXTURE PRECONDITION: the shadow really would win on the default path.
-    const shadowed = await adminPool.query(
-      `SELECT to_regclass('memory_identity_edges')::text AS resolved`,
+    //
+    // R3.5 (candidate-4 gate 1 F1): this asked `adminPool` — a session whose
+    // role is not the mutator, so `"$user"` never named the shadow schema —
+    // and compared `regclass::text`, which renders WITHOUT a schema whenever
+    // the relation is visible: the same string whether the shadow wins, loses
+    // or does not exist. True in every world. It is now asked AS the mutator,
+    // on PostgreSQL's default path, and by OID: the unqualified name must
+    // resolve to the SHADOW table, or the refusal below proves nothing about
+    // defeating a live shadow.
+    const probe = await adminPool.connect();
+    let shadowWins: boolean | undefined;
+    try {
+      await probe.query("BEGIN");
+      await probe.query(`SET LOCAL ROLE "aaliyah_memory_mutator"`);
+      await probe.query(`SET LOCAL search_path = "$user", public`);
+      shadowWins = (
+        await probe.query(
+          `SELECT to_regclass('memory_identity_edges')::oid
+                  = to_regclass('aaliyah_memory_mutator.memory_identity_edges')::oid AS wins`,
+        )
+      ).rows[0].wins as boolean;
+    } finally {
+      await probe.query("ROLLBACK").catch(() => undefined);
+      probe.release();
+    }
+    assert.equal(
+      shadowWins,
+      true,
+      "fixture precondition: as the mutator, on the default path, the unqualified table must resolve to the SHADOW",
     );
-    assert.equal(shadowed.rows[0].resolved, "memory_identity_edges");
 
     const refused = await eraseRecordAtHead(SURVIVOR, "mutation.atkp1.survivor", "tombstone-atkp1-survivor");
     // The provider is available and says the key is ALIVE, so this is the
@@ -6113,6 +6139,50 @@ test("R-4 K-04 (probe4): one hung provider call is bounded by the store's own de
     "active",
     "nothing may be recorded destroyed on an answer that never arrived",
   );
+});
+
+test("R3.1 / R-15: the PRODUCTION provider deadline bounds a hung provider — the default, not an injected one", async () => {
+  // Gate 3 raised PROVIDER_DEADLINE_MS from 5s to 83 MINUTES and this file
+  // passed 132/132: the test above supplies its own 400ms, and the one slow
+  // provider on the default hangs for less than the default. This store is
+  // built exactly as src/server.ts builds it — no providerDeadlineMs — and the
+  // bound is timed against a literal written here, not the constant.
+  const LITERAL_DEADLINE_MS = 5_000;
+  assert.ok(PROVIDER_DEADLINE_MS > 0 && PROVIDER_DEADLINE_MS <= LITERAL_DEADLINE_MS, `PROVIDER_DEADLINE_MS is ${PROVIDER_DEADLINE_MS}`);
+  await bindNumberedParticipantAs("participant-r15", "alias-r15", "person-r15@example.com", "mutation.r15.bind");
+  TEST_PII_KEYS.setAvailable(false);
+  try {
+    const { result } = await eraseRecordAtHead("participant-r15", "mutation.r15.erase", "tombstone-r15");
+    assert.equal(result.rejection, "key_destruction_not_proven");
+  } finally {
+    TEST_PII_KEYS.setAvailable(true);
+  }
+  let calls = 0;
+  const hung = {
+    ...TEST_PII_KEYS,
+    dataKeyState: () => {
+      calls += 1;
+      return new Promise<never>(() => {});
+    },
+    destroyDataKey: () => {
+      calls += 1;
+      return new Promise<never>(() => {});
+    },
+  } as unknown as typeof TEST_PII_KEYS;
+  const store0 = createPostgresTrustedMemoryStore(writePool, readPool, { piiKeys: hung });
+  const startedAt = Date.now();
+  const outcome = await Promise.race([
+    store0.completePendingAliasErasures(),
+    new Promise<"STILL_WAITING">((resolve) => setTimeout(() => resolve("STILL_WAITING"), 60_000)),
+  ]);
+  const elapsed = Date.now() - startedAt;
+  assert.notEqual(outcome, "STILL_WAITING", "a hung provider held the default-deadline pass for a minute");
+  assert.ok(calls >= 1, "fixture precondition: the hung provider must have been called");
+  assert.ok(((outcome as { notProvenReasons: Record<string, number> }).notProvenReasons.PROVIDER_TIMEOUT ?? 0) >= 1, JSON.stringify(outcome));
+  // At least one full default deadline elapsed (so it IS the default that
+  // applied), and no more than one literal deadline per call made.
+  assert.ok(elapsed >= LITERAL_DEADLINE_MS - 500, `abandoned after ${elapsed}ms: not the ${LITERAL_DEADLINE_MS}ms default`);
+  assert.ok(elapsed <= calls * LITERAL_DEADLINE_MS + 2_000, `${calls} hung call(s) took ${elapsed}ms`);
 });
 
 test("R-5 K-11: two racing completion passes report the destructions that ACTUALLY landed, never more", async () => {
@@ -7088,7 +7158,61 @@ test("S-13: a settlement answers ONLY for its own tenant's key, even when a key 
   assert.equal(settlements.rows[0].n, 0, "the second tenant must have no settlement of its own");
 
   // THE UNFILTERED PASS — exactly what src/server.ts runs at boot.
-  const pass = await store0.completePendingAliasErasures();
+  //
+  // R3.2 (candidate-4 red team RT4-4): run through a pool that RECORDS what the
+  // settlement query returns. The outcome assertions below cannot see the
+  // JOIN's width — the store files every row under that ROW's own scope, so
+  // extra cross-tenant rows from a key_ref-only JOIN land under keys nobody
+  // reads, and gate 4 narrowed the JOIN with the whole suite still green. The
+  // JOIN is the recorded fix for G-02, a HIGH; it gets a detector that reads
+  // the query's result directly.
+  const settlementReads: Array<{ wanted: string[]; returned: Array<{ id: string; scope: string }> }> = [];
+  const recordingPool = new Proxy(writePool, {
+    get(target, prop, receiver) {
+      if (prop === "connect") {
+        return async () => {
+          const client = await target.connect();
+          const query = client.query.bind(client) as (text: unknown, values?: unknown[]) => Promise<{ rows: Array<Record<string, string>> }>;
+          (client as unknown as { query: unknown }).query = async (text: unknown, values?: unknown[]) => {
+            const result = await query(text, values);
+            if (typeof text === "string" && /FROM public\.memory_key_destruction_settlements AS s\s+JOIN unnest/.test(text) && values) {
+              const [tenants, workspaces, keyRefs] = values as [string[], string[], string[]];
+              settlementReads.push({
+                wanted: tenants.map((t, i) => `${t}/${workspaces[i]}/${keyRefs[i]}`),
+                returned: result.rows.map((r) => ({
+                  id: r.settlement_receipt_id!,
+                  scope: `${r.tenant_id}/${r.workspace_id}/${r.key_ref}`,
+                })),
+              });
+            }
+            return result;
+          };
+          return client;
+        };
+      }
+      const value = Reflect.get(target, prop, receiver) as unknown;
+      return typeof value === "function" ? (value as () => unknown).bind(target) : value;
+    },
+  }) as Pool;
+  const pass = await createPostgresTrustedMemoryStore(recordingPool, readPool, { piiKeys: null })
+    .completePendingAliasErasures();
+
+  // THE JOIN'S OWN ASSERTION: every settlement the query returns belongs to a
+  // scope that was ASKED FOR, and none is returned twice. A key_ref-only JOIN
+  // matches the first tenant's settlement against BOTH tenants' wants — the
+  // same row, twice — which is G-02's crossover in the query itself.
+  assert.ok(settlementReads.length >= 1, "fixture precondition: the pass must have asked for settlements");
+  for (const read of settlementReads) {
+    for (const row of read.returned) {
+      assert.ok(read.wanted.includes(row.scope), `settlement ${row.id} returned for a scope nobody asked for: ${row.scope}`);
+    }
+    const ids = read.returned.map((r) => r.id);
+    assert.deepEqual(
+      ids.filter((id, i) => ids.indexOf(id) !== i),
+      [],
+      `a settlement was matched to more than one requested scope — the JOIN is not three columns wide: ${JSON.stringify(read)}`,
+    );
+  }
 
   // THE ASSERTION. The second tenant's key is NOT answered for by the first
   // tenant's settlement: it is unproven, and it has an obligation.

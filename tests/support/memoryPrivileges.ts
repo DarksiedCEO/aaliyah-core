@@ -152,6 +152,22 @@ export async function memoryPrivilegeMap(pool: Pool): Promise<Record<string, str
         JOIN pg_namespace AS n ON n.oid = p.pronamespace AND ${userSchema}
        WHERE p.prosecdef
        ORDER BY 1`),
+    /**
+     * SEC-E (candidate-4 gate 2): WHAT a SECURITY DEFINER function does, not
+     * only who it runs as. Every section above was blind to the BODY: the
+     * security gate replaced the erasure-guard helper
+     * `aaliyah_memory_unerased_merged_records` with a body that returned
+     * nothing — owner, SECURITY DEFINER, config and ACL all unchanged — and
+     * this map, and the test over it, did not change. The body's digest is part
+     * of the declared surface now.
+     */
+    securityDefinerBodies: await q(`
+      SELECT n.nspname || '.' || p.oid::regprocedure::text || ' BODY sha256:' ||
+             encode(sha256(convert_to(p.prosrc, 'UTF8')), 'hex') AS entry
+        FROM pg_proc AS p
+        JOIN pg_namespace AS n ON n.oid = p.pronamespace AND ${userSchema}
+       WHERE p.prosecdef
+       ORDER BY 1`),
     /** W5, for the rest: who owns the functions this schema's guards live in. */
     functionOwners: await q(`
       SELECT COALESCE((SELECT rolname FROM pg_roles WHERE oid = p.proowner), '?') || ' OWNS ' ||

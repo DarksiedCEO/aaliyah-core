@@ -67,11 +67,16 @@ test("migrations apply cleanly from an EMPTY database — the positive control",
   // to migrate anything at all.
   await runMailMigrations(replayPool);
   const applied = await replayPool.query(
-    `SELECT count(*)::int AS n FROM aaliyah_mail_migrations`,
+    `SELECT id FROM aaliyah_mail_migrations ORDER BY id`,
   );
-  assert.ok(
-    (applied.rows[0].n as number) >= 42,
-    "every migration must have applied",
+  // EXACTLY the build's migrations (R3.5, candidate-4 gate 1 F3). This read
+  // `>= 42` against a true count of 60, so eighteen migrations — 043..060, all
+  // of the W1.3 hardening — could silently not apply with this assertion,
+  // whose message is "every migration must have applied", still true.
+  assert.deepEqual(
+    applied.rows.map((r) => r.id),
+    MIGRATIONS.map((m) => m.id),
+    "every migration must have applied — exactly this build's set",
   );
   // And the hardened definition is the one that is live: 033's version pins
   // its search_path, 027's does not.
@@ -711,7 +716,7 @@ test("INT-DIGEST: an applied migration whose CONTENT changed is refused, and a f
         counted.rows[0].rows,
         `${counted.rows[0].rows - counted.rows[0].digested} applied migrations have no digest`,
       );
-      assert.ok((counted.rows[0].rows as number) >= 57);
+      assert.equal(counted.rows[0].rows, MIGRATIONS.length, "a fresh apply must record every migration");
       // Re-running is still a clean no-op.
       await runMailMigrations(pool);
 
@@ -774,11 +779,15 @@ test("K-06 REOPENED: the real migrator survives a concurrent OLDER build on a FR
         const check = new Pool({ connectionString: url, max: 1 });
         check.on("error", () => undefined);
         try {
-          const ledger = await check.query(
-            `SELECT count(*)::int AS n, count(DISTINCT id)::int AS d FROM aaliyah_mail_migrations`,
+          // EXACTLY the build's set (F3): `n = count(DISTINCT id)` was true by
+          // the ledger's PRIMARY KEY whatever the migrator did, and `>= 56`
+          // let five migrations silently not apply.
+          const ledger = await check.query(`SELECT id FROM aaliyah_mail_migrations ORDER BY id`);
+          assert.deepEqual(
+            ledger.rows.map((r) => r.id),
+            MIGRATIONS.map((m) => m.id),
+            `trial ${trial}: the ledger is not exactly this build's migrations`,
           );
-          assert.equal(ledger.rows[0].n, ledger.rows[0].d, `trial ${trial}: duplicate ledger rows`);
-          assert.ok((ledger.rows[0].n as number) >= 56, `trial ${trial}: only ${ledger.rows[0].n} applied`);
           const held = await check.query(
             `SELECT count(*)::int AS n FROM pg_locks
               WHERE locktype = 'advisory'
@@ -900,12 +909,14 @@ for (const concurrency of [2, 3, 5]) {
         const check = new Pool({ connectionString: url, max: 1 });
         check.on("error", () => undefined);
         try {
-          const ledger = await check.query(
-            `SELECT count(*)::int AS n, count(DISTINCT id)::int AS d FROM aaliyah_mail_migrations`,
+          // Exactly once each, and exactly the full set (F3: the count was
+          // `n = d` — guaranteed by the PRIMARY KEY — and `>= 54`).
+          const ledger = await check.query(`SELECT id FROM aaliyah_mail_migrations ORDER BY id`);
+          assert.deepEqual(
+            ledger.rows.map((r) => r.id),
+            MIGRATIONS.map((m) => m.id),
+            "the ledger is not exactly this build's migrations",
           );
-          // Exactly once each: no duplicate rows, and the full set applied.
-          assert.equal(ledger.rows[0].n, ledger.rows[0].d);
-          assert.ok((ledger.rows[0].n as number) >= 54, `only ${ledger.rows[0].n} migrations applied`);
           // And the ledger agrees with the schema, not just with itself.
           const helper = await check.query(
             `SELECT count(*)::int AS n FROM pg_proc
