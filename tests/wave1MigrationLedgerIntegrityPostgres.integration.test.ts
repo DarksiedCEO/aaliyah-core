@@ -175,6 +175,20 @@ test("R2.2: a column a later migration DROPPED, put back, is refused — dropped
   });
 });
 
+test("R2.2: a column whose TYPE drifted is refused — present is not the same as what the migration made (mutation R2-M12)", async () => {
+  // R2's own sweep: with column types dropped from the comparison, every test
+  // above still passed, because each drifted column was also ABSENT. This is
+  // the case where only the type differs.
+  await withLedgerDatabase("coltype", async (pool) => {
+    await runMailMigrations(pool);
+    await pool.query(`ALTER TABLE mail_connections ALTER COLUMN email_address TYPE varchar(320)`);
+    await assert.rejects(
+      () => runMailMigrations(pool),
+      /002_mail_connections \[col:mail_connections\.email_address differs\]/,
+    );
+  });
+});
+
 test("R2.1 / D-03 L5: an applied row's digest NULLed is REFUSED, and stays NULL — never re-derived from the source", async () => {
   await withLedgerDatabase("l5", async (pool) => {
     await runMailMigrations(pool);
