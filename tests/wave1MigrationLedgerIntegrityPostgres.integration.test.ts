@@ -10,6 +10,8 @@ import {
 } from "../src/persistence/postgres/migrations";
 import { deriveMigrationEvidence, EVIDENCE_FILE, renderEvidence } from "../scripts/migration-evidence";
 import * as fs from "node:fs";
+import * as path from "node:path";
+import { spawnSync } from "node:child_process";
 
 /**
  * R2 — THE LEDGER IS VERIFIED AGAINST THE SCHEMA, AND NEVER RE-BLESSED SILENTLY.
@@ -305,4 +307,27 @@ test("R2.2: the committed catalog evidence is exactly what the SQL does — rege
     "migrationEvidence.generated.ts drifted from the migrations' actual effect; regenerate it and review the diff",
   );
   assert.deepEqual(Object.keys(derived), MIGRATIONS.map((m) => m.id));
+});
+
+test("R2.2: the operator's attestation tool — refuses without a named actor, and attests with one", async () => {
+  // The refusal messages name this script; it must exist and do what they say.
+  const script = path.resolve(__dirname, "../scripts/attest-migration-ledger.ts");
+  await withLedgerDatabase("cli", async (pool) => {
+    await runMailMigrations(pool, { through: id("056") });
+    const url = ADMIN_URL.replace(/\/[^/]+$/, "/aaliyah_ledger_cli");
+    const run = (args: string[]) =>
+      spawnSync(process.execPath, ["--require", "ts-node/register", script, ...args], {
+        cwd: path.resolve(__dirname, ".."),
+        encoding: "utf8",
+        timeout: 120_000,
+        env: { ...process.env, AALIYAH_DATABASE_URL: url, NODE_TEST_CONTEXT: "" },
+      });
+    const bare = run([]);
+    assert.equal(bare.status, 2, bare.stderr);
+    assert.equal((await ledger(pool)).length, 56, "a refused attestation applied something");
+    const attested = run(["--actor", "operator:cli-test"]);
+    assert.equal(attested.status, 0, attested.stderr);
+    assert.match(attested.stdout, /ledger attested by operator:cli-test: 56 row\(s\) carry this attestation/);
+    assert.equal((await ledger(pool)).length, MIGRATIONS.length);
+  });
 });
