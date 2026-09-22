@@ -1,0 +1,12 @@
+[
+ {
+  "name": "RT4-3-MUT-B-lock-after-ledger",
+  "path": "src/persistence/postgres/migrations.ts",
+  "old": "    await bounded(\"SELECT pg_advisory_lock(hashtextextended($1, 0))\", [LEDGER_LOCK_KEY]);\n    await createLedgerToleratingARace(bounded);",
+  "new": "    await createLedgerToleratingARace(bounded);\n    await bounded(\"SELECT pg_advisory_lock(hashtextextended($1, 0))\", [LEDGER_LOCK_KEY]);",
+  "tests": [
+   "tests/wave1MigrationReplayPostgres.integration.test.ts"
+  ],
+  "expect_killer": "K-06c"
+ }
+]

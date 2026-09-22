@@ -44,10 +44,12 @@ def main():
                        cwd=M, env=ENV, capture_output=True, text=True)
         e = json.load(open(ev)); os.remove(ev)
         failed = [f["name"] for f in e["failures"]] + [t["name"] for t in e["timedOut"]]
+        messages = [(f.get("message") or "")[:220] for f in e["failures"]]
         killer = m.get("expect_killer", "")
         killed = e["verdict"] != "PASS" and any(killer in f for f in failed)
         results.append({"name": m["name"], "status": "KILLED" if killed else "SURVIVED",
-                        "verdict": e["verdict"], "counts": e["counts"], "failed": [f[:110] for f in failed]})
+                        "verdict": e["verdict"], "counts": e["counts"], "failed": [f[:110] for f in failed],
+                        "messages": messages})
         print(json.dumps(results[-1])[:400], flush=True)
     reset(sha)
     with open(out_path, "w") as f:

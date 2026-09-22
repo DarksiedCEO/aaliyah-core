@@ -1,0 +1,1 @@
+{"name": "RT4-3-MUT-B-lock-after-ledger", "status": "SURVIVED", "verdict": "PASS", "counts": {"tests": 18, "failed": 0, "passed": 18, "cancelled": 0, "skipped": 0, "todo": 0, "topLevel": 18, "suites": 0}, "failed": []}
